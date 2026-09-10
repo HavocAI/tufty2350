@@ -17,13 +17,23 @@ Get your very own Tufty from [https://shop.pimoroni.com/products/tufty-2350](htt
 
 ## Specs
 
-* 2.8" 320×240 Full-colour IPS display
-* RP2350 + 16MB flash + 8MB PSRAM
-* WiFi + Bluetooth 5.2
-* USB-C + 1,000mAh battery
-* User + system buttons
-* Four-zone rear lighting
-* "Sciuridae Consultant" lanyard
+Tufty shares its core hardware and Badgeware software with the other badges in the family. These are the details relevant to our Tufty badges, based on the official [Shared hardware](https://badgewa.re/docs#shared-hardware) and [Meet the badges](https://badgewa.re/docs#meet-the-badges) documentation.
+
+| Feature | Tufty 2350 |
+| --- | --- |
+| Display | 2.8" full-colour IPS LCD with full RGB colour. Supports 320×240 and 160×120 modes, with continuous redraws for games, animation, and graphical interfaces. |
+| Processor | RP2350 with two Arm Cortex-M33 cores running at 200MHz and hardware floating-point support. |
+| Memory | 16MB flash holds firmware, code, and assets; 8MB PSRAM provides runtime memory. |
+| Connectivity | 2.4GHz Wi-Fi for online apps and data downloads, plus Bluetooth 5.2. |
+| Power | 1,000mAh rechargeable battery, charged through USB-C. |
+| Expansion | Qw/ST connector for breakout accessories and an SWD debugging port. |
+| Buttons | Five buttons on the front, with RESET and BOOTSEL on the back. |
+| Software | Badgeware's MicroPython API is shared across the badge family; apps may need adjustments for each display. |
+| USB disk mode | Double-tap RESET to access the badge as a USB drive, copy app files, then safely eject it to run them. See [Installing Apps](#installing-apps). |
+| Lighting | Four-zone rear lighting. |
+| Included | "Sciuridae Consultant" lanyard. |
+
+Our badges arrive with firmware and demo apps installed. You can add and edit apps using USB disk mode without reflashing the firmware.
 
 ## Meet The Badgeware Family
 
