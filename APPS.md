@@ -7,7 +7,7 @@ The app packaging and installation steps are based on Badgeware's [Creating your
 - [What you need](#what-you-need)
 - [1. Create an app folder](#1-create-an-app-folder)
 - [2. Write your app](#2-write-your-app)
-- [3. Add an icon (optional)](#3-add-an-icon-optional)
+- [3. Add an icon](#3-add-an-icon)
 - [4. Install and launch](#4-install-and-launch)
 - [5. Make it yours](#5-make-it-yours)
 - [Troubleshooting](#troubleshooting)
@@ -38,7 +38,10 @@ Paste this complete program into `cloud_hello/__init__.py` and save it:
 
 ```python
 badge.mode(LORES | VSYNC)
-screen.font = font.sins
+try:
+    screen.font = rom_font.sins
+except NameError:
+    screen.font = font.sins
 
 greetings = ["Hello, Cloud Org!", "Hello from Tufty!"]
 greeting_index = 0
@@ -60,17 +63,19 @@ def update():
 run(update)
 ```
 
-Badgeware supplies `badge`, `screen`, `color`, `font`, the button constants, and `run` automatically. Run this program on the badge; a laptop's normal Python interpreter does not provide those objects.
+Badgeware supplies `badge`, `screen`, `color`, the button constants, and `run` automatically. The font library is available to apps as `rom_font` on shipped firmware and `font` on newer firmware; the example tries those names directly, without looking them up on the `builtins` module. Run this program on the badge; a laptop's normal Python interpreter does not provide those objects.
 
 The example uses Tufty's 160×120 drawing mode. Coordinates start at the top-left corner: increasing `x` moves right and increasing `y` moves down. `screen.pen` selects the colour for subsequent drawing, including `screen.clear()`.
 
 `run(update)` repeatedly calls your function, displays the frame, and polls the buttons. The function returns normally each time so the helper can finish that work. `badge.pressed(BUTTON_A)` detects a new press, so each tap advances the greeting once.
 
-## 3. Add an icon (optional)
+## 3. Add an icon
 
-To give your app its own menu image, save a **24×24 PNG** as `cloud_hello/icon.png`. A simple symbol or a couple of letters works well at that size. Without this file, the launcher uses its default icon.
+Save a **24×24 PNG** as `cloud_hello/icon.png`. The shipped launcher only lists apps that contain this file. Newer launchers offer a default icon, but include one so your app works with the supplied firmware.
 
-You can later add an `assets/` folder for images or fonts. Neither an icon nor an assets folder is needed for this example.
+For a quick start, copy the [Gallery app's icon](firmware/apps/gallery/icon.png) into your folder, keeping the name `icon.png`. To make your own, use a simple symbol or a couple of letters that read clearly at that size.
+
+You can later add an optional `assets/` folder for images or fonts; this example does not need one.
 
 ## 4. Install and launch
 
@@ -83,7 +88,7 @@ You can later add an `assets/` folder for images or fonts. Neither an icon nor a
    └── apps/
        └── cloud_hello/
            ├── __init__.py
-           └── icon.png       (optional)
+           └── icon.png
    ```
 
 4. Wait for copying to finish, then safely eject/unmount the drive. If the badge stays in disk mode after ejection, tap **RESET** once.
@@ -102,7 +107,7 @@ Save your edits on the laptop. Double-tap RESET again, copy the updated files in
 | --- | --- |
 | No badge drive appears | Confirm the cable supports data and double-tap RESET again. |
 | The drive is named `RP2350` | This is firmware flashing mode. Tap RESET to leave it, then double-tap RESET for app installation. |
-| The app is missing from the menu | Check that the path is `apps/cloud_hello/__init__.py`, with no extra nested folder and no hidden `.txt` extension. Eject and reset after copying. |
+| The app is missing from the menu | Check for both `apps/cloud_hello/__init__.py` and `apps/cloud_hello/icon.png`, with no extra nested folder or hidden `.txt` extension. The shipped launcher requires an icon. Eject and reset after copying. |
 | An error appears when launching | Note the error and line number, check the saved code and indentation, then correct your laptop copy and reinstall it. |
 | Laptop Python reports that `badge` or `screen` is undefined | Launch the app from the badge's menu instead of running it with desktop Python. |
 | Your latest edits do not appear | Confirm that you saved the laptop file and replaced the file inside the badge's app folder before ejecting and relaunching. |
