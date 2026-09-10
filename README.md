@@ -10,6 +10,7 @@ Get your very own Tufty from [https://shop.pimoroni.com/products/tufty-2350](htt
 - [Specs](#specs)
 - [Meet The Badgeware Family](#meet-the-badgeware-family)
 - [Help](#help)
+  - [Create Your First App](APPS.md)
   - [Updating/Reflashing Firmware](#updatingreflashing-firmware)
   - [Installing Apps](#installing-apps)
   - [Configuring WiFi](#configuring-wifi)
@@ -45,6 +46,10 @@ More details at [https://badgewa.re](https://badgewa.re)
 
 ## Help
 
+### Create Your First App
+
+Start with [Creating and Installing Tufty Apps](APPS.md) for a complete walkthrough: write a small interactive app, copy it to your badge, launch it, and make your first changes. You only need a text editor and a USB data cable; the example works offline and does not require reflashing firmware.
+
 ### Updating/Reflashing Firmware
 
 :warning: Our firmware comes in two flavours:
@@ -67,13 +72,7 @@ Then:
 
 ### Installing Apps
 
-* Connect your badge to your computer with a USB Type-C to USB A cable.
-* Turn your badge around so the back is facing you.
-* Double-tap the RESET button, located toward the right on the left-hand side of the badge.
-* A disk named "Tufty2350" should appear on your computer.
-* Copy your app directory into "apps".
-* *Safely Unmount* the disk from your computer. This may take a second.
-* Your badge should reboot into the menu!
+Follow [Install and launch](APPS.md#4-install-and-launch) for the USB installation steps, or start at the beginning of [the first-app guide](APPS.md) to create an app first.
 
 ### Configuring WiFi
 
