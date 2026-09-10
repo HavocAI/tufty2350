@@ -72,15 +72,7 @@ Then:
 
 ### Installing Apps
 
-If you haven't created an app yet, follow [the first-app guide](APPS.md). For an existing app directory:
-
-* Connect your badge to your computer with a USB Type-C to USB A cable.
-* Turn your badge around so the back is facing you.
-* Double-tap the RESET button, located toward the right on the left-hand side of the badge.
-* A disk named "Tufty2350" should appear on your computer.
-* Copy your app directory into "apps".
-* *Safely Unmount* the disk from your computer. This may take a second.
-* Your badge should reboot into the menu!
+Follow [Install and launch](APPS.md#4-install-and-launch) for the USB installation steps, or start at the beginning of [the first-app guide](APPS.md) to create an app first.
 
 ### Configuring WiFi
 
