@@ -1,4 +1,3 @@
-import builtins
 import gc
 import os
 import time
@@ -9,11 +8,8 @@ LOOP_MS = FRAME_COUNT * 1000 // FPS
 
 os.chdir("/system/apps/rampage_loop")
 badge.mode(LORES | VSYNC)
-# Shipped firmware calls this rom_font; newer firmware calls it font.
-font_library = getattr(builtins, "rom_font", None)
-if font_library is None:
-    font_library = builtins.font
-screen.font = font_library.sins
+# Load a bundled font explicitly, as the shipped Hydrate app does.
+screen.font = pixel_font.load("assets/sins.ppf")
 screen.pen = color.black
 screen.clear()
 screen.pen = color.white

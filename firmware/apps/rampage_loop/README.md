@@ -4,9 +4,9 @@ A silent, four-second video that repeats continuously on Tufty. After a brief lo
 
 ## Install
 
-Follow [Install and launch](../../../APPS.md#4-install-and-launch), copying this entire `rampage_loop` directory into the badge's `apps` folder. Select **Rampage Loop** in the menu and press **B**. The included icon is reused from the bundled Gallery app.
+Follow [Install and launch](../../../APPS.md#4-install-and-launch), copying this entire `rampage_loop` directory into the badge's `apps` folder. Select **Rampage Loop** in the menu and press **B**. The included 24×24 icon depicts the Rampage boat from the video.
 
-The folder must include `__init__.py`, `icon.png`, and all 48 PNG files inside `frames/`. The shipped launcher hides apps without an icon; newer launchers can provide a default. No Wi-Fi, MP4 player, or firmware flashing is required.
+The folder must include `__init__.py`, `icon.png`, the loading-screen font at `assets/sins.ppf`, and all 48 PNG files inside `frames/`. The shipped launcher hides apps without an icon; newer launchers can provide a default. No Wi-Fi, MP4 player, or firmware flashing is required.
 
 ## Playback format
 

@@ -37,13 +37,11 @@ Keep this laptop copy as your working copy. You can also share the whole folder 
 Paste this complete program into `cloud_hello/__init__.py` and save it:
 
 ```python
-import builtins
-
 badge.mode(LORES | VSYNC)
-font_library = getattr(builtins, "rom_font", None)
-if font_library is None:
-    font_library = builtins.font
-screen.font = font_library.sins
+try:
+    screen.font = rom_font.sins
+except NameError:
+    screen.font = font.sins
 
 greetings = ["Hello, Cloud Org!", "Hello from Tufty!"]
 greeting_index = 0
@@ -65,7 +63,7 @@ def update():
 run(update)
 ```
 
-Badgeware supplies `badge`, `screen`, `color`, the button constants, and `run` automatically. The font library is called `rom_font` on shipped firmware and `font` on newer firmware; the example supports both. Run this program on the badge; a laptop's normal Python interpreter does not provide those objects.
+Badgeware supplies `badge`, `screen`, `color`, the button constants, and `run` automatically. The font library is available to apps as `rom_font` on shipped firmware and `font` on newer firmware; the example tries those names directly, without looking them up on the `builtins` module. Run this program on the badge; a laptop's normal Python interpreter does not provide those objects.
 
 The example uses Tufty's 160×120 drawing mode. Coordinates start at the top-left corner: increasing `x` moves right and increasing `y` moves down. `screen.pen` selects the colour for subsequent drawing, including `screen.clear()`.
 
