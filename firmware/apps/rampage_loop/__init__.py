@@ -1,19 +1,25 @@
+import builtins
 import gc
+import os
 import time
 
 FPS = 12
 FRAME_COUNT = 48
 LOOP_MS = FRAME_COUNT * 1000 // FPS
 
+os.chdir("/system/apps/rampage_loop")
 badge.mode(LORES | VSYNC)
-screen.font = font.sins
+# Shipped firmware calls this rom_font; newer firmware calls it font.
+font_library = getattr(builtins, "rom_font", None)
+if font_library is None:
+    font_library = builtins.font
+screen.font = font_library.sins
 screen.pen = color.black
 screen.clear()
 screen.pen = color.white
 screen.text("Loading video...", 10, 50)
 display.update()
 
-# The launcher sets the working directory to this app's folder.
 # Decode once so playback does not read from flash or allocate images.
 gc.collect()
 frames = []
