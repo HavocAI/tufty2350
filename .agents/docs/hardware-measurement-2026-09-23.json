@@ -1,0 +1,50 @@
+{
+    "measured": {
+        "lit": {
+            "black": 288,
+            "mid grey": 320,
+            "white": 368,
+            "span": 80,
+            "noise": 32,
+            "gamma": 1.58,
+            "mid of swing": 0.4,
+            "settle ms": "-",
+            "blind ms": 22.2
+        },
+        "dark": {
+            "black": 32,
+            "mid grey": 64,
+            "white": 112,
+            "span": 80,
+            "noise": 32,
+            "gamma": 2.32,
+            "mid of swing": 0.4,
+            "settle ms": "-",
+            "blind ms": 22.2
+        }
+    },
+    "recommended": {
+        "MIN_CONTRAST": "40 row 750",
+        "panel gamma": 1.95,
+        "mid of swing": "0.400 ok",
+        "ideal mid": "0.701 of white"
+    },
+    "gamma ramp": {
+        "lit": {
+            "0% of white": 272,
+            "25% of white": 288,
+            "50% of white": 304,
+            "67% of white": 320,
+            "75% of white": 336,
+            "100% of white": 368
+        },
+        "dark": {
+            "0% of white": 32,
+            "25% of white": 32,
+            "50% of white": 48,
+            "67% of white": 64,
+            "75% of white": 80,
+            "100% of white": 112
+        }
+    }
+}
