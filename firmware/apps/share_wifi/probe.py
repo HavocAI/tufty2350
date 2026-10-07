@@ -1,14 +1,18 @@
 """Dev Mode's frame timing probe: where a frame's time goes on this badge.
 
 The first hardware run measured 54 ms frames where the docs expected 11 ms.
-This finds out why, in six steps, as specified under "probe frame timing" in
-.agents/docs/share_wifi_spec.md:
+This finds out why, in eight steps, as specified under "probe frame timing"
+in .agents/docs/share_wifi_spec.md:
 
     refresh      back-to-back presents with vsync: the panel's refresh period
     write        the same without vsync: what writing one frame costs
     breakdown    the signalling and status screens' frames, each part timed
     reads        loops that never present: how fast a static screen can listen
+    fast_reads   the sensor read straight from the ADC, by viper and by DMA:
+                 how fast it can be read at all, and how its noise averages
     alloc        what allocating a 1-, 2- and 3-block tuple costs
+    flicker_filter  the transfer's flicker filter: a fit, a correction, a
+                 phase-lock point and update, on a synthetic room
     gc           what one collection costs, and frames with it on and off
 
 Pure Python, like measure.py: no `screen`, no `badge`, no `display`. Every
@@ -20,17 +24,21 @@ blocks while it does -- up to about 12 s for the gc step -- which is the point:
 the probe has to own the loop to time it.
 """
 
+import math
 import time
 
 TOOL_PROBE = "frame_probe"      # its key in the measurements file
 
-STEPS = ("refresh", "write", "breakdown", "reads", "alloc", "gc")
+STEPS = ("refresh", "write", "breakdown", "reads", "fast_reads", "alloc",
+         "flicker_filter", "gc")
 STEP_TITLES = {
     "refresh": "Refresh rate",
     "write": "Write time",
     "breakdown": "Frame breakdown",
     "reads": "Read rate",
+    "fast_reads": "Fast reads",
     "alloc": "Allocation",
+    "flicker_filter": "Flicker filter",
     "gc": "Garbage collection",
 }
 
@@ -47,15 +55,50 @@ ALLOC_CALLS = 1000
 # READ_MS has passed, whichever comes first.
 READ_CALLS = 5000
 READ_MS = 1000
+# Each capture of the fast_reads step: this many raw 12-bit readings, and the
+# group sizes whose means' spread says how far averaging beats the noise --
+# by sqrt(n) if the noise is independent from reading to reading. A raw
+# reading is a sixteenth of a light_level() count.
+FAST_READS = 4096
+AVERAGES = (1, 4, 16, 64, 256)
+COUNTS_PER_RAW = 16
+# The flicker_filter step's room: 2 ms means one every 3 ms, as a transfer
+# keeps them, of a light at FILTER_MEAN counts flickering FILTER_FLICKER at
+# 120 Hz and FILTER_HARMONIC at 240, with noise of about FILTER_NOISE --
+# the shape of the 2026-10-06 room that flickered 12.5 counts. Leader's
+# window 200 ms, the Follower's 100: FILTER_SAMPLES and half of it.
+FILTER_EVERY_US = 3000
+FILTER_SPAN_US = 2000
+FILTER_SAMPLES = 66
+FILTER_MEAN = 700
+FILTER_FLICKER = 12
+FILTER_HARMONIC = 4
+FILTER_NOISE = 4
+FILTER_FITS = 3             # fits timed after the first, each on a fresh filter
+FILTER_CORRECTS = 500
+# Phase-lock updates, each after this many points (the protocol's
+# FLICKER_TRACK_POINTS): updates before FILTER_RATE_FROM_S from the fit are
+# timed as `update`, those after as `update_rate` -- by then the rate's line
+# spans the protocol's FLICKER_RATE_MIN_S and every update fits it.
+FILTER_TRACK_POINTS = 8
+FILTER_UPDATES = 48
+FILTER_RATE_BEFORE_S = 0.3
+FILTER_RATE_FROM_S = 0.7
 
 
 class TimeStats:
-    """Microsecond durations, summarised in milliseconds without allocating."""
+    """Microsecond durations, summarised in milliseconds.
+
+    The sum of squares is a float: as an int it passes 2**30 -- a small
+    int's limit on the badge -- within a second of 700 us passes, and from
+    then on every add is big-int arithmetic and allocation, inside the very
+    pass being timed (2026-10-06a: `reads.transfer` at 705 us, sd 502). A
+    float costs one small allocation an add, always."""
 
     def __init__(self):
         self.n = 0
         self.total = 0
-        self.total_sq = 0
+        self.total_sq = 0.0
         self.lo = 0
         self.hi = 0
 
@@ -66,7 +109,7 @@ class TimeStats:
             self.hi = us
         self.n += 1
         self.total += us
-        self.total_sq += us * us
+        self.total_sq += float(us) * us
 
     def mean_us(self):
         return self.total / self.n if self.n else 0
@@ -113,15 +156,23 @@ class Hooks:
     reads        ((name, callable), ...): one pass of each loop the reads step
                  times, never presenting. The first should do nothing, so the
                  loop's own cost can be taken off the others.
+    reads_detail what the reads loops found out besides their rates -- a dict,
+                 stored as reads.detail -- or None.
+    fast         ((name, capture), ...): the fast_reads step's captures, each
+                 a callable giving (FAST_READS raw readings, the us they took)
+                 or raising where the firmware cannot.
     temp         the chip's temperature in degrees C, or None where there is
                  no sensor: read before every step and once at the end.
+    flicker_filter  the protocol's FlickerFilter class, or None to skip the
+                 flicker_filter step.
     cancelled    True to stop: B pressed. Checked after every frame.
     collect, enable, disable    gc.collect, gc.enable, gc.disable
     mem_alloc, mem_free         gc.mem_alloc, gc.mem_free, or None
     """
 
     def __init__(self, present, set_vsync, poll, clear, screens, cancelled, collect, enable, disable, mem_alloc=None,
-                 mem_free=None, ticks_us=None, reads=(), temp=None):
+                 mem_free=None, ticks_us=None, reads=(), temp=None, fast=(),
+                 reads_detail=None, flicker_filter=None):
         self.present = present
         self.set_vsync = set_vsync
         self.poll = poll
@@ -136,6 +187,9 @@ class Hooks:
         self.ticks_us = ticks_us or time.ticks_us
         self.reads = reads
         self.temp = temp
+        self.fast = fast
+        self.reads_detail = reads_detail
+        self.flicker_filter = flicker_filter
 
 
 class FrameProbe:
@@ -174,8 +228,13 @@ class FrameProbe:
                 result = self.breakdown()
             elif name == "reads":
                 result = self.read_rates()
+            elif name == "fast_reads":
+                result = self.fast_reads()
             elif name == "alloc":
                 result = alloc_costs(self.hooks.ticks_us)
+            elif name == "flicker_filter":
+                result = filter_costs(self.hooks.flicker_filter,
+                                      self.hooks.ticks_us)
             else:
                 result = self.gc()
         except Exception as error:     # noqa: BLE001
@@ -336,6 +395,33 @@ class FrameProbe:
             if hooks.cancelled():
                 self.cancelled = True
                 break
+        if hooks.reads_detail is not None and not self.cancelled:
+            try:
+                out["detail"] = hooks.reads_detail()
+            except Exception as error:     # noqa: BLE001
+                out["detail"] = {"error": "%s: %s" % (type(error).__name__,
+                                                      error)}
+        return out
+
+    # -- fast reads
+
+    def fast_reads(self):
+        """Each of hooks.fast, its readings summarised. One that raises --
+        no viper, no rp2.DMA, registers not where expected -- is recorded
+        and the next tried."""
+        hooks = self.hooks
+        if not hooks.fast:
+            return {"error": "no fast reads"}
+        out = {}
+        for name, capture in hooks.fast:
+            try:
+                values, us = capture()
+                out[name] = fast_stats(values, us)
+            except Exception as error:     # noqa: BLE001
+                out[name] = {"error": "%s: %s" % (type(error).__name__, error)}
+            if hooks.cancelled():
+                self.cancelled = True
+                break
         return out
 
     # -- gc
@@ -390,6 +476,41 @@ def loop_rate(call, ticks_us):
     return stats.rate()
 
 
+# -- fast reads --------------------------------------------------------------
+
+def fast_stats(values, us):
+    """{reads, us, per_s, mean, noise}: raw readings, summarised in
+    light_level() counts. `noise` is, for each of AVERAGES, the standard
+    deviation of the means of that many consecutive readings: noise that
+    averages away falls by sqrt(n), and noise that does not -- the light
+    itself, the sensor -- stays."""
+    n = len(values)
+    if not n or us <= 0:
+        return {"error": "no readings"}
+    total = 0
+    for v in values:
+        total += v
+    mean = total / n
+    noise = {}
+    for k in AVERAGES:
+        groups = n // k
+        if groups < 4:
+            break
+        sums = 0.0
+        sums_sq = 0.0
+        for g in range(groups):
+            part = 0
+            for i in range(g * k, g * k + k):
+                part += values[i]
+            m = part / k
+            sums += m
+            sums_sq += m * m
+        var = sums_sq / groups - (sums / groups) ** 2
+        noise[str(k)] = round(max(0.0, var) ** 0.5 * COUNTS_PER_RAW, 2)
+    return {"reads": n, "us": us, "per_s": round(n * 1000000.0 / us),
+            "mean": round(mean * COUNTS_PER_RAW, 1), "noise": noise}
+
+
 # -- allocation --------------------------------------------------------------
 # A tuple is a 4-byte type, a 4-byte length and 4 bytes an item, so with the
 # default 16-byte GC blocks a pair is one block, four items two and eight
@@ -432,4 +553,104 @@ def alloc_costs(ticks_us):
             out[key] = round(each, 2)
         else:
             out[key] = round(max(0.0, each - call), 2)
+    return out
+
+
+# -- the flicker filter --------------------------------------------------------
+
+def filter_room(start_us, count):
+    """`count` samples of the step's synthetic room from `start_us`: (times,
+    values, spans). Noise from a fixed generator, so every run sees the same
+    room; made before anything is timed."""
+    ts = [0] * count
+    vs = [0] * count
+    spans = [FILTER_SPAN_US] * count
+    # A 15-bit generator: seed x multiplier stays under 2**30, a small int on
+    # the badge, so making the room allocates no big ints.
+    seed = 12345
+    for k in range(count):
+        t = time.ticks_add(start_us, k * FILTER_EVERY_US)
+        x = 2 * math.pi * 120 * (t % 1000000) / 1000000.0
+        seed = (seed * 25173 + 13849) & 0x7FFF
+        noise = (seed >> 4) % (4 * FILTER_NOISE + 1) - 2 * FILTER_NOISE
+        ts[k] = t
+        vs[k] = int(FILTER_MEAN + FILTER_FLICKER * math.sin(x)
+                    + FILTER_HARMONIC * math.sin(2 * x + 0.5) + noise)
+    return ts, vs, spans
+
+
+def _timed(call, ticks_us):
+    t = ticks_us()
+    call()
+    return time.ticks_diff(ticks_us(), t)
+
+
+def filter_costs(flicker_filter, ticks_us):
+    """What FlickerFilter's work costs on this badge, in us: the first fit
+    -- which also fills the protocol's gain tables, unless a fit already ran
+    since launch -- then FILTER_FITS more of the Leader's window and of the
+    Follower's, the first correction (which builds the table for its span),
+    corrections, phase-lock points, and updates before and after the rate's
+    line is in use."""
+    if flicker_filter is None:
+        return {"error": "no flicker filter"}
+    tracked = FILTER_TRACK_POINTS * FILTER_UPDATES
+    ts, vs, spans = filter_room(ticks_us(), FILTER_SAMPLES + tracked)
+    fit_t = ts[:FILTER_SAMPLES]
+    fit_v = vs[:FILTER_SAMPLES]
+    fit_s = spans[:FILTER_SAMPLES]
+    half = FILTER_SAMPLES // 2
+    follow_t = fit_t[half:]
+    follow_v = fit_v[half:]
+    follow_s = fit_s[half:]
+    out = {"samples": FILTER_SAMPLES, "follower_samples": len(follow_t)}
+    flicker = flicker_filter()
+    verdict = []
+    out["fit_first_us"] = _timed(
+        lambda: verdict.append(flicker.fit(fit_t, fit_v, fit_s)), ticks_us)
+    out["verdict"] = verdict[0]
+    for name, a, b, c in (("fit", fit_t, fit_v, fit_s),
+                          ("fit_follower", follow_t, follow_v, follow_s)):
+        stats = TimeStats()
+        for _ in range(FILTER_FITS):
+            fresh = flicker_filter()
+            t = ticks_us()
+            fresh.fit(a, b, c)
+            stats.add(time.ticks_diff(ticks_us(), t))
+        out[name] = stats.rate()
+    if verdict[0] != "flicker":
+        return out
+    # The rest on the first filter, as a transfer goes on from its fit.
+    first = FILTER_SAMPLES
+    out["correct_first_us"] = _timed(
+        lambda: flicker.correct(ts[first], vs[first], spans[first]), ticks_us)
+    stats = TimeStats()
+    for i in range(FILTER_CORRECTS):
+        k = first + i % tracked
+        t = ticks_us()
+        flicker.correct(ts[k], vs[k], spans[k])
+        stats.add(time.ticks_diff(ticks_us(), t))
+    out["correct"] = stats.rate()
+    track = TimeStats()
+    update = TimeStats()
+    update_rate = TimeStats()
+    fitted_at = ts[first - 1]
+    k = first
+    for _ in range(FILTER_UPDATES):
+        for _ in range(FILTER_TRACK_POINTS):
+            t = ticks_us()
+            flicker.track(ts[k], vs[k], spans[k])
+            track.add(time.ticks_diff(ticks_us(), t))
+            k += 1
+        since = time.ticks_diff(ts[k - 1], fitted_at) / 1000000.0
+        t = ticks_us()
+        flicker.update()
+        us = time.ticks_diff(ticks_us(), t)
+        if since < FILTER_RATE_BEFORE_S:
+            update.add(us)
+        elif since >= FILTER_RATE_FROM_S:
+            update_rate.add(us)
+    out["track"] = track.rate()
+    out["update"] = update.rate()
+    out["update_rate"] = update_rate.rate()
     return out

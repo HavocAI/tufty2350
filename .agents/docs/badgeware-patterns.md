@@ -116,7 +116,8 @@ must change:
 def do_transfer(self):
     passes = 0
     while True:
-        field = transfer.step(time.ticks_ms(), badge.light_level())
+        read_sample(SAMPLE_US, transfer.deadline(), buf)   # 2 ms of reads
+        field = transfer.sample(buf[0], buf[1], buf[2], buf[3], buf[4])
         if transfer.phase == PHASE_DONE:
             return self.finish_transfer(transfer)
         if backlight_changed:
@@ -140,6 +141,17 @@ def do_transfer(self):
   directly -- so a loop that only changes it never returns at all.
 - **Leave a seam for tests**: a cap on passes per `update()`, 0 on the
   badge, so a test can step it one reading a frame.
+- **Keep the pass cheap: read in a loop of locals, decide once a sample.**
+  On v2 each Python operation costs microseconds -- an attribute, a call,
+  a float -- and a call into the protocol about a millisecond
+  **[measured-v2]**. Called once a reading, it was the whole pass, and a
+  shortcut for "nothing changed since the last reading" never ran, since
+  the last reading was always a ms ago. `share_wifi`'s `read_sample()`
+  reads back to back into two local sums for 2 ms, then makes one call.
+  Look up anything keyed on a value that rarely changes when it changes.
+- **The unix port is no guide to the badge's costs.** It runs the same
+  interpreter, and the change above ran six to fifteen times faster there
+  while running twice as slow on the badge. Measure on the badge.
 
 ---
 
@@ -636,6 +648,16 @@ using — it truncates by **word**, so a one-line box holding a long hyphenated
 SSID comes out as `"..."` and nothing else. Measure and truncate by character
 for anything name-shaped; `share_wifi`'s `fit()` is that, paired with the
 native `align=`.
+
+**Viper cannot hold a constant over 30 bits.** **[inferred-v2]** On the
+badge's 32-bit build a small int is 31 bits, so `0x400A0000` or `0xFFFFFFFF`
+is a big-int object, and viper code doing machine-word arithmetic with one
+is an error at compile time, which on the badge is the import. A 64-bit
+host, CPython or the unix port, cannot show it: there they are small. Pass
+such values in as `uint` arguments, which viper converts to a machine word
+(`fastadc._convert` does), and check with `mpy-cross -march=armv7m
+-msmall-int-bits=31`, which compiles as the badge would. Not yet run on the
+badge.
 
 **Stubs that model the documentation instead of the badge.** **[source-v3]**
 `State.load(name, defaults)` is documented to return the saved data. It returns

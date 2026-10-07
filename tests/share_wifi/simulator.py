@@ -515,13 +515,16 @@ def build(protocol, payload, settle_ms=16, ambient=(200, 240), contrast=9000,
 
 
 # --- continuous badges --------------------------------------------------------
-# The app as it now runs a transfer: a loop that reads the sensor for every
-# pass and never presents while it listens. Only a change of pixels goes back
-# to run() to be presented; a change of backlight is a display.backlight()
-# call, live at once. Modelled from the badge as measured:
+# The app as it now runs a transfer: a loop that reads the sensor back to
+# back for a sample, hands the protocol their mean, and never presents while
+# it listens. Only a change of pixels goes back to run() to be presented; a
+# change of backlight is a display.backlight() call, live at once. Modelled
+# from the badge as measured:
 #
-# - reads every LOOP_READ_MS, the probe's listener pass (2,166-2,362 a second
-#   [measured-v2]), none while the badge is presenting;
+# - reads every LOOP_READ_MS for FINE_MS, or up to the next symbol boundary
+#   while transmitting; then the protocol's call, LOOP_CALL_MS give or take,
+#   reading nothing [measured-v2: 0.8-1.5 ms, 2026-10-06b]; its field takes
+#   effect when it returns; none while the badge is presenting;
 # - a present waits for the panel's next vertical blank, then writes for
 #   WRITE_MS, and blocks reading throughout [measured-v2];
 # - the liquid crystal starts to move `pixel_dead_ms` after the blank, then
@@ -538,7 +541,15 @@ def build(protocol, payload, settle_ms=16, ambient=(200, 240), contrast=9000,
 #   to half and 4.05 to 90% (0.63, 3.24), and a lit rise at 0.37 (0.57 with
 #   the PWM wait). [inferred-all]
 
-LOOP_READ_MS = 0.43
+# A reading in read_sample()'s tight loop: unmeasured, but the probe's own
+# loop around a read was 50-70 us, so this is a floor on the sample's
+# readings, ~20, not a guess at them. The simulation steps 0.1 ms anyway.
+LOOP_READ_MS = 0.1
+LOOP_CALL_MS = 1.0
+# The flicker's fit, once a transfer, stalls the loop that long: 3.3 ms on
+# MicroPython's unix port, and protocol work has run up to ~50 times slower
+# on the badge [inferred-v2]. Pessimistic on purpose.
+LOOP_FIT_MS = 150.0
 WRITE_MS = 7.8
 PWM_PERIOD_MS = 0.263
 SENSOR_K = 36.0             # counts x ms, for the mirror's 80-count swing
@@ -597,7 +608,8 @@ class LoopSensor:
     """
 
     def __init__(self, offset, light, contrast, rng, sd=0.0, noise=0,
-                 quantum=1, k=None, flicker=0.0, flicker_hz=120):
+                 quantum=1, k=None, flicker=0.0, flicker_hz=120, light_shape=None,
+                 mains_hz=60.0, mains_drift_hz=0.0):
         self.offset = offset
         self.light = light
         # The room's light flickers at `flicker_hz` by this share of itself:
@@ -605,6 +617,15 @@ class LoopSensor:
         self.flicker = flicker
         self.flicker_hz = flicker_hz
         self.phase = rng.uniform(0, 2 * math.pi)
+        # Or, with `light_shape` -- ((harmonic, weight), ...) of the mains --
+        # a light that flickers at several harmonics of a mains running
+        # `mains_drift_hz` off nominal, the largest by `flicker`. See
+        # FLICKER_LIGHTS.
+        self.shape = None
+        if light_shape:
+            self.mains = mains_hz + mains_drift_hz
+            self.shape = tuple((h, w, rng.uniform(0, 2 * math.pi))
+                               for h, w in light_shape)
         self.t = 0.0
         self.contrast = contrast
         self.rng = rng
@@ -617,7 +638,13 @@ class LoopSensor:
     def settle(self, peer_output, dt):
         self.t += dt
         room = self.light
-        if self.flicker:
+        if self.flicker and self.shape:
+            cycle = 2 * math.pi * self.mains * self.t / 1000.0
+            wave = 0.0
+            for h, w, phase in self.shape:
+                wave += w * math.sin(h * cycle + phase)
+            room *= 1 + self.flicker * wave
+        elif self.flicker:
             room *= 1 + self.flicker * math.sin(
                 2 * math.pi * self.flicker_hz * self.t / 1000.0 + self.phase)
         target = room + peer_output * self.contrast
@@ -642,7 +669,7 @@ class LoopBadge:
 
     def __init__(self, protocol, transfer, panel, sensor, rng, start_at=0.0,
                  refresh_ms=16.7, pixel_dead_ms=7.0, read_ms=LOOP_READ_MS,
-                 duty=backlight_duty_v2, models=None):
+                 duty=backlight_duty_v2, models=None, call_ms=LOOP_CALL_MS):
         self.protocol = protocol
         self.transfer = transfer
         self.panel = panel
@@ -661,6 +688,14 @@ class LoopBadge:
         self.pixels = None          # what has been drawn
         self.backlight = 1.0
         self.presents = 0
+        self.call_ms = call_ms
+        self.fitted = False
+        # The sample being read: its start, its readings' sum, count and
+        # sum of times, and the deadline the protocol gave for it.
+        self.window = start_at
+        self.total = self.count = 0
+        self.times = 0.0
+        self.deadline = None
 
     def next_blank(self, now):
         k = math.ceil((now - self.phase_ms) / self.refresh_ms)
@@ -671,18 +706,43 @@ class LoopBadge:
 
     def tick(self, now):
         transfer = self.transfer
+        protocol = self.protocol
         if not self.started:
             transfer.started = int(now)
             transfer.phase_started = int(now)
             self.started = True
-        field = transfer.step(int(now), self.sensor.read(),
-                              int(now * 1000))
-        pixels, backlight = self.protocol.LEVEL_SCHEMES[transfer.scheme][field]
+            self.window = now
+        if not self.count:
+            self.window = now
+        self.total += self.sensor.read()
+        self.count += 1
+        self.times += now
+        step = self.read_ms * self.rng.uniform(0.9, 1.1)
+        done = now - self.window >= protocol.FINE_MS
+        if self.deadline is not None and int(now) >= self.deadline:
+            done = True
+        if not done:
+            self.next_read = now + step
+            return
+        # read_sample() ends: the protocol's call, reading nothing.
+        t = self.times / self.count
+        span = now - self.window + step
+        field = transfer.sample(int(now), int(t), self.total // self.count,
+                                int(t * 1000), int(span * 1000))
+        self.total = self.count = 0
+        self.times = 0.0
+        self.deadline = transfer.deadline()
+        now += self.call_ms * self.rng.uniform(0.7, 1.5)
+        if getattr(transfer, "fit_tried", False) and not self.fitted:
+            self.fitted = True
+            now += LOOP_FIT_MS
+        pixels, backlight = protocol.LEVEL_SCHEMES[transfer.scheme][field]
         if backlight != self.backlight:
             # Set first, in update(), before any present: live at the wrap.
             self.backlight = backlight
             self.panel.schedule(now + self.rng.uniform(0, PWM_PERIOD_MS),
                                 "duty", self.duty(backlight))
+        self.busy_until = now
         if pixels != self.pixels:
             self.pixels = pixels
             blank = self.next_blank(now)
@@ -691,8 +751,7 @@ class LoopBadge:
             self.panel.schedule(blank + self.pixel_dead_ms, "share", share)
             self.busy_until = blank + WRITE_MS
             self.presents += 1
-        self.next_read = max(self.busy_until, now) + \
-            self.read_ms * self.rng.uniform(0.9, 1.1)
+        self.next_read = self.busy_until
 
 
 class LoopLink(Link):
@@ -738,7 +797,9 @@ def build_loop(protocol, payload, settle_ms=16, ambient=(200, 240),
                schemes=None, follower_schemes=None, refresh_ms=16.7,
                pixel_dead_ms=7.0, sensor_sd=None, quantum=1, offset=None,
                room_light=0, sensor_lag=False, duty=backlight_duty_v2,
-               read_ms=LOOP_READ_MS, k_scale=1.0, flicker=0.0, **_ignored):
+               read_ms=LOOP_READ_MS, k_scale=1.0, flicker=0.0,
+               flicker_hz=120, call_ms=LOOP_CALL_MS, light=None,
+               mains_drift_hz=0.0, **_ignored):
     """A Leader and Follower that read continuously, as the app now does.
 
     Takes the same scenario keywords as build(). With `sensor_sd` -- the
@@ -760,7 +821,9 @@ def build_loop(protocol, payload, settle_ms=16, ambient=(200, 240),
             return LoopSensor(ambient[which], 0, contrast, rng, noise=noise, k=k)
         return LoopSensor(ambient[which] if offset is None else offset,
                           room_light, contrast, rng, sd=sensor_sd,
-                          quantum=quantum, k=k, flicker=flicker)
+                          quantum=quantum, k=k, flicker=flicker,
+                          flicker_hz=flicker_hz, mains_drift_hz=mains_drift_hz,
+                          **FLICKER_LIGHTS.get(light, {}))
 
     def badge(transfer, which, start):
         return LoopBadge(protocol, transfer,
@@ -768,7 +831,7 @@ def build_loop(protocol, payload, settle_ms=16, ambient=(200, 240),
                          sensor(which), random.Random(seed * 7 + which),
                          start_at=start, refresh_ms=refresh_ms,
                          pixel_dead_ms=pixel_dead_ms, read_ms=read_ms,
-                         duty=duty)
+                         duty=duty, call_ms=call_ms)
     checker = Invariants(protocol, leader, follower, payload) if check else None
     return LoopLink(badge(leader, 0, 0.0), badge(follower, 1, start_skew_ms),
                     invariants=checker)
@@ -780,6 +843,22 @@ def build_loop(protocol, payload, settle_ms=16, ambient=(200, 240),
 LOOP_V2 = dict(refresh_ms=16.7, pixel_dead_ms=7.0)
 LOOP_V2_SLOW_PANEL = dict(refresh_ms=16.7, pixel_dead_ms=16.0, settle_ms=20)
 LOOP_V3 = dict(refresh_ms=11.1, pixel_dead_ms=7.0)
+
+# Room lights for build_loop(light=...), with `flicker` the size of the
+# largest component: the mains harmonics each flickers at, and their weights.
+# "led" is what every light measured on 2026-10-06 was: twice the mains, and
+# not a sine -- the brightest rooms' peak-to-peak was 3.4-3.5 times their
+# standard deviation, where a sine's is 2.8 [measured-all], which a 30%
+# fourth harmonic gives. "half" flickers once a cycle, as a light rectifying
+# half the mains would: none measured did. `mains_drift_hz` moves the mains
+# off nominal: grids hold within about 0.02 Hz [unmeasured here].
+FLICKER_LIGHTS = {
+    "sine60": dict(mains_hz=60.0, light_shape=((2, 1.0),)),
+    "led60": dict(mains_hz=60.0, light_shape=((2, 1.0), (4, 0.3))),
+    "led50": dict(mains_hz=50.0, light_shape=((2, 1.0), (4, 0.3))),
+    "half60": dict(mains_hz=60.0, light_shape=((1, 1.0), (2, 0.5), (3, 0.2))),
+    "half50": dict(mains_hz=50.0, light_shape=((1, 1.0), (2, 0.5), (3, 0.2))),
+}
 
 # The sensor as measured, for build_loop(): the ADC floor centred at 40 in
 # the dark, a reading every pass rather than the median of three, and its own

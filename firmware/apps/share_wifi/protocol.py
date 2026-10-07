@@ -95,16 +95,37 @@ BACKLIGHT_PROVEN_MS = 50
 # than any frame.
 FINE_MS = 2
 COARSE_MS = 8
+# A Follower in the handshake drops the coarse sample it is pooling when its
+# readings stop for longer than this -- dead time, from the end of one fine
+# sample to the start of the next. A present stops them for 7.8 ms or more
+# (vertical blank, then the write); a protocol call for about 1 [measured-v2].
+# A coarse sample cut short by a present holds a few ms of readings, which
+# leave most of 120 Hz flicker in: at three times the lit room's light, one
+# such sample a beacon half lifted BeaconDetector's midpoint over the
+# Leader's rising edge, and the Follower took the missed crossing for quiet
+# -- 30 of 144 failed calibration or the handshake. Never twice in a row: a
+# badge whose every call outlasted this would otherwise never close one.
+HANDSHAKE_GAP_MS = 7
 
 # Room lights flicker at twice the mains frequency: every LED light measured
-# did, at 120 Hz, by up to 47% of its light [measured-all]. That is noise
+# did, at 120 Hz, by up to 47% of its light, and none at the mains frequency
+# itself by more than 2% of that [measured-all, 2026-10-06]. That is noise
 # inside a slot, and at the lit room's level it is bigger than an ADC step.
 # It is also steady -- locked to the mains -- so a continuous badge in the
-# data phase estimates it and takes it off each reading. Only from readings
+# data phase estimates it and takes it off each fine sample. Only from samples
 # it knows were the peer dark: the back half of each slot it decides LOW. Not
 # from every reading: beacons and staircases are periodic, 100 and 120 Hz are
 # harmonics of them, and an estimate from everything picked up 15% of the
 # swing where there was no flicker at all.
+#
+# Any whole number of Hz can be listed, and 50 and 60 -- the mains itself, a
+# light flickering once a cycle -- were tried and left out. No light measured
+# does it. In simulation such a light defeats calibration before this filter
+# runs: calibration's 8 ms samples are nearly one 120 Hz period, which
+# averages 120 Hz flicker away to 4%, and leave 66-76% of 50 or 60 Hz, so
+# 47% flicker at either delivered 0 of 144 with or without them. And learning
+# 50 Hz from 8 ms of a slot takes part of its own harmonic, 100 Hz: 126 of
+# 144 in a 100 Hz room, against 143 without.
 FLICKER_HZ = (100, 120)
 # How much each dark slot moves the estimate, as the time it covers against
 # this: a few hundred ms of dark settles it.
@@ -112,83 +133,566 @@ FLICKER_TAU_MS = 250
 # Only flicker at least this big, in counts, is taken off: a quarter of an
 # ADC step.
 FLICKER_MIN_COUNTS = 4
+# A dark slot teaches only if its back half held this many samples: a 16 ms
+# slot's holds two or three, one every ~3 ms with the protocol's call.
+FLICKER_MIN_POINTS = 2
+
+# The filter's per-sample arithmetic is whole numbers from tables, never
+# math.sin: on the badge a float is a heap allocation and every operation
+# microseconds [measured-v2]. Sine is FLICKER_STEPS steps a period, scaled
+# by FLICKER_ONE: 1.1 degrees a step, and a whole number of us a step per Hz
+# (3125), so a time's step is exact. 64 steps, 5.6 degrees, did as well in
+# simulation; the table is cheap.
+FLICKER_STEPS = 320
+FLICKER_ONE = 1024
+# A sample's span, for the shrink below, in steps of this many us.
+FLICKER_SPAN_US = 250
+_SINE = tuple(int(round(FLICKER_ONE * math.sin(2 * math.pi * i / FLICKER_STEPS)))
+              for i in range(FLICKER_STEPS))
+_QUARTER = FLICKER_STEPS // 4
+# One second is a whole number of periods of every FLICKER_HZ, so a time's
+# phase is its microseconds into the second: step = us x hz x STEPS / 1e6,
+# and STEPS / 1e6 is 1 / 15625. (ticks_us wraps at 2**30 us, not a whole
+# second: one phase jump every 17.9 minutes.)
+_US_PER_STEP_HZ = 1000000 // FLICKER_STEPS
+
+
+def _span_table(hz, grow):
+    """A sample's mean shrinks a flicker by sin(x)/x, x = pi x span x hz:
+    per FLICKER_SPAN_US step of span up to two samples' length, that or its
+    inverse, scaled by FLICKER_ONE."""
+    out = []
+    for k in range(4 * FINE_MS * 1000 // FLICKER_SPAN_US + 1):
+        x = math.pi * k * FLICKER_SPAN_US * hz / 1000000.0
+        shrink = math.sin(x) / x if x else 1.0
+        out.append(int(round(FLICKER_ONE * (1 / shrink if grow else shrink))))
+    return tuple(out)
+
+
+_SHRINK = tuple(_span_table(hz, False) for hz in FLICKER_HZ)
+_GROW = tuple(_span_table(hz, True) for hz in FLICKER_HZ)
+
+
+# The mains measured before calibration (option A): each badge fits the
+# room's flicker from FLICKER_FIT_MS of samples taken while its peer is
+# known dark -- the Follower from the Leader's opening gap, the Leader from
+# its own staircase, which the Follower watches dark -- as one cycle of a
+# mains in FLICKER_MAINS with FLICKER_HARMONICS harmonics. That gives the
+# region, the light's own shape, and a table to correct every sample with
+# from then on, calibration included. A window whose fit leaves more than
+# FLICKER_FIT_MAX_NOISE counts unexplained was not dark and steady, and the
+# filter learns as before; a fit whose largest harmonic is under
+# FLICKER_MIN_COUNTS is a steady room, and nothing is taken off.
+FLICKER_MAINS = (50, 60)
+FLICKER_HARMONICS = 4
+FLICKER_FIT_MS = 200
+# How far into the Leader's staircase its window starts: past the opening
+# gap, which the Follower spends seeing it quiet and going dark, and a
+# margin -- and so that the fit, and the stall it is, falls in the middle of
+# a 150 ms step rather than on a boundary.
+FLICKER_FIT_LEAD_MS = 175
+# The Follower cannot fit when it sees the Leader quiet: quiet is timed from
+# the beacon's last edge, so the Leader may have been dark only 30 ms of
+# that. It is dark for its opening gap and its staircase's first step, low,
+# 450 ms, which the Follower sees 30-300 ms in: so it fits this long after,
+# from this long of samples, inside it with 50 ms to spare -- 150 ran into
+# the step's end when the quiet was seen late, and the fit was refused.
+# 100 ms is five cycles of 50 Hz and six of 60.
+FLICKER_FOLLOWER_FIT_MS = 100
+FLICKER_FIT_MAX_NOISE = 12
+# A fitted harmonic counts only this many of its standard errors above the
+# fit's noise. Without it, noise in 16-count steps fitted 8.5 counts of 50 Hz
+# in a dark room with no flicker at all.
+FLICKER_FIT_SIGMAS = 4
+# A harmonic is fitted only if the window's samples, averaged over their
+# spans, keep this much of it on average.
+FLICKER_MIN_SEEN = 0.3
+# Refinements of the fit's projections, each on what the others leave.
+FLICKER_FIT_PASSES = 2
+# Samples kept for the fit: ~290 ms of them, one every ~3 ms.
+FLICKER_BUFFER = 96
+
+# The mains drifts -- grids hold within about 0.02 Hz, which moves 120 Hz
+# flicker 14 degrees a second -- so the table's timing is tracked: a phase
+# lock on its offset, in steps, and the offset's rate. Each update is a
+# least-squares phase error from samples the peer was dark for: every
+# FLICKER_TRACK_POINTS while this badge sends its staircase or waits out the
+# gap, and the back half of each slot decided dark. FLICKER_TRACK_GAIN of
+# the error moves the offset. The rate is the slope of a line fitted to
+# the timing each update measured against time, forgetting
+# FLICKER_RATE_MEMORY of the past an update, and used once its points span
+# FLICKER_RATE_MIN_S: it carries the timing through calibration's
+# stretches with nothing dark to see. A rate stepped by each update's own
+# error, divided by the time since the last, was noise -- 30 times the
+# drift's rate, either sign -- since updates can come 24 ms apart.
+FLICKER_TRACK_POINTS = 8
+FLICKER_TRACK_GAIN = 0.25
+FLICKER_RATE_MEMORY = 0.99
+FLICKER_RATE_MIN_S = 0.3
+# The rate's bound, in steps a second: 0.1 Hz of mains drift, five times
+# what grids allow.
+FLICKER_MAX_RATE = 32
+# A single update's error, in steps, is clipped to this: one noisy slot
+# cannot throw the lock.
+FLICKER_TRACK_MAX_STEPS = 16
+
+
+_GAINS = {}
+
+
+def _gains(mains, h):
+    """sin(x)/x for harmonic `h` of `mains`, per span step, scaled by
+    FLICKER_ONE: what a sample's averaging leaves of it. Made once each."""
+    key = mains * 16 + h
+    out = _GAINS.get(key)
+    if out is None:
+        values = []
+        for k in range(4 * FINE_MS * 1000 // FLICKER_SPAN_US + 1):
+            x = math.pi * h * mains * k * FLICKER_SPAN_US / 1000000.0
+            values.append(int(round(FLICKER_ONE * (math.sin(x) / x if x
+                                                   else 1.0))))
+        out = tuple(values)
+        _GAINS[key] = out
+    return out
+
+
+def _span_step(span_us):
+    k = (span_us + FLICKER_SPAN_US // 2) // FLICKER_SPAN_US
+    last = len(_SHRINK[0]) - 1
+    return k if k < last else last
 
 
 class FlickerFilter:
-    """Mains flicker: learnt from dark slots, taken off every reading."""
+    """Mains flicker at each of FLICKER_HZ: learnt from dark slots a sample
+    at a time, taken off every fine sample.
+
+    Each frequency is a sine and a cosine part, in counts. Learning sums
+    each dark sample against the sine table, in whole numbers; a slot's
+    sums become an estimate once, when it is decided, and only that step
+    uses floats. Correcting is a table look-up and a multiply a frequency,
+    for the frequencies big enough to take off."""
 
     def __init__(self):
         n = len(FLICKER_HZ)
-        self.period = [1000000 // hz for hz in FLICKER_HZ]
         self.amp = [0.0] * (2 * n)      # sine, cosine amplitude per frequency
-        # The slot being collected: sums of value x sine/cosine, of sine and
-        # cosine, of value, the count and the time covered.
-        self.xs = [0.0] * (2 * n)
-        self.basis = [0.0] * (2 * n)
-        self.sum = 0.0
+        # The same, in quarter counts, and which frequencies are taken off:
+        # what correct() uses, refreshed when the estimate moves.
+        self.amp4 = [0] * (2 * n)
+        self.active = []
+        # The slot being collected: sums of value x sine/cosine and of sine
+        # and cosine, in table units; of value, less the slot's first, to
+        # keep the products small ints; the count and the time covered.
+        self.xs = [0] * (2 * n)
+        self.basis = [0] * (2 * n)
+        self.ref = 0
+        self.sum = 0
         self.count = 0
-        self.first_us = 0
+        self.covered_us = 0
+        # Fitted before calibration (see FLICKER_FIT_MS): the mains, each
+        # harmonic's sine and cosine part in counts, and tables per span
+        # step of the flicker and its slope, in quarter counts. `steady`: the
+        # fit found nothing to take off.
+        self.mains = 0
+        self.harmonics = None
+        self.steady = False
+        self.base = None
+        self.tables = {}
+        # What the last fit() saw, whatever it returned: why it refused
+        # ("few" samples, "unfit" -- no mains fitted, "dof" -- too few left
+        # over the harmonics, "noise", or None), the mains it preferred, the noise left,
+        # and each harmonic's size in counts before the significance test.
+        # For Dev Mode's room-flicker tool; the transfer does not read it.
+        self.fit_info = None
+        # The phase lock: the table's offset in thousandths of a step at
+        # anchor_us, its rate in thousandths of a step a second; the same as
+        # floats; and the tracker's sums for the points since its last
+        # update -- count, residual, slope, their products, in quarter counts.
+        self.off_m = 0
+        self.rate_m = 0
+        self.offset = 0.0
+        self.rate = 0.0
+        self.anchor_us = None
         self.last_us = 0
+        # The rate's line: time since the fit in s, the timing measured, in
+        # steps and unwrapped; weighted sums of 1, t, m, t*t, t*m.
+        self.fit_us = 0
+        self.lw = self.lt = self.lm = self.ltt = self.ltm = 0.0
+        self.tn = 0
+        self.tr = self.td = self.trd = self.tdd = 0
 
-    def _angle(self, i, now_us):
-        period = self.period[i]
-        return 2 * math.pi * (now_us % period) / period
-
-    def correct(self, now_us, value):
-        """`value` less the flicker estimated at `now_us`, as a whole count."""
-        flicker = 0.0
+    def refresh(self):
+        """Brings what correct() uses up to date with `amp`."""
         floor = FLICKER_MIN_COUNTS * FLICKER_MIN_COUNTS
-        amp = self.amp
+        active = []
         for i in range(len(FLICKER_HZ)):
-            a = amp[2 * i]
-            b = amp[2 * i + 1]
+            a = self.amp[2 * i]
+            b = self.amp[2 * i + 1]
+            self.amp4[2 * i] = int(round(4 * a))
+            self.amp4[2 * i + 1] = int(round(4 * b))
             if a * a + b * b >= floor:
-                angle = self._angle(i, now_us)
-                flicker += a * math.sin(angle) + b * math.cos(angle)
-        if not flicker:
-            return value
-        corrected = value - flicker
-        return int(corrected + 0.5) if corrected > 0 else 0
+                active.append(i)
+        self.active = active
 
-    def collect(self, now_us, value):
-        """A raw reading from the back half of the slot in progress."""
-        if not self.count:
-            self.first_us = now_us
+    @property
+    def fitted(self):
+        return self.harmonics is not None or self.steady
+
+    def fit(self, ts, vs, spans):
+        """Fits the samples -- times in us, mean values, spans in us -- as
+        one cycle of each mains in FLICKER_MAINS with up to FLICKER_HARMONICS
+        harmonics on a straight line, and keeps the mains that explains
+        more. Returns what it found: "flicker", "steady" (nothing worth
+        taking off), or None -- too few samples, or a window that was not
+        steady, when the filter goes on learning as before.
+
+        Not a full least squares: over 100-200 ms the harmonics are near
+        independent, so each is projected on its own, in whole numbers from
+        the sine table, and the projections are refined FLICKER_FIT_PASSES
+        times on what the others leave. It runs in the middle of
+        calibration, where a stall stretches a staircase step."""
+        n = len(ts)
+        self.fit_info = {"reason": "few", "mains": None, "noise": None,
+                         "sizes": None}
+        if n < 12:
+            return None
+        # The line: a sensor still settling from the last thing it saw,
+        # which the harmonics would otherwise take for 50 Hz.
+        middle = ts[n // 2]
+        sx = sy = sxx = sxy = 0
+        for k in range(n):
+            x = time.ticks_diff(ts[k], middle) // 1000
+            sx += x
+            sy += vs[k]
+            sxx += x * x
+            sxy += x * vs[k]
+        spread = n * sxx - sx * sx
+        slope = (n * sxy - sx * sy) / spread if spread else 0.0
+        level = (sy - slope * sx) / n
+        flat = [0] * n
+        total = 0
+        for k in range(n):
+            x = time.ticks_diff(ts[k], middle) // 1000
+            flat[k] = int(round(vs[k] - level - slope * x))
+            total += flat[k] * flat[k]
+        best = None
+        for mains in FLICKER_MAINS:
+            found = self.fit_mains(ts, flat, spans, mains)
+            if found is not None and (best is None or found[0] < best[0]):
+                best = found
+        info = self.fit_info
+        if best is None:
+            info["reason"] = "unfit"
+            return None
+        left, mains, used, harmonics, seen = best
+        info["mains"] = mains
+        sizes = []
+        for a, b in harmonics:
+            sizes.append(math.sqrt(a * a + b * b))
+        info["sizes"] = sizes
+        dof = n - 2 - 2 * used
+        if dof < 4:
+            info["reason"] = "dof"
+            return None
+        noise = math.sqrt(max(0, left) / dof)
+        info["noise"] = noise
+        if noise > FLICKER_FIT_MAX_NOISE:
+            info["reason"] = "noise"
+            return None
+        info["reason"] = None
+        # A harmonic counts if the samples saw it -- its amplitude as their
+        # spans shrank it -- FLICKER_FIT_SIGMAS of its standard error clear;
+        # one that does not is dropped rather than taken off.
+        error = noise * math.sqrt(2.0 / n)
+        kept = []
+        strongest = 0.0
+        for h in range(FLICKER_HARMONICS):
+            a, b = harmonics[h]
+            size = math.sqrt(a * a + b * b)
+            if (size * seen[h] >= FLICKER_FIT_SIGMAS * error
+                    and size >= FLICKER_MIN_COUNTS):
+                kept.append((a, b))
+                strongest = max(strongest, size)
+            else:
+                kept.append((0.0, 0.0))
+        if not strongest:
+            self.steady = True
+            return "steady"
+        self.mains = mains
+        self.harmonics = kept
+        self.base = None
+        self.tables = {}
+        self.anchor_us = ts[-1]
+        self.fit_us = ts[-1]
+        return "flicker"
+
+    def fit_mains(self, ts, flat, spans, mains):
+        """One mains' projections: (what is left unexplained, the mains, how
+        many harmonics were fitted, [(a, b) per harmonic in counts], how much
+        of each the samples saw). A harmonic whose samples' spans shrink it
+        below FLICKER_MIN_SEEN on average is left out: dividing by that
+        shrink magnified noise into flicker -- 25 times, for 240 Hz in
+        samples 4 ms long."""
+        n = len(ts)
+        left = flat[:]
+        # Per harmonic: each sample's sine and cosine, shrunk by its span,
+        # scaled by FLICKER_ONE; and what the fit takes off it so far.
+        sines = []
+        cosines = []
+        parts = []
+        seen = [0.0] * FLICKER_HARMONICS
+        used = []
+        for h in range(1, FLICKER_HARMONICS + 1):
+            gains = _gains(mains, h)
+            total = 0
+            for k in range(n):
+                total += gains[_span_step(spans[k])]
+            seen[h - 1] = total / (n * FLICKER_ONE)
+            if seen[h - 1] < FLICKER_MIN_SEEN:
+                continue
+            si = [0] * n
+            co = [0] * n
+            for k in range(n):
+                g = gains[_span_step(spans[k])]
+                j = (ts[k] % 1000000) * mains * h // _US_PER_STEP_HZ \
+                    % FLICKER_STEPS
+                si[k] = _SINE[j] * g // FLICKER_ONE
+                co[k] = _SINE[(j + _QUARTER) % FLICKER_STEPS] * g // FLICKER_ONE
+            used.append(h)
+            sines.append(si)
+            cosines.append(co)
+            parts.append([0] * n)
+        coeffs = [(0.0, 0.0)] * len(used)
+        for _ in range(FLICKER_FIT_PASSES):
+            for u in range(len(used)):
+                si = sines[u]
+                co = cosines[u]
+                part = parts[u]
+                ss = cc = sc = ys = yc = 0
+                for k in range(n):
+                    y = left[k] + part[k]
+                    s1 = si[k]
+                    c1 = co[k]
+                    ss += s1 * s1
+                    cc += c1 * c1
+                    sc += s1 * c1
+                    ys += y * s1
+                    yc += y * c1
+                det = ss * cc - sc * sc
+                if not det:
+                    continue
+                a = (ys * cc - yc * sc) / det
+                b = (yc * ss - ys * sc) / det
+                coeffs[u] = (a, b)
+                for k in range(n):
+                    new = int(round(a * si[k] + b * co[k]))
+                    left[k] += part[k] - new
+                    part[k] = new
+        remaining = 0
+        for k in range(n):
+            remaining += left[k] * left[k]
+        harmonics = [(0.0, 0.0)] * FLICKER_HARMONICS
+        for u in range(len(used)):
+            a, b = coeffs[u]
+            harmonics[used[u] - 1] = (a * FLICKER_ONE, b * FLICKER_ONE)
+        return (remaining, mains, len(used), harmonics, seen)
+
+    def table(self, k):
+        """The fitted flicker and its slope per step, in quarter counts, as
+        a sample of span step `k` sees them. Built once per span step, from
+        one base table per harmonic made once a fit, in whole numbers: a
+        span step costs a pass of FLICKER_STEPS, not trigonometry."""
+        out = self.tables.get(k)
+        if out is not None:
+            return out
+        if self.base is None:
+            self.base = []
+            for h in range(1, len(self.harmonics) + 1):
+                a, b = self.harmonics[h - 1]
+                if not a and not b:
+                    continue
+                a4 = int(round(4 * a))
+                b4 = int(round(4 * b))
+                line = [0] * FLICKER_STEPS
+                for j in range(FLICKER_STEPS):
+                    line[j] = (a4 * _SINE[j] + b4 * _SINE[
+                        (j + _QUARTER) % FLICKER_STEPS]) // FLICKER_ONE
+                self.base.append((h, line))
+        flicker = [0] * FLICKER_STEPS
+        for h, line in self.base:
+            g = _gains(self.mains, h)[k]
+            for i in range(FLICKER_STEPS):
+                flicker[i] += line[h * i % FLICKER_STEPS] * g
+        for i in range(FLICKER_STEPS):
+            flicker[i] //= FLICKER_ONE
+        slope = [0] * FLICKER_STEPS
+        for i in range(FLICKER_STEPS):
+            slope[i] = (flicker[(i + 1) % FLICKER_STEPS]
+                        - flicker[i - 1]) // 2
+        out = (flicker, slope)
+        self.tables[k] = out
+        return out
+
+    def step_at(self, now_us):
+        """Where `now_us` falls in the fitted table: the mains' step, moved
+        by the phase lock's offset and its rate since the anchor."""
+        base = (now_us % 1000000) * self.mains // _US_PER_STEP_HZ
+        elapsed_ms = time.ticks_diff(now_us, self.anchor_us) // 1000
+        if elapsed_ms > 30000:
+            elapsed_ms = 30000
+        shift = (self.off_m + elapsed_ms * self.rate_m // 1000) // 1000
+        return (base + shift) % FLICKER_STEPS
+
+    def track(self, now_us, value, span_us):
+        """A sample the peer was dark for, toward the next phase-lock
+        update: its residual against the table, and the table's slope."""
+        flicker, slope = self.table(_span_step(span_us))
+        i = self.step_at(now_us)
+        r = 4 * value - flicker[i]
+        d = slope[i]
+        self.tn += 1
+        self.tr += r
+        self.td += d
+        self.trd += r * d
+        self.tdd += d * d
         self.last_us = now_us
+
+    def update(self):
+        """The phase lock: the timing error that best explains the points
+        since the last update, and a step toward it, of the offset and of
+        its rate. Then clears them."""
+        n = self.tn
+        if n >= FLICKER_MIN_POINTS:
+            var = self.tdd - self.td * self.td / n
+            if var > 0:
+                error = (self.trd - self.tr * self.td / n) / var
+                if error > FLICKER_TRACK_MAX_STEPS:
+                    error = FLICKER_TRACK_MAX_STEPS
+                elif error < -FLICKER_TRACK_MAX_STEPS:
+                    error = -FLICKER_TRACK_MAX_STEPS
+                now = self.last_us
+                # Where step_at() put the table now, and where the points
+                # say it is: unwrapped, so the line through them is too.
+                elapsed = time.ticks_diff(now, self.anchor_us) / 1000000.0
+                predicted = self.offset + self.rate * min(elapsed, 30.0)
+                measured = predicted + error
+                t = time.ticks_diff(now, self.fit_us) / 1000000.0
+                k = FLICKER_RATE_MEMORY
+                self.lw = k * self.lw + 1.0
+                self.lt = k * self.lt + t
+                self.lm = k * self.lm + measured
+                self.ltt = k * self.ltt + t * t
+                self.ltm = k * self.ltm + t * measured
+                w = self.lw
+                spread = self.ltt / w - (self.lt / w) ** 2
+                if spread >= FLICKER_RATE_MIN_S * FLICKER_RATE_MIN_S / 4:
+                    rate = (self.ltm / w - self.lt / w * self.lm / w) / spread
+                    if rate > FLICKER_MAX_RATE:
+                        rate = float(FLICKER_MAX_RATE)
+                    elif rate < -FLICKER_MAX_RATE:
+                        rate = -float(FLICKER_MAX_RATE)
+                    self.rate = rate
+                self.offset = predicted + FLICKER_TRACK_GAIN * error
+                self.anchor_us = now
+                self.off_m = int(self.offset * 1000)
+                self.rate_m = int(self.rate * 1000)
+        self.tn = 0
+        self.tr = self.td = self.trd = self.tdd = 0
+
+    def correct(self, now_us, value, span_us=0):
+        """`value` less the flicker estimated at `now_us`, as a whole count.
+        `value` is a mean over `span_us` centred there, which shrinks the
+        flicker by sin(x)/x: so is what is taken off."""
+        if self.harmonics is not None:
+            flicker, _ = self.table(_span_step(span_us))
+            corrected = value - (flicker[self.step_at(now_us)] + 2) // 4
+            return corrected if corrected > 0 else 0
+        if self.steady:
+            return value
+        active = self.active
+        if not active:
+            return value
+        t = now_us % 1000000
+        k = _span_step(span_us)
+        amp4 = self.amp4
+        flicker = 0                     # quarter counts
+        for i in active:
+            j = t * FLICKER_HZ[i] // _US_PER_STEP_HZ % FLICKER_STEPS
+            part = (amp4[2 * i] * _SINE[j]
+                    + amp4[2 * i + 1] * _SINE[(j + _QUARTER) % FLICKER_STEPS]
+                    ) // FLICKER_ONE
+            flicker += part * _SHRINK[i][k] // FLICKER_ONE
+        corrected = value - (flicker + 2) // 4
+        return corrected if corrected > 0 else 0
+
+    def collect(self, now_us, value, span_us):
+        """A mean raw reading over `span_us` centred on `now_us` -- a fine
+        sample's, from the back half of the slot in progress. The mean has
+        the flicker shrunk by sin(x)/x, so each point is scaled back up:
+        what is learnt is the flicker itself, and correct() shrinks it again
+        for the sample it corrects. Learnt shrunk, it was taken off shrunk
+        twice."""
+        if self.harmonics is not None:
+            self.track(now_us, value, span_us)
+            return
+        if self.steady:
+            return
+        if not self.count:
+            self.ref = value
+        x = value - self.ref
+        self.covered_us += span_us
         self.count += 1
-        self.sum += value
+        self.sum += x
+        t = now_us % 1000000
+        k = _span_step(span_us)
+        xs = self.xs
+        basis = self.basis
         for i in range(len(FLICKER_HZ)):
-            angle = self._angle(i, now_us)
-            s = math.sin(angle)
-            c = math.cos(angle)
-            self.xs[2 * i] += value * s
-            self.xs[2 * i + 1] += value * c
-            self.basis[2 * i] += s
-            self.basis[2 * i + 1] += c
+            j = t * FLICKER_HZ[i] // _US_PER_STEP_HZ % FLICKER_STEPS
+            grow = _GROW[i][k]
+            s = _SINE[j] * grow // FLICKER_ONE
+            c = _SINE[(j + _QUARTER) % FLICKER_STEPS] * grow // FLICKER_ONE
+            xs[2 * i] += x * s
+            xs[2 * i + 1] += x * c
+            basis[2 * i] += s
+            basis[2 * i + 1] += c
 
     def close(self, dark):
-        """The slot is decided: learn from it if it was dark, then clear it."""
+        """The slot is decided: learn from it if it was dark, then clear it.
+        Once a slot, so floats are affordable here."""
+        if self.harmonics is not None:
+            if dark:
+                self.update()
+            else:
+                self.tn = 0
+                self.tr = self.td = self.trd = self.tdd = 0
+            return
         n = self.count
-        if dark and n >= 4:
+        if dark and n >= FLICKER_MIN_POINTS:
             mean = self.sum / n
-            span = time.ticks_diff(self.last_us, self.first_us)
             # Slowly, on purpose: weighting the first dark slots fully let a
             # slot misjudged dark set a wrong estimate, which then corrupted
             # the readings that taught it -- 0 of 3 delivered against 47%
             # flicker, where this delivers 143 of 144.
-            weight = min(1.0, span / (FLICKER_TAU_MS * 1000.0))
+            weight = min(1.0, self.covered_us / (FLICKER_TAU_MS * 1000.0))
+            scale = 2.0 / (n * FLICKER_ONE)
             for k in range(len(self.amp)):
-                estimate = 2 * (self.xs[k] - mean * self.basis[k]) / n
+                estimate = (self.xs[k] - mean * self.basis[k]) * scale
                 self.amp[k] += weight * (estimate - self.amp[k])
+            self.refresh()
         self.count = 0
-        self.sum = 0.0
+        self.covered_us = 0
+        self.sum = 0
         for k in range(len(self.xs)):
-            self.xs[k] = 0.0
-            self.basis[k] = 0.0
+            self.xs[k] = 0
+            self.basis[k] = 0
 
     def size(self):
         """The largest flicker amplitude estimated, in counts."""
         out = 0.0
+        if self.harmonics is not None:
+            for a, b in self.harmonics:
+                out = max(out, math.sqrt(a * a + b * b))
+            return out
         for i in range(len(FLICKER_HZ)):
             a = math.sqrt(self.amp[2 * i] ** 2 + self.amp[2 * i + 1] ** 2)
             if a > out:
@@ -1209,6 +1713,25 @@ class Transfer:
         self.coarse_n = self.coarse_sum = self.coarse_tsum = 0
         self.coarse_base = None
         self.coarse_t = self.coarse_v = 0
+        # The microsecond time of the reading that finished the last fine
+        # sample, and how many readings it held: a sample's midpoint is half
+        # way from the one to the next.
+        self.fine_end_us = None
+        self.fine_count = 0
+        # The handshake's gap check: where the last fine sample ended, and
+        # whether the coarse sample in progress follows a drop.
+        self.sample_end_us = None
+        self.coarse_dropped = False
+        # The last FLICKER_BUFFER raw fine samples before the data phase, for
+        # the flicker's fit: time and span in us, value. A ring.
+        self.fit_t = [0] * FLICKER_BUFFER
+        self.fit_v = [0] * FLICKER_BUFFER
+        self.fit_s = [0] * FLICKER_BUFFER
+        self.fit_ms = [0] * FLICKER_BUFFER
+        self.fit_n = 0
+        self.fit_result = None      # what fit() found, once it has run
+        self.fit_tried = False
+        self.track_points = 0
         self.field = LOW        # what the pre-data phases last decided
         self.flicker = FlickerFilter()
         # A continuous receiver's phase lock waits for a second lit sample
@@ -1306,6 +1829,10 @@ class Transfer:
         self.rx = []
         self.tx = []
         self.detector.reset()
+        # Points collected toward a flicker update belong to the phase they
+        # were read in: the peer may not be dark in the next.
+        self.flicker.close(False)
+        self.track_points = 0
 
     def fail(self, code):
         self.result = code
@@ -1355,17 +1882,80 @@ class Transfer:
         or -- `continuous` -- for every reading: they are pooled into FINE_MS
         and COARSE_MS samples, and only a finished sample moves anything but
         the transmitted symbol. With `now_us`, the reading's time in
-        microseconds, a continuous badge in the data phase takes the room's
-        mains flicker off it: see FlickerFilter."""
+        microseconds, a continuous badge in the data phase learns the room's
+        mains flicker from each fine sample and takes it off: see
+        FlickerFilter. The app does not call this: it pools its own readings
+        and calls sample()."""
         self.now = now
-        if (now_us is not None and self.continuous
-                and self.phase == PHASE_DATA):
-            raw = light
-            light = self.flicker.correct(now_us, raw)
-            # The back half of a slot, for the estimate if it turns out dark.
-            if self.clock.offset(now) >= self.clock.duration // 2:
-                self.flicker.collect(now_us, raw)
         fine, coarse = self.pool(now, light)
+        if fine and now_us is not None:
+            end = self.fine_end_us
+            self.fine_end_us = now_us
+            if end is not None:
+                # n readings a pass apart, the last now and the first a pass
+                # after the last sample's: their mean time, and the span they
+                # stand for -- no further back than a sample's length, in
+                # case of a gap.
+                n = self.fine_count
+                span = min(time.ticks_diff(now_us, end), 2 * FINE_MS * 1000)
+                self.filter_sample(
+                    time.ticks_add(now_us, -(span * (n - 1) // (2 * n))),
+                    span)
+        return self.decide(now, fine, coarse)
+
+    def sample(self, now, t, value, t_us=None, span_us=0):
+        """The field to show now, for a continuous badge that pools its own
+        readings: `value` is their mean, `t` their mean time in ms, and
+        `t_us` and `span_us` the same in microseconds, and how long they
+        were read for. Each call is one fine sample, FINE_MS or so long.
+
+        This is the app's way in. On the badge each Python operation costs
+        microseconds, and a protocol call per reading cost about a ms
+        [measured-v2, 2026-10-06b], more than the readings between calls:
+        the app reads in a tight loop of its own and calls this once a
+        sample. See "What a reading costs" in the protocol."""
+        self.now = now
+        self.fine_t = t
+        self.fine_v = value
+        if t_us is not None:
+            if self.phase == PHASE_PRESENT:
+                self.drop_after_gap(t_us, span_us)
+            self.filter_sample(t_us, span_us)
+        # Corrected, so calibration's samples are too, once the flicker has
+        # been fitted.
+        coarse = self.pool_coarse(t, self.fine_v)
+        if coarse:
+            self.coarse_dropped = False
+        return self.decide(now, True, coarse)
+
+    def drop_after_gap(self, t_us, span_us):
+        """A Follower in the handshake: drops the coarse sample in progress
+        if this fine sample -- `span_us` of readings centred on `t_us` --
+        started more than HANDSHAKE_GAP_MS after the last one ended, unless
+        the one in progress already follows a drop."""
+        half = span_us // 2
+        end = self.sample_end_us
+        self.sample_end_us = time.ticks_add(t_us, span_us - half)
+        if end is None or self.coarse_dropped:
+            return
+        start = time.ticks_add(t_us, -half)
+        if time.ticks_diff(start, end) > HANDSHAKE_GAP_MS * 1000:
+            self.coarse_n = self.coarse_sum = self.coarse_tsum = 0
+            self.coarse_base = None
+            self.coarse_dropped = True
+
+    def deadline(self):
+        """The ms tick by which a continuous caller must hand in its next
+        sample, or None for whenever: while it transmits in the data phase,
+        the next slot boundary, where its symbol changes. Elsewhere symbols
+        last tens of ms or more, and a sample late is nothing to them."""
+        if self.phase != PHASE_DATA or not self.tx:
+            return None
+        clock = self.clock
+        return time.ticks_add(
+            clock.epoch, (clock.number(self.now) + 1) * clock.duration)
+
+    def decide(self, now, fine, coarse):
         if self.phase == PHASE_DATA:
             return self.step_data(now, fine)
         if not coarse:
@@ -1399,9 +1989,9 @@ class Transfer:
         A stream finishes a sample on the first reading at least its interval
         after the last one it finished -- so a caller stepping once a frame
         gets one per call, holding just that reading at just that time."""
-        fine = coarse = False
+        fine = False
         if self.fine_base is None:
-            self.fine_base = self.coarse_base = now
+            self.fine_base = now
         dt = time.ticks_diff(now, self.fine_base)
         self.fine_n += 1
         self.fine_sum += light
@@ -1410,22 +2000,123 @@ class Transfer:
             n = self.fine_n
             self.fine_t = time.ticks_add(self.fine_base, self.fine_tsum // n)
             self.fine_v = self.fine_sum // n
+            self.fine_count = n
             self.fine_base = now
             self.fine_n = self.fine_sum = self.fine_tsum = 0
             fine = True
-        dt = time.ticks_diff(now, self.coarse_base)
+        return fine, self.pool_coarse(now, light)
+
+    def pool_coarse(self, t, value):
+        """Adds a reading, or a fine sample, to the coarse stream. Returns
+        whether it finished a sample, now in coarse_t/coarse_v."""
+        if self.coarse_base is None:
+            self.coarse_base = t
+        dt = time.ticks_diff(t, self.coarse_base)
         self.coarse_n += 1
-        self.coarse_sum += light
+        self.coarse_sum += value
         self.coarse_tsum += dt
         if dt >= COARSE_MS or self.coarse_n == 1 and not self.continuous:
             n = self.coarse_n
             self.coarse_t = time.ticks_add(self.coarse_base,
                                            self.coarse_tsum // n)
             self.coarse_v = self.coarse_sum // n
-            self.coarse_base = now
+            self.coarse_base = t
             self.coarse_n = self.coarse_sum = self.coarse_tsum = 0
-            coarse = True
-        return fine, coarse
+            return True
+        return False
+
+    def filter_sample(self, t_us, span_us):
+        """A continuous badge: the flicker, for the fine sample just
+        finished, a mean over `span_us` centred on `t_us`. Before the data
+        phase the sample is kept for the fit, and once the fit has a table
+        it is corrected, and tracked while the peer is known dark. In the
+        data phase it is learnt from -- or tracked -- in the back half of
+        its slot, and corrected. Once a sample, never once a reading."""
+        if not self.continuous:
+            return
+        raw = self.fine_v
+        flicker = self.flicker
+        if self.phase != PHASE_DATA:
+            i = self.fit_n % FLICKER_BUFFER
+            self.fit_t[i] = t_us
+            self.fit_v[i] = raw
+            self.fit_s[i] = span_us
+            self.fit_ms[i] = self.fine_t
+            self.fit_n += 1
+            if flicker.harmonics is not None:
+                if self.peer_dark():
+                    flicker.track(t_us, raw, span_us)
+                    self.track_points += 1
+                    if self.track_points >= FLICKER_TRACK_POINTS:
+                        flicker.update()
+                        self.track_points = 0
+                self.fine_v = flicker.correct(t_us, raw, span_us)
+            return
+        if self.clock.offset(self.fine_t) >= self.clock.duration // 2:
+            flicker.collect(t_us, raw, span_us)
+        self.fine_v = flicker.correct(t_us, raw, span_us)
+
+    def peer_dark(self):
+        """Whether the peer is known to be dark before the data phase: it
+        is listening while this badge sends its staircase -- the Leader's
+        from FLICKER_FIT_LEAD_MS past the opening gap, by when the Follower
+        has seen it and gone dark -- and both are in the shared gap."""
+        if self.phase == PHASE_CAL_GAP:
+            return True
+        if self.phase != PHASE_CAL_SEND:
+            return False
+        return (not self.leader or
+                self.elapsed(self.now) >= CAL_GAP_MS + FLICKER_FIT_LEAD_MS)
+
+    def fit_flicker(self, window_ms=FLICKER_FIT_MS):
+        """Fits the flicker, once, from the last FLICKER_FIT_MS of kept
+        samples -- taken while the peer was dark. See FLICKER_FIT_MS. A
+        window the fit refuses is tried again at half the length: the
+        Follower's quiet is timed from the Leader's last edge, and can start
+        in a steady half of its beacon."""
+        self.fit_tried = True
+        self.fit_result = self.fit_window(window_ms)
+        if self.fit_result is None:
+            self.fit_result = self.fit_window(window_ms // 2)
+        self.track_points = 0
+
+    def replay_staircase(self):
+        """A fresh staircase reader, fed the kept samples since this phase
+        began, corrected, through a fresh coarse stream."""
+        self.reader = StaircaseReader()
+        self.coarse_n = self.coarse_sum = self.coarse_tsum = 0
+        self.coarse_base = None
+        count = min(self.fit_n, FLICKER_BUFFER)
+        first = self.fit_n - count
+        for n in range(first, self.fit_n):
+            i = n % FLICKER_BUFFER
+            if time.ticks_diff(self.fit_ms[i], self.phase_started) < 0:
+                continue
+            value = self.flicker.correct(self.fit_t[i], self.fit_v[i],
+                                         self.fit_s[i])
+            if self.pool_coarse(self.fit_ms[i], value):
+                self.reader.feed(self.coarse_t, self.coarse_v)
+
+    def fit_window(self, window_ms):
+        count = min(self.fit_n, FLICKER_BUFFER)
+        if not count:
+            return None
+        newest = (self.fit_n - 1) % FLICKER_BUFFER
+        last = self.fit_t[newest]
+        ts = []
+        vs = []
+        spans = []
+        for back in range(count):
+            i = (newest - back) % FLICKER_BUFFER
+            if time.ticks_diff(last, self.fit_t[i]) > window_ms * 1000:
+                break
+            ts.append(self.fit_t[i])
+            vs.append(self.fit_v[i])
+            spans.append(self.fit_s[i])
+        ts.reverse()
+        vs.reverse()
+        spans.reverse()
+        return self.flicker.fit(ts, vs, spans)
 
     # -- phase: announce (Leader beacons, waits for Peer Present)
 
@@ -1492,6 +2183,10 @@ class Transfer:
         plateau = self.plateau()
         length = staircase_ms(reps, plateau)
         elapsed = self.elapsed(now)
+        if (self.leader and self.continuous and not self.fit_tried and
+                elapsed >= CAL_GAP_MS + FLICKER_FIT_LEAD_MS + FLICKER_FIT_MS):
+            # The Follower has been dark, receiving, since the opening gap.
+            self.fit_flicker()
         if self.leader:
             count = 2 if self.offers_backlight else 1
             if elapsed >= length * count:
@@ -1519,6 +2214,17 @@ class Transfer:
 
     def step_cal_recv(self, now, light):
         self.progress = "Calibrating"
+        if (not self.leader and self.continuous and not self.fit_tried
+                and self.elapsed(now) >= FLICKER_FOLLOWER_FIT_MS):
+            # Inside the Leader's dark: see FLICKER_FOLLOWER_FIT_MS.
+            self.fit_flicker(FLICKER_FOLLOWER_FIT_MS)
+            if self.flicker.harmonics is not None:
+                # What has been read of the staircase so far was not
+                # corrected: read it again, from the kept samples, as if the
+                # flicker had been known from the start. Uncorrected, 50 or
+                # 60 Hz flicker in its black failed calibration in 15 of 144.
+                self.replay_staircase()
+                return LOW
         ended = self.reader.feed(now, light)
         if (ended and not self.leader and self.cal_index == 1
                 and self.elapsed(now) < staircase_ms(self.peer_reps(),

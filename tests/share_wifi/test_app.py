@@ -878,9 +878,11 @@ def in_transfer(leader=False):
 
 
 def scripted(namespace, fields):
-    """Make the transfer's step() return these fields, one a frame."""
+    """Make the transfer's sample() -- the listen loop's call, once a sample
+    -- return these fields, one a frame."""
     queue = list(fields)
-    namespace["app"].transfer.step = lambda now, light, now_us=None: queue.pop(0)
+    namespace["app"].transfer.sample = \
+        lambda now, t, value, t_us=None, span_us=0: queue.pop(0)
 
 
 def test_a_transfer_signals_at_lores_with_runs_clear_off():
@@ -921,13 +923,16 @@ class LoopTransfer:
         self.received = []
         self.calls = 0
 
-    def step(self, now, light, now_us=None):
+    def sample(self, now, t, value, t_us=None, span_us=0):
         self.calls += 1
         if not self.fields:
             self.result = protocol.OK
             self.phase = protocol.PHASE_DONE
             return protocol.LOW
         return self.fields.pop(0)
+
+    def deadline(self):
+        return None
 
     def fail(self, code):
         self.result = code
@@ -958,7 +963,7 @@ def test_the_listen_loop_changes_the_backlight_without_presenting():
     presents, fills = display.updates, len(screen.fills)
     lights = len(display.backlights)
     app.do_transfer()
-    assert fake.calls == len(symbols) + 1, "one reading a pass, then done"
+    assert fake.calls == len(symbols) + 1, "one sample a pass, then done"
     assert display.updates == presents, "the loop presented"
     assert len(screen.fills) == fills, "the loop filled the screen"
     # Low, high, middle, low: each change made once.
@@ -982,6 +987,29 @@ def test_the_listen_loop_returns_to_present_a_change_of_pixels():
     assert fake.calls == 31, fake.calls
     assert screen.fills[fills:] == [namespace["FIELD_COLOR"][scheme][protocol.HIGH]]
     assert app.screen == namespace["TRANSFER"]
+
+
+def test_read_sample_reads_back_to_back_for_its_time():
+    namespace = in_transfer()
+    values = iter(range(1000000))
+    namespace["badge"].light_level = lambda: next(values)
+    out = [0] * 6
+    namespace["read_sample"](2000, None, out)
+    now, t, mean, t_us, span, n = out
+    assert n > 1 and span >= 2000, out
+    # Readings 0..n-1: their mean, at about the middle of the span.
+    assert mean == (n - 1) // 2, out
+    assert 0 <= namespace["time"].ticks_diff(now, t) <= 2, out
+
+
+def test_read_sample_stops_at_the_deadline():
+    # Transmitting: the symbol changes at the deadline, so the sample ends
+    # there however long it was to run.
+    namespace = in_transfer()
+    time = namespace["time"]
+    out = [0] * 6
+    namespace["read_sample"](10 ** 6, time.ticks_ms() - 1, out)
+    assert out[5] == 1, out
 
 
 def test_b_cancels_from_inside_the_listen_loop():
@@ -1461,7 +1489,8 @@ def test_each_dev_tool_opens_its_first_screen():
     expected = (("DEV_PROMPT", "Dark room"), ("DEV_ROLE", "Who goes first?"),
                 ("DEV_PROBE_PROMPT", "Probe frame timing"),
                 ("DEV_FLICKER", "Room flicker"),
-                ("DEV_DISPLAY", "Measurements"))
+                ("DEV_DISPLAY", "Measurements"),
+                ("DEV_SAVED", "Done"))
     for index, (target, title) in enumerate(expected):
         namespace, app = app_with()
         open_dev(namespace)
@@ -2111,20 +2140,46 @@ def test_the_flicker_tool_says_what_to_do_and_b_with_nothing_leaves():
     assert "measurements" not in namespace["State"].files, "saved nothing"
 
 
+def flickering(namespace, clock, hz=100, size=20):
+    # Flicker of `size` counts on 400, as a lit room's lights might.
+    namespace["badge"].light_level = lambda: int(
+        400 + size * math.sin(2 * math.pi * hz * clock.us / 1e6))
+
+
+def drift_frames(namespace, app, limit=20):
+    """Frames until the drift windows end, each checked: the case lights held
+    off, run()'s clear off, nothing drawn. How many it took."""
+    badge = namespace["badge"]
+    count = 0
+    while app.screen == namespace["DEV_FLICKER_DRIFT"]:
+        assert badge.default_clear is None
+        badge.lights = 1.0
+        drawn = frame(namespace)
+        assert badge.lights == 0.0, "case lights on during the drift"
+        assert not drawn, drawn
+        count += 1
+        assert count <= limit
+    return count
+
+
 def test_each_a_takes_a_measurement_with_the_backlight_off():
     namespace, app = flicker_tool()
+    namespace["DRIFT_WINDOWS"] = 3
     display = namespace["display"]
     badge = namespace["badge"]
-    # 100 Hz flicker of 20 counts on 400, as a lit room's lights might.
     with FastClock() as clock:
-        badge.light_level = lambda: int(
-            400 + 20 * math.sin(2 * math.pi * 100 * clock.us / 1e6))
+        flickering(namespace, clock)
         for n in (1, 2, 3):
             before = len(display.backlights)
-            frame(namespace, "A")
-            # Off for the capture, back to normal after.
+            drawn = frame(namespace, "A")
+            assert namespace["FLICKER_MEASURING"] in " ".join(drawn).replace("\n", " "), drawn
+            # Off for the capture and the drift windows, back to normal after.
+            assert app.screen == namespace["DEV_FLICKER_DRIFT"]
+            assert display.backlights[before:] == [0.0]
+            assert drift_frames(namespace, app) == 3
             assert display.backlights[before:] == \
                 [0.0, namespace["BACKLIGHT_NORMAL"]], display.backlights[before:]
+            assert badge.default_clear is not None, "run()'s clear back on"
             assert len(app.flicker_results) == n
             drawn = frame(namespace)
             assert any(("%d measured" % n) in line for line in drawn), drawn
@@ -2132,6 +2187,67 @@ def test_each_a_takes_a_measurement_with_the_backlight_off():
     assert result["peak_hz"] == 100, result
     assert abs(result["peak_counts"] - 20) < 2, result
     assert result["hz"]["100"] > 10 * result["hz"]["60"], result["hz"]
+    assert result["filter"]["verdict"] == "flicker", result["filter"]
+    assert result["drift"]["hz"] == 100 and result["drift"]["windows"] == 3, \
+        result["drift"]
+
+
+def test_b_during_the_drift_stops_it_and_keeps_the_measurement():
+    namespace, app = flicker_tool()
+    with FastClock() as clock:
+        flickering(namespace, clock)
+        frame(namespace, "A")
+        frame(namespace)
+        frame(namespace, "B")               # held as the frame ends
+    assert app.screen == namespace["DEV_FLICKER"]
+    assert app.flicker_results[-1]["drift"] == {"error": "cancelled"}
+    assert namespace["display"].backlights[-1] == namespace["BACKLIGHT_NORMAL"]
+    assert namespace["badge"].default_clear is not None
+    frame(namespace, "B")                   # and B again saves it
+    saved = namespace["State"].files["measurements"]["room_flicker"]
+    assert saved["1"]["drift"] == {"error": "cancelled"}
+
+
+def test_a_drift_that_reads_nothing_still_ends():
+    namespace, app = flicker_tool()
+    namespace["DRIFT_WINDOWS"] = 3
+    with FastClock() as clock:
+        flickering(namespace, clock)
+        frame(namespace, "A")
+        assert app.screen == namespace["DEV_FLICKER_DRIFT"]
+        # A capture that never reads -- the window passes with no reading.
+        app.flicker.take = lambda light, ticks: None
+        app.flicker.counts[:] = [0] * len(app.flicker.counts)
+        assert drift_frames(namespace, app) == 3
+    assert app.flicker_results[-1]["drift"] == {"error": "too few windows"}
+
+
+def test_a_steady_room_has_no_drift_to_measure_and_takes_no_windows():
+    namespace, app = flicker_tool()
+    with FastClock():
+        namespace["badge"].light_level = lambda: 400
+        frame(namespace, "A")
+    assert app.screen == namespace["DEV_FLICKER"]
+    assert app.flicker_results[-1]["drift"] == {"error": "no mains flicker"}
+    assert namespace["display"].backlights[-2:] == \
+        [0.0, namespace["BACKLIGHT_NORMAL"]]
+
+
+def test_twenty_measurements_are_saved_and_there_is_no_cap():
+    namespace, app = flicker_tool()
+    namespace["DRIFT_WINDOWS"] = 3
+    with FastClock() as clock:
+        flickering(namespace, clock, hz=120)
+        for _ in range(21):
+            frame(namespace, "A")
+            drift_frames(namespace, app)
+    frame(namespace, "B")
+    saved = namespace["State"].files["measurements"]["room_flicker"]
+    assert len(saved) == 21
+    import json
+    size = len(json.dumps(saved))
+    # The spec's storage budget: about 550 bytes a measurement.
+    assert size < 21 * 650, size
 
 
 def test_b_saves_every_measurement_numbered_and_exits():
@@ -2151,6 +2267,97 @@ def test_b_saves_every_measurement_numbered_and_exits():
     frame(namespace)
     frame(namespace, "A")                  # Done -> Dev Mode, on this tool
     assert app.screen == namespace["DEV"] and app.cursor == FLICKER_INDEX
+
+
+# --- dev mode: clear saved measurements ---------------------------------------
+
+def clear_saved(namespace):
+    open_tool(namespace, namespace["CLEAR_INDEX"])
+    assert namespace["app"].screen == namespace["DEV_SAVED"]
+    return frame(namespace)
+
+
+def test_clear_deletes_every_measurement_and_says_so():
+    namespace, app = dev_app()
+    namespace["State"].files["measurements"] = MEASURED
+    drawn = clear_saved(namespace)
+    assert drawn[0] == "Done"
+    assert "Measurements cleared" in drawn
+    assert "measurements" not in namespace["State"].files
+    frame(namespace, "A")
+    assert app.screen == namespace["DEV"] and \
+        app.cursor == namespace["CLEAR_INDEX"]
+    frame(namespace, "UP")                  # display measurements
+    frame(namespace, "A")
+    assert "No measurements saved" in frame(namespace)
+
+
+def real_delete_measurements(fake_os, path):
+    """The app's own delete_measurements(), which the harness replaces,
+    compiled from the source against `fake_os` and `path`."""
+    import os
+    import ast
+    from harness import APPS
+    source = open(os.path.join(APPS, "share_wifi", "__init__.py")).read()
+    tree = ast.parse(source)
+    node = next(n for n in tree.body if isinstance(n, ast.FunctionDef)
+                and n.name == "delete_measurements")
+    namespace = {"os": fake_os, "MEASUREMENTS_PATH": path}
+    exec(compile(ast.Module(body=[node], type_ignores=[]), "app", "exec"),
+         namespace)
+    return namespace["delete_measurements"]
+
+
+def test_the_real_delete_measurements_on_a_real_directory():
+    import os
+    import tempfile
+    import types
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "measurements.json")
+        delete = real_delete_measurements(os, path)
+        with open(path, "w") as handle:
+            handle.write("{}")
+        assert delete() is True and not os.path.exists(path)
+        assert delete() is True, "absent is cleared too"
+        # remove raising and the file still there: not cleared.
+        with open(path, "w") as handle:
+            handle.write("{}")
+
+        def refuse(_path):
+            raise OSError(5, "EIO")
+        stuck = types.SimpleNamespace(remove=refuse, stat=os.stat)
+        assert real_delete_measurements(stuck, path)() is False
+        assert os.path.exists(path)
+
+
+def test_clear_with_nothing_saved_says_the_same():
+    namespace, app = dev_app()
+    drawn = clear_saved(namespace)
+    assert "Measurements cleared" in drawn
+
+
+def test_a_file_still_there_after_clearing_says_it_could_not():
+    namespace, app = dev_app()
+    namespace["State"].files["measurements"] = MEASURED
+    namespace["State"].fail_deletes = True
+    drawn = clear_saved(namespace)
+    assert "Could not clear" in drawn
+    assert namespace["State"].files["measurements"] == MEASURED
+
+
+def test_done_after_clearing_does_not_stick_to_the_next_save():
+    namespace, app = dev_app()
+    clear_saved(namespace)
+    frame(namespace, "A")
+    frame(namespace, "UP")
+    frame(namespace, "UP")                  # measure room flicker
+    frame(namespace, "A")
+    assert app.screen == namespace["DEV_FLICKER"]
+    with FastClock():
+        namespace["badge"].light_level = lambda: 400
+        frame(namespace, "A")
+    frame(namespace, "B")
+    assert "Measurements saved" in frame(namespace)
 
 
 def test_display_with_nothing_saved_says_so():
@@ -2366,10 +2573,22 @@ def test_the_probe_shows_each_step_before_it_runs_and_then_saves():
         ["frame", "clear", "bands", "column", "lights", "measure", "present",
          "poll"])
     assert probe["firmware"]["set_framerate"] in (True, False)
-    assert sorted(probe["reads"]) == ["listen", "loop", "read", "sample",
-                                      "transfer"]
-    for entry in probe["reads"].values():
+    reads = dict(probe["reads"])
+    detail = reads.pop("detail")
+    assert sorted(reads) == ["listen", "loop", "read", "sample", "transfer",
+                             "transfer_timed"]
+    for entry in reads.values():
         assert entry["calls"] > 0 and entry["per_s"] > 0, entry
+    # Where the instrumented listener's time went: every reading is a first
+    # of its ms or a later one, and the slow path's parts were each timed.
+    # One protocol call a sample, each holding readings.
+    timed = reads["transfer_timed"]["calls"]
+    assert detail["sample"]["calls"] == timed, (detail["sample"], timed)
+    for name in ("filter_sample", "pool_coarse", "step_data"):
+        assert name in detail, detail
+    assert detail["reads_per_sample"] >= 1 and detail["read_us"] > 0, detail
+    assert isinstance(detail["phase"], int)
+    assert "light" in detail and "flicker" in detail
     # What it changed, it put back.
     assert gc.isenabled()
     assert namespace["display"].backlights[-1] == namespace["BACKLIGHT_NORMAL"]

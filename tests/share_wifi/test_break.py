@@ -240,16 +240,21 @@ def test_a_lit_room_runs_on_16ms_and_a_dark_one_on_32():
             assert leader.lit == link.follower.transfer.lit == (room > 0)
 
 
-def test_breaks_rescue_a_link_reading_slowly():
-    # Reading every 2 ms: framing fails now and then, and each failure is a
-    # break of a few slots rather than the rest of a block.
+def test_breaks_rescue_a_struggling_link():
+    # A reading every 2 ms and a protocol call five times as slow as
+    # measured: framing fails now and then, and each failure is a break of
+    # a few slots rather than the rest of a block. The link is hard to
+    # break now -- a sample is a mean, and flicker is fitted before
+    # calibration -- so this is far past anything measured, and not every
+    # transfer survives it.
     breaks = delivered = 0
-    for seed in range(1, 7):
+    for seed in range(1, 9):
         link = run(seed=seed, contrast=sim.SWING_MIRROR, read_ms=2.0,
-                   **sim.LOOP_SENSOR_V2)
+                   call_ms=5.0, **sim.LOOP_SENSOR_V2)
         delivered += link.leader.transfer.result == P.OK
         breaks += link.follower.transfer.breaks
-    assert delivered == 6, delivered
+    assert delivered >= 5, delivered
+    assert breaks >= 2, breaks
     assert breaks > 0, "nothing to rescue: the test is not testing breaks"
 
 
@@ -266,9 +271,9 @@ def test_the_filter_learns_flicker_from_dark_slots_and_takes_it_off():
     f = P.FlickerFilter()
     t = 0
     for _ in range(160):                    # 160 dark slots of 16 ms: 1.3 s
-        for _ in range(20):                 # their back halves, every 0.4 ms
-            t += 400
-            f.collect(t, flickering(t))
+        for _ in range(8):                  # their back halves, a ms at a time
+            t += 1000
+            f.collect(t, flickering(t), 1000)
         t += 8000
         f.close(True)
     # A running average over 250 ms of dark, by 8 ms a slot: 99% there.
@@ -282,16 +287,17 @@ def test_the_filter_learns_nothing_from_lit_slots():
     f = P.FlickerFilter()
     t = 0
     for _ in range(40):
-        for _ in range(20):
-            t += 400
-            f.collect(t, flickering(t))
+        for _ in range(8):
+            t += 1000
+            f.collect(t, flickering(t), 1000)
         f.close(False)
     assert f.size() == 0.0
 
 
 def test_small_flicker_is_left_alone():
     f = P.FlickerFilter()
-    f.amp[2] = 3.0                          # 3 counts at 120 Hz: under the floor
+    f.amp[2 * P.FLICKER_HZ.index(120)] = 3.0   # 3 counts: under the floor
+    f.refresh()
     assert f.correct(12345, 100) == 100
 
 
@@ -299,25 +305,48 @@ def test_a_continuous_badge_filters_only_in_the_data_phase():
     t = continuous(False)
     t.levels = levels()
     calls = []
-    t.flicker.correct = lambda now_us, value: calls.append(now_us) or value
-    t.step(0, 32, 0)                        # discovery: not filtered
+    t.flicker.correct = \
+        lambda now_us, value, span_us=0: calls.append(now_us) or value
+    for ms in range(10):                    # discovery: not filtered
+        t.step(ms, 32, ms * 1000)
     assert not calls
-    t.now = 0
-    t.start_data(0, P.BACKLIGHT_INDEX)
-    t.step(1, 32, 1000)
-    assert calls == [1000]
+    t.start_data(9, P.BACKLIGHT_INDEX)
+    for ms in range(10, 20):
+        t.step(ms, 32, ms * 1000)
+        t.step(ms, 32, ms * 1000 + 500)     # the same ms: only summed
+    # Once a fine sample, at its readings' mean time: not once a reading.
+    assert len(calls) == 5, calls
+    assert calls[-1] == 17250, calls        # 16500-18000 ms, four readings
 
 
-def test_a_lit_room_with_47_percent_flicker_runs_on_16ms():
-    delivered = sixteen = 0
-    for seed in (1, 2, 3):
+def test_a_reading_in_the_same_ms_only_adds_to_the_sums():
+    t = continuous(False)
+    t.levels = levels()
+    t.step(0, 32, 0)
+    field = t.step(1, 32, 1000)
+    before = (t.fine_n, t.fine_sum, t.coarse_n, t.coarse_sum)
+    assert t.step(1, 48, 1400) == field
+    assert (t.fine_n, t.fine_sum, t.coarse_n, t.coarse_sum) == \
+        (before[0] + 1, before[1] + 48, before[2] + 1, before[3] + 48)
+
+
+def test_a_lit_room_with_47_percent_flicker_runs_on_20ms():
+    # Sampling, with the protocol's call between samples, settles one rung
+    # down from 16 at this depth: 255 of 288 across the scenarios end on 20,
+    # 32 on 25. Over eight seeds: every one delivered, none slower than 25,
+    # most on 20.
+    delivered = twenty = 0
+    for seed in range(1, 9):
         link = run(seed=seed, contrast=sim.SWING_MIRROR, room_light=48,
                    flicker=0.47, **sim.LOOP_SENSOR_V2)
         leader = link.leader.transfer
         delivered += leader.result == P.OK
-        sixteen += P.SLOT_LADDER[leader.clock.index] == 16
-        assert leader.flicker.size() > 10, leader.flicker.size()
-    assert delivered == 3 and sixteen >= 2, (delivered, sixteen)
+        rung = P.SLOT_LADDER[leader.clock.index]
+        assert rung <= 25, (seed, rung)
+        twenty += rung <= 20
+        # The flicker is 22 counts; learnt within a few.
+        assert 15 < leader.flicker.size() < 26, leader.flicker.size()
+    assert delivered == 8 and twenty >= 6, (delivered, twenty)
 
 
 # --- discovery and calibration --------------------------------------------------

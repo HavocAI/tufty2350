@@ -553,7 +553,7 @@ recorded below as part of the spec.
 | | |
 |---|---|
 | Title | `Dev Mode` |
-| Items | `measure screen w/ mirror`, `measure screen w/ 2nd badge`, `probe frame timing`, `measure room flicker`, `display measurements` |
+| Items | `measure screen w/ mirror`, `measure screen w/ 2nd badge`, `probe frame timing`, `measure room flicker`, `display measurements`, `clear saved measurements` |
 | Help | `A - Select   B - Back` |
 | A | open the chosen tool |
 | B | main screen, with the selection back on its first item (`Share`); `Dev Mode` stays in the list |
@@ -561,6 +561,15 @@ recorded below as part of the spec.
 
 - Leaving a tool -- Done, a cancel, or leaving *display measurements* --
   returns here with that tool selected.
+- **`clear saved measurements`** deletes `/state/measurements.json` at once,
+  with no confirmation, and shows *Done* with the message
+  `Measurements cleared` -- the same whether there was a file or not, since
+  either way there is none now. Any button returns here with this item
+  selected. It deletes with `os.remove()` and then checks with `os.stat()`
+  that the file is gone, rather than reading an errno, unproven on the
+  badge, or using `State.delete()`, which swallows every error: only a file
+  still there afterwards shows `Could not clear`. Opening *display
+  measurements* afterwards recreates an empty file (see there).
 
 ### What a run measures
 
@@ -1072,9 +1081,9 @@ in through `Hooks`.
    part of a measuring frame and how fast the sensor reads. Takes about 25 s;
    the screen flashes and goes dark.`; help `A - Start   B - Back`. B returns
    to the Dev Mode menu.
-2. **A** runs the six steps in order, one per frame. Before each, the screen
-   shows `Probe frame timing`, then `<step> n/6` (for example
-   `Refresh rate 1/6`) and `B - Cancel`, and presents that frame itself. The
+2. **A** runs the eight steps in order, one per frame. Before each, the screen
+   shows `Probe frame timing`, then `<step> n/8` (for example
+   `Refresh rate 1/8`) and `B - Cancel`, and presents that frame itself. The
    step then blocks until it ends, so this is what stays on screen while it
    runs. After each step the backlight goes back to normal, so the next
    step's status can be read.
@@ -1087,8 +1096,10 @@ in through `Hooks`.
 | `refresh` | 60 back-to-back `display.update()`s with vsync on, after one to line up; the intervals, and `hz` = 1000 / mean | the panel's real refresh rate: 16.7 ms is 60 Hz, 11.1 ms is 90 Hz |
 | `write` | the same with `display.set_vsync(False)`, then vsync back on | what writing one frame costs on its own; about 7 ms is expected |
 | `breakdown` | 60 frames of each of two screens, drawn the way `run()` draws them: `clear` (`badge.clear()`), the screen's parts, `present`, `poll`. **`field`** is the signalling frame -- a transfer's, or a Dev Mode test's -- at LORES with `run()`'s clear off, its parts `field` (backlight and a full-screen fill) and `measure`. It fills every frame, so it is the frame that changes the field; one that does not skips `field`. **`status`** is Dev Mode's HIRES handshake screen: `bands` (black clear and two bands), `column` (the text), `lights` (backlight and case lights), `measure`. `measure` is `MirrorRun.frame()` and the status update, from a fresh `MirrorRun` per screen. Each part's mean and max, and the frame's stats. Then 8 more frames of each, untimed, for `alloc_bytes`: the mean heap growth per frame, where `gc.mem_alloc` exists | which part of a frame costs the time, and how much it allocates |
-| `reads` | four loops run back to back with **nothing presented**, each until 5,000 passes (`READ_CALLS`) or 1 s (`READ_MS`), whichever is first, timing every pass with `time.ticks_us()`: **`loop`** does nothing, so it is the loop's own cost (the clock read and the bookkeeping) to take off the others; **`read`** is one `badge.light_level()`; **`sample`** is `sample_light()`, the median of three reads every transfer frame takes; **`listen`** is a whole pass of a listener that never presents -- `time.ticks_ms()`, `sample_light()`, a data-phase `SlotReceiver.feed()` on the 50 ms rung (levels 32/64/112, a 17 ms frame), `badge.poll()` and `badge.pressed(BUTTON_B)`; **`transfer`** is a pass of the transfer's own listen loop -- `badge.light_level()` into a continuous `Transfer` listening in the data phase on the backlight's 32 ms rung, the buttons every `POLL_PASSES` -- with its silence budgets reset each pass, since nobody is sending. Each gives `calls`, `per_s`, and the pass's `mean_us`, `max_us` and `sd_us` | how many readings a receiver could take per slot if it held its screen static instead of presenting every frame -- a present blocks reading for ~12.3 ms of each 16.7 ms frame on v2 -- and whether anything (a collection, the receiver's growing lists) stalls such a loop: its `max_us` |
+| `reads` | four loops run back to back with **nothing presented**, each until 5,000 passes (`READ_CALLS`) or 1 s (`READ_MS`), whichever is first, timing every pass with `time.ticks_us()`: **`loop`** does nothing, so it is the loop's own cost (the clock read and the bookkeeping) to take off the others; **`read`** is one `badge.light_level()`; **`sample`** is `sample_light()`, the median of three reads every transfer frame takes; **`listen`** is a whole pass of a listener that never presents -- `time.ticks_ms()`, `sample_light()`, a data-phase `SlotReceiver.feed()` on the 50 ms rung (levels 32/64/112, a 17 ms frame), `badge.poll()` and `badge.pressed(BUTTON_B)`; **`transfer`** is a pass of the transfer's own listen loop -- `read_sample()`, the sensor read back to back for 2 ms, its mean handed to a continuous `Transfer`'s `sample()` listening in the data phase on the backlight's 32 ms rung, the buttons every `POLL_PASSES` -- with its silence budgets reset each pass, since nobody is sending; **`transfer_timed`** is the same pass on a second such listener whose `step()` is timed, and **`detail`** -- not a loop -- is where that time went: `sample`, the protocol's call, and its parts `filter_sample`, `pool_coarse` and `step_data`, each timed; `reads_per_sample` and `read_us`, how many readings a sample held and how long each took in `read_sample()`'s loop; and the listener's mean `light`, its `phase` at the end and the `flicker` it learnt. Each loop gives `calls`, `per_s`, and the pass's `mean_us`, `max_us` and `sd_us` | how many readings a receiver could take per slot if it held its screen static instead of presenting every frame -- a present blocks reading for ~12.3 ms of each 16.7 ms frame on v2 -- and whether anything (a collection, the receiver's growing lists) stalls such a loop: its `max_us` |
+| `fast_reads` | the sensor read straight from the ADC's registers, in [`fastadc.py`](../../firmware/apps/share_wifi/fastadc.py), 4,096 raw 12-bit readings (`FAST_READS`) per capture, three captures: **`viper`**, a `@micropython.viper` loop starting each conversion and waiting for it; **`dma_500k`** and **`dma_100k`**, the ADC converting free-running at 500k and 100k a second into its FIFO and a `rp2.DMA` channel moving each result to a buffer. Each first checks that the ADC's control register holds the sensor's input (3: GPIO43) and that its result register matches a `badge.light_level()` just taken, and refuses otherwise -- every address is from the Pico SDK's RP2350 headers, and a wrong one would fault. `fastadc` is imported by the first capture, so a firmware without viper fails the step, not the app; a DMA capture puts the ADC back as it found it. Each gives `reads`, `us`, `per_s`, `mean` in `light_level()` counts, and `noise`: for 1, 4, 16, 64 and 256 readings, the standard deviation of the means of that many consecutive readings, in counts | how fast the sensor can be read at all -- a `badge.light_level()` call costs ~14 µs over its loop, a conversion 2 µs -- and whether averaging many readings beats the noise: by the square root of their number if it is independent, not at all if it is in the light or the sensor. Together, how short a slot could be |
 | `alloc` | 1,000 calls each of a function returning nothing, a 2-tuple, a 4-tuple and an 8-tuple, built from the function's arguments so they really allocate; µs per call, with the bare call subtracted from the tuples | whether allocations bigger than one GC block are the slow kind |
+| `flicker_filter` | the protocol's `FlickerFilter` (handed in as `Hooks.flicker_filter`) on a synthetic room, made before anything is timed: 2 ms means every 3 ms, as a transfer keeps them, of 700 counts flickering 12 at 120 Hz and 4 at 240, with noise of about 4 from a fixed generator -- the shape of the 2026-10-06 room that flickered 12.5 counts. **`fit_first_us`**, one fit of the Leader's 200 ms window (66 samples), timed on its own because the first fit since launch also fills the protocol's gain tables; then **`fit`**, three more of it, and **`fit_follower`**, three of the Follower's 100 ms (33), each on a fresh filter; `verdict`, the first fit's. Then, on the first filter, as a transfer goes on from its fit: **`correct_first_us`**, the first correction, which builds the table for its span; **`correct`**, 500 more; **`track`**, a phase-lock point, and the updates after each 8: **`update`** for those under 0.3 s from the fit, and **`update_rate`** for those 0.7 s on, by when the rate's line spans the protocol's `FLICKER_RATE_MIN_S` and every update fits it. Each of the last five gives `calls`, `per_s`, `mean_us`, `max_us`, `sd_us`; `samples` and `follower_samples` say how many the fits had | what the filter costs on the badge: the simulator guesses the fit stalls a staircase step by 150 ms, the unix port took 3.3 ms, and badge protocol work has run up to 100 times slower |
 | `gc` | three timed `gc.collect()`s; heap in use and free (KiB); then 120 `status` frames with the collector on, and 120 with it off (`gc.disable()`, always followed by `gc.enable()`) | what a collection costs, and whether the long frames are collections |
 
 - **`temperature_c`** reads the chip's temperature before each step and at
@@ -1110,7 +1121,7 @@ in through `Hooks`.
   `{"error": "no set_vsync"}` for `write`. Vsync and the collector are always
   turned back on.
 - **B** is checked after every frame of `breakdown` and `gc`, after each of
-  the `reads` loops, and between steps. It cancels: nothing is saved, the panel is restored, and the screen
+  the `reads` loops and `fast_reads` captures, and between steps. It cancels: nothing is saved, the panel is restored, and the screen
   returns to the Dev Mode menu with this tool selected. `refresh`, `write` and
   `alloc` take about a second each and are not checked part way through.
 - **Not a measurement of the panel:** what is on screen during `refresh` and
@@ -1206,7 +1217,8 @@ The values above illustrate the format only. A failed test holds
 
 `<probe>` has one key per step of *probe frame timing*, plus `firmware` and
 `temperature_c`.
-Times are in ms to two decimals, except `reads` and `alloc`, which are in µs:
+Times are in ms to two decimals, except `reads`, `fast_reads`, `alloc` and
+`flicker_filter`, which are in µs:
 
     "firmware": {"version": "<os.uname().version>", "set_framerate": false},
     "refresh": {"frames": 60, "mean_ms": 16.67, "min_ms": 16.6, "max_ms": 16.74, "sd_ms": 0.03, "hz": 60.0},
@@ -1222,8 +1234,21 @@ Times are in ms to two decimals, except `reads` and `alloc`, which are in µs:
     "reads": {"loop":   {"calls": 5000, "per_s": 52000, "mean_us": 19.2, "max_us": 61, "sd_us": 2.1},
               "read":   {...}, "sample": {...},
               "listen": {"calls": 3100, "per_s": 3100, "mean_us": 322.5, "max_us": 9400, "sd_us": 410.0},
-              "transfer": {...}},
+              "transfer": {...}, "transfer_timed": {...},
+              "detail": {"sample": {"calls": 330, "per_s": 1100, "mean_us": 905.0, "max_us": 2900, "sd_us": 310.0},
+                         "filter_sample": {...}, "pool_coarse": {...}, "step_data": {...},
+                         "reads_per_sample": 31.0, "read_us": 64.5,
+                         "light": 48, "phase": 5, "flicker": 0.0}},
+    "fast_reads": {"viper": {"reads": 4096, "us": 9830, "per_s": 416700, "mean": 52.3,
+                             "noise": {"1": 9.8, "4": 5.1, "16": 2.6, "64": 1.4, "256": 0.9}},
+                   "dma_500k": {...},
+                   "dma_100k": {"error": "RuntimeError: DMA did not finish in 90 ms"}},
     "alloc": {"calls": 1000, "call_us": 6.1, "pair_us": 3.2, "quad_us": 31.0, "octet_us": 35.5},
+    "flicker_filter": {"samples": 66, "follower_samples": 33, "fit_first_us": 1813,
+                       "verdict": "flicker",
+                       "fit": {"calls": 3, "per_s": 688, "mean_us": 1453.7, "max_us": 1478, "sd_us": 18.6},
+                       "fit_follower": {...}, "correct_first_us": 327, "correct": {...},
+                       "track": {...}, "update": {...}, "update_rate": {...}},
     "gc": {"collect": {"mean_ms": 95.0, "max_ms": 101.0}, "alloc_kb": 210, "free_kb": 7900,
            "screen": "status", "frames_on": {<as refresh, less hz>}, "frames_off": {...}},
     "temperature_c": {"refresh": 24.8, "write": 24.8, ..., "gc": 25.3, "end": 25.4}
@@ -1309,10 +1334,10 @@ badge, no schedule. The capture and the analysis are in
 | | |
 |---|---|
 | Title | `Room flicker` |
-| Message | before any measurement: `Hold the badge where it will be used, sensor towards the room. A measures for a quarter of a second.`; after: `<n> measured. Last: <peak> Hz, <size> counts on <mean>` |
+| Message | before any measurement: `Hold the badge where it will be used, sensor towards the room. A measures for about 30 s.`; after: `<n> measured. Last: <peak> Hz, <size> counts on <mean>` |
 | Help | `A - Measure   B - Save & exit` |
-| A | take a measurement: the screen shows `Measuring - hold still`, presented at once, then the backlight goes **off** for the capture -- the badge's own PWM must not be what is measured -- and back to 230/255; the analysis follows. As many as wanted |
-| B | save every measurement taken and show *Done*, then back to the Dev Mode menu on this tool; with none taken, straight back to the menu, nothing written |
+| A | take a measurement: the screen shows `Measuring for about 30 s - hold still. The screen goes dark; hold B to stop.`, presented at once; then the backlight goes **off** and the case lights are held off -- the badge's own light must not be what is measured -- for the capture, its analysis and the drift windows, and the backlight returns to 230/255 when they end. As many as wanted; there is no cap |
+| B | on this screen: save every measurement taken and show *Done*, then back to the Dev Mode menu on this tool; with none taken, straight back to the menu, nothing written. **During the drift windows**: held as a window ends, stop them; the measurement is kept, its `drift` `{"error": "cancelled"}` |
 
 - **A capture** reads `light_level()` back to back for 250 ms
   (`CAPTURE_MS`), adding each reading to the 0.5 ms bin (`BIN_US`) it falls
@@ -1323,28 +1348,105 @@ badge, no schedule. The capture and the analysis are in
 - **The analysis**: the mean of the binned series, its standard deviation and
   peak to peak; the amplitude, in counts, of every 5 Hz from 20 to 1,000 Hz
   (Goertzel's algorithm, one multiply-add a bin), and the strongest as
-  `peak_hz` and `peak_counts`; and the amplitude at 50, 60, 100 and 120 Hz
-  under `hz` whatever the strongest. `read_us` is the mean time a reading
+  `peak_hz` and `peak_counts`; and under `hz` the amplitude at every
+  harmonic the fit uses -- 1-4 x 50 and 60 Hz: 50, 60, 100, 120, 150, 180,
+  200 and 240 (`HARMONIC_HZ`) -- whatever the strongest. `read_us` is the mean time a reading
   took. `temp_c` is the chip's temperature, as the other tools take it.
   Averaging ~18 readings a bin brings back flicker smaller than an ADC step,
   dithered by the sensor's own noise: 6 counts of 100 Hz in 16-count steps
   comes back as 3-9 in simulation.
+- **The fit**: the transfer's own `FlickerFilter.fit()` on the capture, fed
+  as a transfer feeds it -- the mean of each 2 ms (`FINE_MS`, four bins)
+  every 3 ms (six bins), timed at its middle, span 2,000 µs -- from the
+  first 200 ms (`FLICKER_FIT_MS`, 67 samples). A window it refuses is fitted
+  again on its newest half, as `Transfer.fit_flicker()` does. Under `filter`:
+  `verdict` (`"flicker"`, `"steady"` or `null`, refused), `reason` (why it
+  refused, else `null`), `window_ms` (the window the
+  verdict came from; `reason` is `"few"` under 12 samples, `"unfit"` when
+  no mains could be fitted, `"dof"` when the harmonics leave under 4
+  degrees of freedom, `"noise"` past `FLICKER_FIT_MAX_NOISE`), `mains` (the
+  region it preferred), `noise` (counts
+  left unexplained), `harmonics` (each harmonic's size in counts, keyed by
+  its Hz, before the significance test) and, for `"flicker"`, `kept` (the Hz
+  taken off). Then, on the capture's last ~50 ms, which the fit never saw,
+  `held_out` samples' standard deviation before (`sd_before`) and after
+  (`sd_after`) `correct()`: the flicker left in a transfer's samples.
+  `FlickerFilter.fit_info` carries the noise, mains and sizes out of `fit()`
+  whatever it returns; the transfer does not read it.
+- **The drift**: after the capture, 80 more windows of 250 ms
+  (`DRIFT_WINDOWS`), one a frame -- `run()` presents and polls between them,
+  so B can stop them, with its clear off. Each window's bins are projected
+  on the filter's own sine table (320 steps of 1.125 degrees, which average
+  out across the bins) at their time since the first window began, at
+  `drift.hz`: twice the fitted mains if the fit found flicker, else the
+  stronger of 100 and 120 Hz in `hz`; under 2 counts there
+  (`DRIFT_MIN_COUNTS`), `drift` is `{"error": "no mains flicker"}` and no
+  windows are taken. The phases are unwrapped against the line through the
+  first and latest, and a least-squares line through them all gives
+  `offset_mhz_vs_clock`: the mains' offset from nominal, in mHz. `seconds`
+  is the time from the first window to the last, `windows` how many,
+  `wander_deg` the phases' standard deviation about the line.
+  - **Against the badge's own clock, not absolute.** `time.ticks_us()` is
+    the RP2350's timer, counting a tick generator run from the crystal
+    oscillator **[inferred-all]** from the RP2350 datasheet's clocking; the
+    crystal's tolerance on this board is not documented in this repo
+    **[unverified]**. A typical ±30 ppm crystal moves 50 or 60 Hz by up to
+    0.0018 Hz -- 1.8 mHz -- so a figure that small cannot be told from the
+    clock. Two badges agree on the mains only to their crystals.
+  - **Range.** Unwrapping holds while the flicker moves under half a cycle
+    between the first two windows: a mains offset under 1 / (4 x their
+    gap), 0.93 Hz at windows 270 ms apart. Past it the answer aliases and
+    looks clean -- 0.95 Hz reads as -0.9 with little wander -- so a window
+    landing more than a quarter cycle (`DRIFT_AMBIGUOUS_TURNS`) from where
+    the line predicted marks the result `"ambiguous": true`: any offset
+    over about half the limit, 0.46 Hz. Grids hold ±0.2 Hz, so an
+    ambiguous result is a bad window or a light that is not on the mains,
+    not a figure to use.
+  - **Ending.** The run ends after `DRIFT_WINDOWS` attempts, read or not, so
+    a window with no reading cannot keep the screen dark.
+  - **B is not latched.** `poll()` reads the buttons' GPIO levels once a
+    frame and `pressed` is the change since the last poll, on v2
+    **[source-v2]** (`picovector/micropython/input.cpp` at `db958ce`) and v3
+    **[source-v3]** (`modules/c/input/input.cpp`). A frame here is a 250 ms
+    window, so a tap between polls is missed: the screen says *hold B*, and
+    the frame checks `held(BUTTON_B)`.
+  - **Precision.** For 12 counts of flicker and a 0.3-degree phase scatter a
+    window, the line's slope is good to far better than 0.01 Hz; in
+    simulation `wander_deg` under 3 with 4 counts of noise. What it
+    measures is the mains' own wander over the ~25 s.
+- **What a measurement takes**: the capture's quarter second, the analysis
+  -- one to two seconds of Goertzel on the v2 badge [inferred-v2] -- and the
+  drift: 80 x (250 ms, the window's phase, and a frame of 17-33 ms), about
+  25 s. The screen says about 30.
+- **Storage**: a saved measurement is about 550 bytes of JSON, so 20 are
+  about 11 KB; with the other tools the file is about 21 KB, six of the
+  flash's ~256 4 KB blocks, written once a session.
 - **What it found** (2026-10-06): every LED light flickered at 120 Hz, by 1%
   of its light in one room, 30-47% in an open area, 0.1% in another
   **[measured-all]**. Enough that the protocol now filters it -- see "Mains
   flicker is filtered" in the protocol.
 - **What it cannot tell**: which light flickers, or whether the sensor sees
   the room or a lamp; hold the badge where a transfer would be. The capture is
-  a quarter second, so frequencies are resolved to about 4 Hz.
+  a quarter second, so the spectrum resolves frequencies to about 4 Hz; the
+  drift, not the spectrum, gives the mains to the mHz.
 
 **In the measurements file** the tool's, one numbered entry per
 measurement, in the order taken:
 
     "room_flicker": {
-      "1": {"reads": 9310, "read_us": 26.9, "mean": 96.4, "sd": 3.1, "p2p": 14.0,
-            "peak_hz": 100, "peak_counts": 4.2,
-            "hz": {"50": 0.3, "60": 0.2, "100": 4.2, "120": 0.4}, "temp_c": 24.6},
-      "2": {...}
+      "1": {"reads": 9310, "read_us": 26.9, "mean": 696.4, "sd": 9.1, "p2p": 32.0,
+            "peak_hz": 120, "peak_counts": 12.1,
+            "hz": {"50": 0.3, "60": 0.0, "100": 0.1, "120": 12.1,
+                   "150": 0.4, "180": 0.2, "200": 0.1, "240": 3.7},
+            "filter": {"verdict": "flicker", "reason": null, "window_ms": 200,
+                       "mains": 60, "noise": 0.9,
+                       "harmonics": {"60": 0.2, "120": 12.3, "180": 0.2, "240": 3.9},
+                       "kept": [120], "held_out": 16,
+                       "sd_before": 8.3, "sd_after": 1.7},
+            "drift": {"hz": 120, "windows": 80, "ambiguous": false, "seconds": 23.8,
+                      "offset_mhz_vs_clock": 13.0, "wander_deg": 0.4},
+            "temp_c": 24.6},
+      "2": {..., "drift": {"error": "no mains flicker"}}
     }
 
 A *measure room flicker* session saved replaces only `room_flicker`; one

@@ -101,7 +101,11 @@ class FakeBadge(Stub):
         return [] if button is None else False
 
     def held(self, button=None):
-        return [] if button is None else False
+        # A button newly pressed is down, so held too, as on the badge:
+        # pressed is held & changed.
+        if button is None:
+            return list(self.queued)
+        return button in self.queued
 
     def changed(self, button=None):
         return [] if button is None else False
@@ -324,6 +328,18 @@ class FakeState(Stub):
     # filesystem. `fail_writes` makes it raise the way flash can.
     fail_writes = False
 
+    # `fail_deletes` leaves the file in place, as a delete flash refused
+    # would: the app's delete_measurements() then finds it still there.
+    fail_deletes = False
+
+    def delete_file(self, name):
+        """True if the file is gone afterwards, as delete_measurements()
+        reports."""
+        if self.fail_deletes:
+            return name not in self.files and name != self.primary
+        self.files.pop(name, None)
+        return True
+
     def write_file(self, name, data):
         if self.fail_writes:
             raise OSError(28, "No space left on device")
@@ -542,6 +558,10 @@ def load_app(name, max_frames=0, networks=None, run_frames=0,
         state = injected["State"]
         namespace["write_measurements"] = (
             lambda data: state.write_file("measurements", data))
+    if "delete_measurements" in namespace:
+        state = injected["State"]
+        namespace["delete_measurements"] = (
+            lambda: state.delete_file("measurements"))
     namespace.setdefault("wifi", fake_wifi)
     namespace.setdefault("secrets", fake_secrets)
     namespace.setdefault("printed_lines", printed)

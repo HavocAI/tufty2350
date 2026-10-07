@@ -118,12 +118,13 @@ Pimoroni set plus other team apps; see [README.md](README.md).
   also the one app the simulator cannot run, because there is no `network`
   module there.
 - `share_wifi` — shares credentials between badges over the screen and light
-  sensor. Five files: `protocol.py` is the wire format and state machine, pure
+  sensor. Six files: `protocol.py` is the wire format and state machine, pure
   Python with no badge globals and no knowledge of WiFi; `measure.py` is Dev
   Mode's measurement engine, `probe.py` its frame timing probe and
   `flicker.py` its room-flicker capture, all pure in the same way;
   `__init__.py` is the shell around them — drawing, buttons, storage,
-  connecting.
+  connecting; and `fastadc.py`, badge-only, reads the sensor straight from
+  the RP2350's ADC registers, by viper and by DMA, for the probe.
 
   It completes a transfer end to end **in simulation**: `python3
   tests/share_wifi/simulator.py` delivers the payload in all six scenarios with
@@ -141,9 +142,9 @@ Pimoroni set plus other team apps; see [README.md](README.md).
   the optics.
 
   **A transfer reads continuously.** `do_transfer()` is a loop that reads the
-  sensor on every pass -- ~2,300 a second on the badge, against about one a
-  slot when it presented every frame -- and steps a `Transfer(continuous=True)`
-  with each reading, which pools them into 2 ms and 8 ms samples. A change of
+  sensor back to back for a 2 ms sample -- `read_sample()`, nothing but
+  locals -- and hands their mean to `Transfer(continuous=True).sample()`,
+  which pools samples into 8 ms ones for calibration. A change of
   backlight is made in the loop; only a change of pixels returns to `run()` to
   be presented. So on the backlight scheme, whose pixels are white for every
   symbol, nothing is presented in the data phase and neither badge is ever
@@ -158,9 +159,24 @@ Pimoroni set plus other team apps; see [README.md](README.md).
   "Reading continuously" in the protocol, which also has the stress sweeps
   and where it fails. Room lights flicker at 120 Hz, some by nearly half
   their light (measured), so in the data phase a continuous badge learns the
-  flicker from slots it knows were dark and takes it off every reading:
-  `step()` takes `now_us` for it. Calibration is not filtered, so very
-  bright flickering light still defeats it in simulation.
+  flicker before calibration -- the region, 50 or 60 Hz, and the light's
+  own shape, from a window its peer is known dark in -- then corrects every
+  sample with a table and tracks the mains' drift with a phase lock (see
+  "Mains flicker is fitted" in the protocol; in simulation a 0.02 Hz drift
+  took the old learner to 77 of 144, and the fit to 144). It takes the
+  flicker off every 2 ms sample: `sample()` takes the sample's time in µs for it.
+  Before any fit, a Follower in the handshake drops a coarse sample its own
+  present cut short (`HANDSHAKE_GAP_MS`): at three times the lit room's
+  light one such sample hid the Leader's beacon edge and 30 of 144 failed;
+  now 144 (see "Peer present" in the protocol).
+  **The protocol is called once a sample, not once a reading**, because on
+  the badge each Python operation costs microseconds and a protocol call
+  about a millisecond [measured-v2]: called per reading, it took every
+  pass -- 380, then 705, then 1,073 µs a reading -- and a shortcut for
+  readings in the same ms never ran, since no two readings ever were.
+  MicroPython's unix port, six to fifteen times *faster* on the same
+  change, is no guide to the badge's costs. See "What a reading costs" in
+  the protocol.
 
   The screen transmits on **the whole screen, at `LORES`, with nothing else
   drawn**, `run()`'s clear switched off and the field redrawn only when it
@@ -270,11 +286,16 @@ Pimoroni set plus other team apps; see [README.md](README.md).
   badge's own backlight and decodes the reflection with the transfer's own
   continuous receiver at 50 down to 16 ms: the first hardware check of the
   continuous path, and a measurement of the edge delay it assumes.
-  **measure room flicker** is a tool of its own: A takes a quarter-second
-  capture, as many as wanted, B saves them all under `room_flicker` -- the
-  strongest frequency from 20 Hz to 1 kHz and its size in counts, and the
-  amplitude at 50, 60, 100 and 120 Hz -- because mains flicker would be noise
-  inside the lit room's 16 ms slots. `flicker.py` is its pure module.
+  **measure room flicker** is a tool of its own: A takes a measurement of
+  about 30 s, as many as wanted, B saves them all under `room_flicker` -- the
+  strongest frequency from 20 Hz to 1 kHz and its size in counts, the
+  amplitude at every harmonic the filter fits (1-4 x 50 and 60 Hz), the
+  transfer's own `FlickerFilter` fit on the capture with the flicker left
+  before and after correction, and the mains' drift from 80 more windows,
+  in mHz **against the badge's own clock** -- because mains flicker would be
+  noise inside the lit room's 16 ms slots. `flicker.py` is its pure module.
+  *clear saved measurements* deletes the file. The probe's
+  `flicker_filter` step times the filter itself.
   See "Dev Mode" in
   [.agents/docs/share_wifi_spec.md](.agents/docs/share_wifi_spec.md), whose
   "Known gaps" are open decisions.
@@ -290,7 +311,17 @@ Pimoroni set plus other team apps; see [README.md](README.md).
   2,166 readings a second -- about 40 in a 50 ms slot's read window, against
   about one while presenting every frame -- which is why a transfer now reads
   continuously. `reads.transfer` times a pass of the real listen loop, the
-  read rate the simulator's 0.43 ms assumes -- 380 µs on 2026-10-06. Every
+  read rate the simulator's 0.43 ms assumes -- 380 µs on 2026-10-06.
+  `fast_reads` reads the sensor straight from the ADC, through `fastadc.py`:
+  by viper, and by DMA at 500k and 100k a second, each giving its rate and
+  how the noise falls when 1-256 readings are averaged -- how short a slot
+  could be. Its first run (2026-10-06a): viper reads at 359k a second,
+  2.8 µs, and averaging 64 readings brings the noise to about a count, so
+  noise no longer limits a slot -- the sensor's settle does. In the same
+  run `reads.transfer` got *slower*, 705 µs a pass against 380, and the
+  next, with `reads.detail` timing it, showed why: a protocol call per
+  reading costs a ms. `reads.transfer` is now a pass of the sampling loop,
+  and `reads.detail` the call's parts and the readings a sample held. Every
   Dev Mode tool and the probe also record the chip's temperature,
   `temperature_c`, at each test. It works on v2, and ruled itself out as why
   the panel's edges were slower in some runs. See "probe frame timing" in the spec
@@ -619,7 +650,9 @@ takes `frame_ms=lambda: badge.ticks_delta` rather than reaching for it.
 references no badge globals. `probe.py` takes even the present, the clear and
 the collector as hooks, and `tests/share_wifi/test_probe.py` checks the same. So
 does `flicker.py`, which takes the sensor and the clock, in
-`tests/share_wifi/test_flicker.py`.
+`tests/share_wifi/test_flicker.py`. `fastadc.py` is the exception, and
+deliberately: it is registers and nothing else, and the arithmetic on what
+it reads is `probe.fast_stats()`.
 
 ## Picking up an in-flight task
 

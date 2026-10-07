@@ -28,18 +28,20 @@ import wifi
 try:
     from protocol import (
         ERR_CANCELLED, ERR_CONTRAST, ERR_CRC, ERR_DECODE, ERR_LOST_PEER,
-        BACKLIGHT_INDEX, ERR_NO_PEER, FAST_INDEX, LEVEL_SCHEMES, LOW, OK,
+        BACKLIGHT_INDEX, ERR_NO_PEER, FAST_INDEX, FINE_MS, LEVEL_SCHEMES, LOW,
+        OK,
         PHASE_ANNOUNCE, PHASE_DONE, PHASE_PRESENT,
-        SCHEME_BACKLIGHT, SCHEME_FIELDS, Levels, SlotClock, SlotReceiver,
-        Transfer, parse_payload,
+        SCHEME_BACKLIGHT, SCHEME_FIELDS, FlickerFilter, Levels, SlotClock,
+        SlotReceiver, Transfer, parse_payload,
     )
 except ImportError:
     from .protocol import (
         ERR_CANCELLED, ERR_CONTRAST, ERR_CRC, ERR_DECODE, ERR_LOST_PEER,
-        BACKLIGHT_INDEX, ERR_NO_PEER, FAST_INDEX, LEVEL_SCHEMES, LOW, OK,
+        BACKLIGHT_INDEX, ERR_NO_PEER, FAST_INDEX, FINE_MS, LEVEL_SCHEMES, LOW,
+        OK,
         PHASE_ANNOUNCE, PHASE_DONE, PHASE_PRESENT,
-        SCHEME_BACKLIGHT, SCHEME_FIELDS, Levels, SlotClock, SlotReceiver,
-        Transfer, parse_payload,
+        SCHEME_BACKLIGHT, SCHEME_FIELDS, FlickerFilter, Levels, SlotClock,
+        SlotReceiver, Transfer, parse_payload,
     )
 
 # Dev Mode's measurement engine: pure, like the protocol, and imported the same
@@ -59,15 +61,27 @@ except ImportError:
 
 # Dev Mode's frame timing probe: pure too, with the badge handed in as hooks.
 try:
-    from probe import STEP_TITLES, STEPS, TOOL_PROBE, FrameProbe, Hooks
+    from probe import (
+        FAST_READS, STEP_TITLES, STEPS, TOOL_PROBE, FrameProbe, Hooks,
+        TimeStats,
+    )
 except ImportError:
-    from .probe import STEP_TITLES, STEPS, TOOL_PROBE, FrameProbe, Hooks
+    from .probe import (
+        FAST_READS, STEP_TITLES, STEPS, TOOL_PROBE, FrameProbe, Hooks,
+        TimeStats,
+    )
 
 # Dev Mode's room-flicker tool: pure, the sensor and clock handed in.
 try:
-    from flicker import TOOL_FLICKER, Capture, analyse, summary
+    from flicker import (
+        DRIFT_WINDOWS, TOOL_FLICKER, Capture, Drift, analyse, drift_hz,
+        summary,
+    )
 except ImportError:
-    from .flicker import TOOL_FLICKER, Capture, analyse, summary
+    from .flicker import (
+        DRIFT_WINDOWS, TOOL_FLICKER, Capture, Drift, analyse, drift_hz,
+        summary,
+    )
 
 badge.mode(HIRES | VSYNC)
 
@@ -467,6 +481,61 @@ def probe_listener():
     transfer.now = now
     transfer.start_data(now, BACKLIGHT_INDEX)
     return transfer
+
+
+class TimedListener:
+    """A probe listener driven as the listen loop drives a transfer, with
+    the protocol's call and its parts timed by timing the listener's own
+    methods, and the readings each sample held counted."""
+
+    def __init__(self, transfer):
+        self.transfer = transfer
+        self.buf = [0, 0, 0, 0, 0, 0]
+        self.parts = {}
+        self.samples = 0
+        self.reads = 0
+        self.read_us = 0
+        self.light_sum = 0
+        for name in ("sample", "filter_sample", "pool_coarse", "step_data"):
+            self.parts[name] = TimeStats()
+            # An instance attribute is found before the class's method.
+            setattr(transfer, name, self.timed(getattr(transfer, name),
+                                               self.parts[name]))
+
+    @staticmethod
+    def timed(method, stats):
+        def call(*args):
+            t = time.ticks_us()
+            out = method(*args)
+            stats.add(time.ticks_diff(time.ticks_us(), t))
+            return out
+        return call
+
+    def step(self):
+        transfer = self.transfer
+        buf = self.buf
+        read_sample(SAMPLE_US, transfer.deadline(), buf)
+        transfer.sample(buf[0], buf[1], buf[2], buf[3], buf[4])
+        self.samples += 1
+        self.reads += buf[5]
+        self.read_us += buf[4]
+        self.light_sum += buf[2]
+        transfer.idle_slots = 0
+        transfer.stall_slots = 0
+
+    def result(self):
+        transfer = self.transfer
+        out = {}
+        for name in self.parts:
+            out[name] = self.parts[name].rate()
+        n = self.samples
+        out["reads_per_sample"] = round(self.reads / n, 1) if n else 0
+        out["read_us"] = round(self.read_us / self.reads, 1) \
+            if self.reads else 0
+        out["light"] = self.light_sum // n if n else 0
+        out["phase"] = transfer.phase
+        out["flicker"] = round(transfer.flicker.size(), 1)
+        return out
 
 
 # --- drawing ----------------------------------------------------------------
@@ -907,12 +976,59 @@ def move_cursor(cursor, count):
 
 # Progress goes to the rear LEDs, because during a transfer both screens face
 # away from their users.
-# Readings one update() may take while a transfer runs; 0 is no limit. The
+# Samples one update() may take while a transfer runs; 0 is no limit. The
 # listen loop otherwise returns to run() only to present a change of pixels
 # or when the transfer ends. A test stepping one field a frame sets 1.
 TRANSFER_PASSES = 0
-# Readings between button polls in it: about 7 ms on the badge.
+# Samples between button polls in it: about 50 ms on the badge.
 POLL_PASSES = 16
+
+# How long the listen loop reads before handing the protocol one sample: its
+# fine sample. The protocol call that follows is ~1 ms on the badge
+# [measured-v2], and nothing is read during it.
+SAMPLE_US = FINE_MS * 1000
+
+# read_sample()'s result, reused so a sample allocates nothing: the ms now,
+# the readings' mean time in ms, their mean, their mean time in us, how long
+# they were read for in us, and how many there were.
+_SAMPLE = [0, 0, 0, 0, 0, 0]
+
+
+def read_sample(limit_us, deadline, out):
+    """Reads the sensor back to back for `limit_us`, or until `deadline`
+    -- a ticks_ms, or None -- if that comes first, into `out` (see
+    _SAMPLE). The tight loop is the point: locals only, no protocol, so a
+    sample is as many readings as the badge can take."""
+    light_level = badge.light_level
+    ticks_us = time.ticks_us
+    ticks_diff = time.ticks_diff
+    total = 0
+    n = 0
+    start = ticks_us()
+    if deadline is None:
+        while True:
+            total += light_level()
+            n += 1
+            if ticks_diff(ticks_us(), start) >= limit_us:
+                break
+    else:
+        # Transmitting: the symbol changes at the deadline, so stop there.
+        ticks_ms = time.ticks_ms
+        while True:
+            total += light_level()
+            n += 1
+            if (ticks_diff(ticks_us(), start) >= limit_us
+                    or ticks_diff(ticks_ms(), deadline) >= 0):
+                break
+    span = ticks_diff(ticks_us(), start)
+    now = time.ticks_ms()
+    half = span // 2
+    out[0] = now
+    out[1] = time.ticks_add(now, -((half + 500) // 1000))
+    out[2] = total // n
+    out[3] = time.ticks_add(start, half)
+    out[4] = span
+    out[5] = n
 
 
 def transfer_lights(transfer):
@@ -966,10 +1082,12 @@ DEV_MODE = "Dev Mode"           # appended to the main menu by C; never saved
 DEV = "dev"
 DEV_ITEMS = ("measure screen w/ mirror", "measure screen w/ 2nd badge",
              "probe frame timing", "measure room flicker",
-             "display measurements")
-TOOL_INDEX = {TOOL_MIRROR: 0, TOOL_SECOND_BADGE: 1, TOOL_PROBE: 2,
-              TOOL_FLICKER: 3}
+             "display measurements", "clear saved measurements")
+TOOL_CLEAR = "clear"            # not a tool: where Done returns the cursor
 DISPLAY_INDEX = 4
+CLEAR_INDEX = 5
+TOOL_INDEX = {TOOL_MIRROR: 0, TOOL_SECOND_BADGE: 1, TOOL_PROBE: 2,
+              TOOL_FLICKER: 3, TOOL_CLEAR: CLEAR_INDEX}
 DEV_ROLE = "dev_role"           # 2nd badge: who goes first
 DEV_PROMPT = "dev_prompt"       # Dark room / Bright room
 DEV_MEASURE = "dev_measure"     # the 3 s delay, then one condition's run
@@ -978,12 +1096,21 @@ DEV_DISPLAY = "dev_display"     # display measurements
 DEV_PROBE_PROMPT = "dev_probe_prompt"   # probe frame timing: what it does
 DEV_PROBE = "dev_probe"                 # probe frame timing: running
 DEV_FLICKER = "dev_flicker"             # measure room flicker
+DEV_FLICKER_DRIFT = "dev_flicker_drift"  # ... its drift windows, screen dark
 FLICKER_TITLE = "Room flicker"
 FLICKER_HELP = "A - Measure   B - Save & exit"
+# What a measurement takes, said before the screen goes dark: the capture and
+# its analysis, a second or two, then DRIFT_WINDOWS windows of 250 ms, each
+# with its phase worked out and a frame presented -- about 0.3 s a window on
+# the 60 Hz badge [inferred-v2], so about 25 s, said as 30 for the margin.
+FLICKER_MEASURING = ("Measuring for about 30 s - hold still. The screen "
+                     "goes dark; hold B to stop.")
+CLEARED = "Measurements cleared"
 
 # --- dev mode ----------------------------------------------------------------
 # /state/measurements.json, one object per tool. Written once, when a run ends.
 MEASUREMENTS = "measurements"
+MEASUREMENTS_PATH = "/state/%s.json" % MEASUREMENTS
 MEASURE_DELAY_MS = 3000         # after A, so the hand pressing it can get clear
 
 CONDITION_TITLES = {"dark": "Dark room", "lit": "Bright room"}
@@ -1066,8 +1193,27 @@ def write_measurements(data):
         os.stat("/state")
     except OSError:
         os.mkdir("/state")
-    with open("/state/%s.json" % MEASUREMENTS, "w") as handle:
+    with open(MEASUREMENTS_PATH, "w") as handle:
         handle.write(json.dumps(data))
+
+
+def delete_measurements():
+    """Delete the measurements file. True if it is gone -- deleted, or never
+    there -- and False only if it is still there.
+
+    Not State.delete(), which swallows every OSError, so a file it failed to
+    delete would read as cleared. Nor errno, unproven on the badge: whether
+    the file is still there afterwards is the answer that matters.
+    """
+    try:
+        os.remove(MEASUREMENTS_PATH)
+    except OSError:
+        pass
+    try:
+        os.stat(MEASUREMENTS_PATH)
+    except OSError:
+        return True
+    return False
 
 
 # Reads of the temperature sensor averaged into one figure: one read is
@@ -1095,6 +1241,49 @@ def core_temp_reader():
             total += adc.read_u16()
         return core_temp_c(total / TEMP_READS)
     return read
+
+
+# The probe's fast_reads captures: viper, then DMA back to back and at a fifth
+# of that.
+FAST_DMA_RATES = (500000, 100000)
+
+
+def fast_reads():
+    """The probe's fast_reads captures, as (name, capture) pairs, each
+    giving (raw readings, us). fastadc is imported by the first capture,
+    not here: on a firmware without viper it does not compile, and that
+    fails the step, not the app. Each capture first checks the ADC's
+    registers are where fastadc thinks -- a wrong address would fault."""
+    held = []
+
+    def ready():
+        if not held:
+            try:
+                import fastadc
+            except ImportError:
+                from . import fastadc
+            held.append(fastadc)
+            held.append(fastadc.buffer(FAST_READS))
+        fastadc, buf = held
+        problem = fastadc.check(badge.light_level)
+        if problem:
+            raise RuntimeError(problem)
+        return fastadc, buf
+
+    def viper():
+        fastadc, buf = ready()
+        return buf, fastadc.viper_capture(buf, FAST_READS)
+
+    def dma(rate):
+        def capture():
+            fastadc, buf = ready()
+            return buf, fastadc.dma_capture(buf, FAST_READS, rate)
+        return capture
+
+    out = [("viper", viper)]
+    for rate in FAST_DMA_RATES:
+        out.append(("dma_%dk" % (rate // 1000), dma(rate)))
+    return tuple(out)
 
 
 def firmware_info():
@@ -1162,15 +1351,20 @@ class App:
         self.delay_until = 0
         self.dark_result = None
         self.saved_ok = False
+        self.saved_message = None       # Done's message, if not the save's
         self.status_a = ""
         self.status_b = None
         self.status_c = None
         self.status_phase = None
         self.status_number = -1
         self.status_no_answer = False
-        # measure room flicker: its capture buffers and the results so far.
+        # measure room flicker: its capture buffers and the results so far,
+        # and while the drift is measured, its windows and the result they
+        # will join.
         self.flicker = None
         self.flicker_results = []
+        self.drift = None
+        self.drift_result = None
         # probe frame timing: the probe, the run its frames measure with, and
         # the slot receiver its reads step times.
         self.probe = None
@@ -1280,11 +1474,12 @@ class App:
         self.screen = TRANSFER
 
     def do_transfer(self):
-        """The transfer's listen loop: a reading every pass, nothing presented.
+        """The transfer's listen loop: a sample every pass, nothing presented.
 
-        Each pass reads the sensor once and steps the protocol, which pools
-        the readings. A change of backlight is made at once -- it needs no
-        present. Only a change of pixels returns to run(), whose present shows
+        Each pass reads the sensor for a sample -- read_sample(): FINE_MS of
+        readings, or up to the next symbol boundary while transmitting --
+        and hands their mean to the protocol. A change of backlight is made
+        at once -- it needs no present. Only a change of pixels returns to run(), whose present shows
         it; that blocks reading for up to a refresh and a write, so the
         backlight scheme, whose pixels never change, is never blind. The
         buttons are polled every POLL_PASSES, which also keeps badge.ticks
@@ -1295,29 +1490,38 @@ class App:
         # loop.
         if badge.pressed(BUTTON_B):
             transfer.fail(ERR_CANCELLED)
-        light_level = badge.light_level
-        ticks_ms = time.ticks_ms
-        ticks_us = time.ticks_us
+        sample = transfer.sample
+        buf = _SAMPLE
         limit = TRANSFER_PASSES
         passes = 0
+        # What the screen was last set for: a pass only looks up the
+        # backlight and pen when the field or the scheme has changed. Most
+        # passes change neither, and the fewer things a pass does, the more
+        # readings a slot gets.
+        shown_field = shown_scheme = None
         while True:
+            read_sample(SAMPLE_US, transfer.deadline(), buf)
             # The microseconds let the protocol take the room's mains
-            # flicker off the reading.
-            field = transfer.step(ticks_ms(), light_level(), ticks_us())
+            # flicker off the sample.
+            field = sample(buf[0], buf[1], buf[2], buf[3], buf[4])
             if transfer.phase == PHASE_DONE:
                 self.finish_transfer(transfer)
                 return
             scheme = transfer.scheme
-            backlight = FIELD_BACKLIGHT[scheme].get(field, 1.0)
-            if _SHOWN[1] != backlight:
-                show_backlight(backlight)
-            pen = FIELD_COLOR[scheme].get(field, color.black)
-            if _SHOWN[0] is not pen:
-                # The whole screen is the field and nothing else is drawn.
-                fill(pen)
-                _SHOWN[0] = pen
-                transfer_lights(transfer)
-                return
+            if field != shown_field or scheme != shown_scheme:
+                shown_field = field
+                shown_scheme = scheme
+                backlight = FIELD_BACKLIGHT[scheme].get(field, 1.0)
+                if _SHOWN[1] != backlight:
+                    show_backlight(backlight)
+                pen = FIELD_COLOR[scheme].get(field, color.black)
+                if _SHOWN[0] is not pen:
+                    # The whole screen is the field and nothing else is
+                    # drawn.
+                    fill(pen)
+                    _SHOWN[0] = pen
+                    transfer_lights(transfer)
+                    return
             passes += 1
             if passes % POLL_PASSES == 0 or passes == limit:
                 badge.poll()
@@ -1498,12 +1702,26 @@ class App:
                 self.screen = DEV_PROBE_PROMPT
             elif self.cursor == 3:
                 self.begin_flicker()
-            else:
+            elif self.cursor == DISPLAY_INDEX:
                 self.open_measurements()
+            else:
+                self.clear_measurements()
 
     def to_dev(self, index):
         self.cursor = index
         self.screen = DEV
+        self.saved_message = None
+
+    def clear_measurements(self):
+        # The same message whether there was a file or not: either way there
+        # are no measurements now.
+        self.measure_tool = TOOL_CLEAR
+        try:
+            self.saved_ok = delete_measurements()
+        except Exception:   # noqa: BLE001 - run() would turn it into a reset
+            self.saved_ok = False
+        self.saved_message = CLEARED if self.saved_ok else "Could not clear"
+        self.screen = DEV_SAVED
 
     def tool_index(self):
         return TOOL_INDEX.get(self.measure_tool, 0)
@@ -1753,8 +1971,11 @@ class App:
     def do_dev_saved(self):
         fill(color.black)
         draw_title("Done")
-        draw_centered("Measurements saved" if self.saved_ok
-                      else "Could not save measurements")
+        if self.saved_message:
+            draw_centered(self.saved_message)
+        else:
+            draw_centered("Measurements saved" if self.saved_ok
+                          else "Could not save measurements")
         draw_help("Any button - Back")
         caselights_for("attention")    # waiting on the user
         if badge.pressed():
@@ -1865,11 +2086,15 @@ class App:
             ticks_us=time.ticks_us,
             reads=(("loop", self.probe_idle), ("read", badge.light_level),
                    ("sample", sample_light), ("listen", self.probe_listen),
-                   ("transfer", self.probe_transfer)),
-            temp=core_temp_reader())
+                   ("transfer", self.probe_transfer),
+                   ("transfer_timed", self.probe_transfer_timed)),
+            reads_detail=self.probe_transfer_detail,
+            temp=core_temp_reader(), fast=fast_reads(),
+            flicker_filter=FlickerFilter)
         self.probe_receiver = probe_receiver()
         self.probe_listener = probe_listener()
         self.probe_passes = 0
+        self.probe_timed = TimedListener(probe_listener())
         self.probe = FrameProbe(hooks, firmware_info())
         self.screen = DEV_PROBE
 
@@ -1917,14 +2142,28 @@ class App:
         badge.poll()
         badge.pressed(BUTTON_B)
 
+    def probe_transfer_timed(self):
+        # The same pass, on a second listener whose step and parts are
+        # timed: where `transfer`'s time goes.
+        self.probe_timed.step()
+        self.probe_passes += 1
+        if self.probe_passes % POLL_PASSES == 0:
+            badge.poll()
+            badge.pressed(BUTTON_B)
+
+    def probe_transfer_detail(self):
+        return self.probe_timed.result()
+
     def probe_transfer(self):
         # One pass of the transfer's own listen loop, as do_transfer() runs
-        # it: a reading into a continuous Transfer listening in the data phase
+        # it: a sample into a continuous Transfer listening in the data phase
         # on the backlight, and the buttons every POLL_PASSES. What it hears
         # is thrown away, and so are the budgets that would end it -- nobody
         # is transmitting.
         listener = self.probe_listener
-        listener.step(time.ticks_ms(), badge.light_level(), time.ticks_us())
+        buf = _SAMPLE
+        read_sample(SAMPLE_US, listener.deadline(), buf)
+        listener.sample(buf[0], buf[1], buf[2], buf[3], buf[4])
         listener.idle_slots = 0
         listener.stall_slots = 0
         self.probe_passes += 1
@@ -1977,8 +2216,7 @@ class App:
                                                     summary(results[-1])))
         else:
             draw_centered("Hold the badge where it will be used, sensor "
-                          "towards the room. A measures for a quarter of a "
-                          "second.")
+                          "towards the room. A measures for about 30 s.")
         draw_help(FLICKER_HELP)
         caselights_for("idle")
         if badge.pressed(BUTTON_A):
@@ -1987,21 +2225,60 @@ class App:
             self.save_flicker()
 
     def measure_flicker(self):
-        # Shown first: the capture and its analysis block for a second or two.
+        # Shown first: the capture and its analysis block for a second or two,
+        # and the drift that follows keeps the screen dark.
         fill(color.black)
         draw_title(FLICKER_TITLE)
-        draw_centered("Measuring - hold still")
+        draw_centered(FLICKER_MEASURING)
         display.update()
         temp = core_temp_reader()
-        # The badge's own backlight off while it reads: its PWM must not be
-        # what is measured. The screen goes dark for the quarter second.
+        # The badge's own light off while it reads -- backlight and case
+        # lights both: its PWM must not be what is measured.
+        badge.caselights(0.0)
         display.backlight(0.0)
         self.flicker.take(badge.light_level, time.ticks_us)
-        display.backlight(BACKLIGHT_NORMAL)
         result = analyse(self.flicker)
         if temp is not None:
             result["temp_c"] = temp()
+        hz = drift_hz(result)
+        if hz is None:
+            result["drift"] = {"error": "no mains flicker"}
+            self.end_flicker(result)
+            return
+        # One drift window a frame, from the next: run() presents and polls
+        # between them, so B can stop it. Its clear is off -- nothing is
+        # drawn, the screen is dark -- and the panel keeps what it had.
+        self.drift = Drift(hz)
+        self.drift_result = result
+        badge.default_clear = None
+        self.screen = DEV_FLICKER_DRIFT
+
+    def do_dev_flicker_drift(self):
+        badge.caselights(0.0)
+        result = self.drift_result
+        # held(), not pressed(): the buttons are read once a frame, not
+        # latched, and a frame here is a 250 ms window. A press is seen only
+        # if B is down when the frame ends, so the screen says hold it.
+        if badge.held(BUTTON_B):
+            result["drift"] = {"error": "cancelled"}
+            self.end_flicker(result)
+            return
+        self.flicker.take(badge.light_level, time.ticks_us)
+        self.drift.add(self.flicker)
+        # Attempts, not windows read: a window with no reading must not
+        # keep the screen dark for ever.
+        if self.drift.attempts >= DRIFT_WINDOWS:
+            result["drift"] = self.drift.result()
+            self.end_flicker(result)
+
+    def end_flicker(self, result):
+        """A measurement done: the panel back, the result kept."""
+        self.drift = None
+        self.drift_result = None
+        badge.default_clear = color.black
+        display.backlight(BACKLIGHT_NORMAL)
         self.flicker_results.append(result)
+        self.screen = DEV_FLICKER
 
     def save_flicker(self):
         results = self.flicker_results
@@ -2038,6 +2315,7 @@ class App:
         self.probe_run = None
         self.probe_receiver = None
         self.probe_listener = None
+        self.probe_timed = None
         restore_panel()
         gc.collect()
 
@@ -2082,6 +2360,8 @@ class App:
             self.do_dev_probe()
         elif self.screen == DEV_FLICKER:
             self.do_dev_flicker()
+        elif self.screen == DEV_FLICKER_DRIFT:
+            self.do_dev_flicker_drift()
 
 
 app = App()

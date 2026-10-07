@@ -13,6 +13,7 @@ import os
 from harness import load_module
 
 P = load_module("share_wifi", "probe")
+PROTOCOL = load_module("share_wifi", "protocol")
 PATH = os.path.join(os.path.dirname(P.__file__), "probe.py")
 
 REFRESH_US = 16667      # 60 Hz
@@ -35,7 +36,7 @@ class Badge:
     """The hooks, each costing a fixed time on the clock."""
 
     def __init__(self, cancel_after=None, part_us=(1000, 2000),
-                 read_us=(2, 12, 40, 150, 180)):
+                 read_us=(2, 12, 40, 150, 180, 190)):
         self.clock = Clock()
         self.temp_reads = 0
         self.presents = 0
@@ -126,8 +127,61 @@ class Badge:
             ticks_us=self.clock, temp=self.temp,
             reads=tuple((name, self.part(us, 0)) for name, us in
                         zip(("loop", "read", "sample", "listen",
-                             "transfer"),
-                            self.read_us)))
+                             "transfer", "transfer_timed"),
+                            self.read_us)),
+            fast=(("viper", self.fast_viper), ("dma_500k", self.fast_viper),
+                  ("dma_100k", self.no_dma)),
+            reads_detail=self.reads_detail,
+            flicker_filter=self.flicker_filter())
+
+    def flicker_filter(self):
+        """The protocol's filter, each call costing time on the clock."""
+        clock = self.clock
+        base = PROTOCOL.FlickerFilter
+
+        class Ticking(base):
+            updates = []
+
+            def fit(self, ts, vs, spans):
+                clock.advance(3000)
+                return base.fit(self, ts, vs, spans)
+
+            def correct(self, now_us, value, span_us=0):
+                clock.advance(40)
+                return base.correct(self, now_us, value, span_us)
+
+            def track(self, now_us, value, span_us):
+                clock.advance(30)
+                base.track(self, now_us, value, span_us)
+
+            def update(self):
+                clock.advance(60)
+                base.update(self)
+                # Whether this update reached the rate's line.
+                w = self.lw
+                spread = self.ltt / w - (self.lt / w) ** 2 if w else 0.0
+                Ticking.updates.append(
+                    spread >= PROTOCOL.FLICKER_RATE_MIN_S ** 2 / 4)
+        return Ticking
+
+    def reads_detail(self):
+        # The app's TimedListener.result(), in shape.
+        part = {"calls": 10, "per_s": 1, "mean_us": 5.0, "max_us": 9,
+                "sd_us": 1.0}
+        out = {"light": 48, "phase": 5, "flicker": 0.0,
+               "reads_per_sample": 31.0, "read_us": 64.5}
+        for name in ("sample", "filter_sample", "pool_coarse", "step_data"):
+            out[name] = part
+        return out
+
+    def fast_viper(self):
+        # Raw readings alternating 100 and 102 -- a sixteenth of a count's
+        # step -- so averaging pairs takes the noise away entirely.
+        self.clock.advance(8192)
+        return [100 + 2 * (i % 2) for i in range(P.FAST_READS)], 8192
+
+    def no_dma(self):
+        raise AttributeError("'module' object has no attribute 'DMA'")
 
 
 def run_all(badge, **kw):
@@ -252,7 +306,9 @@ def test_reads_loops_each_call_without_presenting():
     probe.step()
     assert badge.presents == presents, "a reads loop presented"
     reads = probe.results()["reads"]
-    assert list(reads) == ["loop", "read", "sample", "listen", "transfer"]
+    assert list(reads) == ["loop", "read", "sample", "listen", "transfer",
+                           "transfer_timed", "detail"]
+    assert reads["detail"]["light"] == 48
     for name, us in zip(reads, badge.read_us):
         entry = reads[name]
         # Each is fast enough to make every call inside READ_MS.
@@ -300,6 +356,7 @@ def test_cancelling_between_reads_loops_stops_there():
     hooks.cancelled = lambda: True
     probe.step()
     assert probe.cancelled and probe.done
+    # Cancelled: no detail either.
     assert list(probe.results()["reads"]) == ["loop"]
 
 
@@ -311,7 +368,42 @@ def test_no_reads_hooks_is_an_error_not_a_crash():
     run_until(probe, "reads")
     probe.step()
     assert probe.results()["reads"] == {"error": "no reads"}
+    assert probe.step_name == "fast_reads"
+
+
+def test_fast_reads_summarise_each_capture_and_record_a_failing_one():
+    badge = Badge()
+    probe = P.FrameProbe(badge.hooks())
+    run_until(probe, "fast_reads")
+    probe.step()
+    fast = probe.results()["fast_reads"]
+    viper = fast["viper"]
+    assert viper["reads"] == P.FAST_READS and viper["us"] == 8192
+    assert viper["per_s"] == 500000
+    assert viper["mean"] == 101 * 16
+    # sd 1 raw step = 16 counts, gone once pairs are averaged.
+    assert viper["noise"] == {"1": 16.0, "4": 0.0, "16": 0.0, "64": 0.0,
+                              "256": 0.0}
+    assert fast["dma_500k"] == viper
+    assert fast["dma_100k"] == {
+        "error": "AttributeError: 'module' object has no attribute 'DMA'"}
     assert probe.step_name == "alloc"
+
+
+def test_fast_stats_stops_averaging_where_too_few_groups_are_left():
+    stats = P.fast_stats(list(range(64)), 100)
+    assert sorted(stats["noise"], key=int) == ["1", "4", "16"]
+    assert P.fast_stats([], 100) == {"error": "no readings"}
+
+
+def test_no_fast_reads_hooks_is_an_error_not_a_crash():
+    badge = Badge()
+    hooks = badge.hooks()
+    hooks.fast = ()
+    probe = P.FrameProbe(hooks)
+    run_until(probe, "fast_reads")
+    probe.step()
+    assert probe.results()["fast_reads"] == {"error": "no fast reads"}
 
 
 def test_the_temperature_is_read_before_every_step_and_at_the_end():
@@ -459,8 +551,55 @@ def test_display_measurements_orders_every_probe_key():
     # "clear" after "bands" and "write" after "refresh"'s neighbours.
     measure = load_module("share_wifi", "measure")
     probe, _ = run_all(Badge())
-    missing = sorted(keys_of(probe.results()) - set(measure.KEY_ORDER))
+    # Numeric keys -- fast_reads' group sizes -- are ordered by value.
+    missing = sorted(k for k in keys_of(probe.results()) - set(measure.KEY_ORDER)
+                     if not k.isdigit())
     assert not missing, missing
+
+
+def test_flicker_filter_times_each_part_on_a_room_it_fits():
+    badge = Badge()
+    hooks = badge.hooks()
+    out = P.filter_costs(hooks.flicker_filter, badge.clock)
+    assert out["verdict"] == "flicker", out
+    assert out["samples"] == 66 and out["follower_samples"] == 33
+    assert out["fit_first_us"] == 3000 and out["correct_first_us"] == 40
+    assert out["fit"]["calls"] == out["fit_follower"]["calls"] == 3
+    assert out["fit"]["mean_us"] == 3000.0
+    assert out["correct"] == {"calls": 500, "per_s": 25000, "mean_us": 40.0,
+                              "max_us": 40, "sd_us": 0.0}
+    assert out["track"]["calls"] == 8 * P.FILTER_UPDATES
+    assert out["track"]["mean_us"] == 30.0
+    assert out["update"]["mean_us"] == out["update_rate"]["mean_us"] == 60.0
+    assert out["update"]["calls"] + out["update_rate"]["calls"] < \
+        P.FILTER_UPDATES, "the updates between the two are not timed"
+
+
+def test_updates_are_split_where_the_rate_line_starts():
+    badge = Badge()
+    hooks = badge.hooks()
+    hooks.flicker_filter.updates.clear()
+    out = P.filter_costs(hooks.flicker_filter, badge.clock)
+    reached = hooks.flicker_filter.updates
+    # Every update timed as `update` came before the rate's line was used,
+    # every one timed as `update_rate` after.
+    early = out["update"]["calls"]
+    late = out["update_rate"]["calls"]
+    assert early >= 8 and late >= 8, out
+    assert not any(reached[:early]), reached
+    assert all(reached[-late:]), reached
+
+
+def test_flicker_filter_is_skipped_without_the_hook():
+    assert P.filter_costs(None, Clock()) == {"error": "no flicker filter"}
+
+
+def test_the_synthetic_room_is_the_same_every_run():
+    a = P.filter_room(1000, 20)
+    b = P.filter_room(1000, 20)
+    assert a == b
+    assert {a[0][k + 1] - a[0][k] for k in range(19)} == {3000}
+    assert set(a[2]) == {2000}
 
 
 # --- MicroPython hygiene ----------------------------------------------------

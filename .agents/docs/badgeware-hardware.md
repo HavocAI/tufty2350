@@ -193,6 +193,32 @@ probe's bookkeeping), taken off the others:
 - **A second run agrees** (2026-10-05c): 2,362 listener passes a second,
   ~381 µs net, none over 771 µs.
 - **Nothing stalled in that second** -- no pass over 782 µs, so no collection.
+- **The ADC itself is far faster than any of these.** A conversion is 96
+  cycles of its 48 MHz clock, 2 µs, so 500k a second **[datasheet]**, where
+  `badge.light_level()` is `machine.ADC.read_u16()` -- a method call into a
+  C call, ~8-14 µs over its loop **[measured-v2]**. The light sensor is
+  GPIO43, ADC input 3 on the RP2350B; its registers are at `0x400A0000`
+  and the ADC's DMA request is 48 (Pico SDK, RP2350 headers). `read_u16()`
+  returns `raw << 4 | raw >> 8`, which for the sensor's readings, all under
+  256 raw, is a multiple of 16 **[source-v2]**: the 16-count step.
+- **Read straight from the registers it is 18 times faster** (2026-10-06a,
+  Dev Mode's `fast_reads`, 4,096 readings each, the sensor reading ~209
+  counts) **[measured-v2]**:
+
+  | Capture | Rate | sd of 1 reading | of 4 | of 16 | of 64 | of 256 |
+  |---|---|---|---|---|---|---|
+  | viper, one conversion at a time | 359k a second, 2.8 µs | 4.3 counts | 2.2 | 1.1 | 0.7 | 0.5 |
+  | DMA, asked 500k | 249k (a divider bug, since fixed: half the rate asked) | 8.4 | 4.1 | 2.0 | 1.0 | 0.5 |
+  | DMA, 100k | 99.8k | 7.6 | 3.8 | 1.9 | 0.9 | 0.6 |
+
+- **Averaging works.** The noise falls as the square root of the readings
+  averaged up to 16-64 of them, then flattens at about half a count -- a
+  thirtieth of an ADC step -- what is left being in the light, or slow.
+  So averaging 64 viper readings, 180 µs, puts a reading within about a
+  count, against a panel swing of 64-96: noise is no longer what limits a
+  slot's length; the sensor's settle is **[inferred-all]**. Single
+  readings were noisier free-running under DMA than one at a time under
+  viper, 7.6-8.4 counts against 4.3; why is unknown.
   A transfer runs 20-60 s, and a collection costs a slot or more (see
   "Performance tiers"); whether one lands in a transfer is not yet known.
 

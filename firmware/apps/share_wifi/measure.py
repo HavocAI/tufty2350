@@ -2714,9 +2714,20 @@ KEY_ORDER = (
     "column", "lights", "measure", "present", "poll", "alloc_bytes",
     "reads", "loop", "read", "sample", "listen", "transfer", "calls", "per_s",
     "mean_us",
-    "max_us", "sd_us", "alloc",
+    "max_us", "sd_us", "transfer_timed", "detail", "filter_sample",
+    "pool_coarse", "step_data", "reads_per_sample", "light", "phase",
+    "fast_reads", "viper", "dma_500k", "dma_100k", "us",
+    "alloc",
     "call_us", "pair_us", "quad_us", "octet_us", "gc", "screen",
     "collect", "alloc_kb", "free_kb", "frames_on", "frames_off",
+    "flicker_filter", "samples", "follower_samples", "fit_first_us", "fit",
+    "fit_follower", "correct_first_us", "correct", "track", "update",
+    "update_rate",
+    # measure room flicker (flicker.py): the transfer's fit, and the drift
+    "filter", "reason", "window_ms", "mains", "harmonics", "kept",
+    "held_out", "sd_before", "sd_after",
+    "drift", "windows", "seconds", "offset_mhz_vs_clock", "wander_deg",
+    "ambiguous",
     "error",
 )
 

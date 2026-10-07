@@ -1,0 +1,651 @@
+{
+  "mirror": {
+    "lit": {
+      "gamma_ramp": {
+        "50": 96,
+        "25": 80,
+        "gamma": 2.03,
+        "67": 128,
+        "0": 80,
+        "100": 160,
+        "75": 128
+      },
+      "loopback": {
+        "50": {
+          "symbols": 29,
+          "reads_per_s": 7287,
+          "errors": 0,
+          "lag_ms": -0.01
+        },
+        "25": {
+          "symbols": 29,
+          "reads_per_s": 7838,
+          "errors": 0,
+          "lag_ms": 0.17
+        },
+        "16": {
+          "symbols": 29,
+          "reads_per_s": 7545,
+          "errors": 0,
+          "lag_ms": -0.07
+        },
+        "32": {
+          "symbols": 29,
+          "reads_per_s": 7079,
+          "errors": 0,
+          "lag_ms": 0.1
+        },
+        "dim_25": {
+          "errors": 0,
+          "lag_ms": -0.81,
+          "reads_per_s": 7690,
+          "levels": [80, 128, 160],
+          "symbols": 29
+        },
+        "dim_16": {
+          "errors": 0,
+          "lag_ms": -0.27,
+          "reads_per_s": 7852,
+          "levels": [80, 128, 160],
+          "symbols": 29
+        },
+        "20": {
+          "symbols": 29,
+          "reads_per_s": 7841,
+          "errors": 0,
+          "lag_ms": 0.03
+        }
+      },
+      "backlight_step": {
+        "read_us": 26.6,
+        "mid_rise": {
+          "swing": 48,
+          "transitions": 10,
+          "t10_ms": 0.34,
+          "t90_ms": 1.72,
+          "skipped": { "no_edge": 0, "flat": 0, "gap": 0 },
+          "t50_ms": 0.78,
+          "t10_90_ms": 1.37
+        },
+        "fall": {
+          "swing": -80,
+          "transitions": 10,
+          "t10_ms": 0.11,
+          "t90_ms": 0.96,
+          "skipped": { "no_edge": 0, "flat": 0, "gap": 0 },
+          "t50_ms": 0.47,
+          "t10_90_ms": 0.86
+        },
+        "rise": {
+          "swing": 80,
+          "transitions": 10,
+          "t10_ms": 0.36,
+          "t90_ms": 1.02,
+          "skipped": { "no_edge": 0, "flat": 0, "gap": 0 },
+          "t50_ms": 0.64,
+          "t10_90_ms": 0.66
+        },
+        "bin_us": 50
+      },
+      "settle": {
+        "fall_tau_ms": 8.3,
+        "mid_rise_tau_ms": { "error": "no mid rise transition fitted" },
+        "rise_tau_ms": 5.5,
+        "settle_90_ms": 19.1
+      },
+      "noise": {
+        "fields": {
+          "mid": { "sd": 4.9, "p2p": 16 },
+          "black": { "sd": 6.0, "p2p": 32 },
+          "white": { "sd": 7.5, "p2p": 16 }
+        },
+        "backlight": {
+          "mid": { "sd": 10.5, "p2p": 48 },
+          "black": { "sd": 5.1, "p2p": 32 },
+          "white": { "sd": 7.9, "p2p": 16 }
+        }
+      },
+      "bleed": { "black_on": 80, "black_off": 80 },
+      "levels": {
+        "fields": {
+          "white": 160,
+          "mid_share": 0.6,
+          "black": 80,
+          "mid": 128,
+          "span": 80
+        },
+        "backlight": {
+          "white": 160,
+          "mid_share": 0.6,
+          "black": 80,
+          "mid": 128,
+          "span": 80
+        }
+      },
+      "temperature_c": {
+        "backlight_curve": 26.7,
+        "start": 26.6,
+        "flicker": 26.6,
+        "gamma_ramp": 26.6,
+        "levels": 26.6,
+        "ambient": 26.6,
+        "loopback": 26.6,
+        "bleed": 26.7,
+        "backlight_step": 26.6,
+        "settle": 26.6,
+        "end": 26.6
+      },
+      "frame_timing": {
+        "max_ms": 33,
+        "sd_ms": 0.7,
+        "mean_ms": 16.7,
+        "min_ms": 15,
+        "frames": 2131
+      },
+      "backlight_curve": {
+        "0.3": 64,
+        "0.2": 80,
+        "0.1": 80,
+        "0.0": 80,
+        "0.7": 96,
+        "0.6": 96,
+        "0.9": 144,
+        "0.8": 128,
+        "0.5": 80,
+        "0.4": 80,
+        "1.0": 160
+      },
+      "adc_step": 16,
+      "flicker": {
+        "0.5": { "verdict": "averages", "max": 96, "sd": 8.0, "min": 80 },
+        "0.9": { "verdict": "averages", "max": 160, "sd": 7.9, "min": 128 },
+        "0.25": { "verdict": "averages", "max": 96, "sd": 5.1, "min": 64 },
+        "0.74": { "verdict": "averages", "max": 128, "sd": 10.1, "min": 96 },
+        "1.0": { "verdict": "averages", "max": 176, "sd": 7.3, "min": 144 }
+      },
+      "edge_latency": {
+        "max_ms": 23.4,
+        "rises": 10,
+        "blind_ms": 12.0,
+        "upper_bounds": 0,
+        "min_ms": 22.8,
+        "mean_ms": 23.1
+      },
+      "ambient": 80
+    },
+    "dark": {
+      "gamma_ramp": {
+        "50": 48,
+        "25": 32,
+        "gamma": 2.26,
+        "67": 64,
+        "0": 32,
+        "100": 112,
+        "75": 80
+      },
+      "loopback": {
+        "50": {
+          "symbols": 29,
+          "reads_per_s": 7719,
+          "errors": 0,
+          "lag_ms": 1.19
+        },
+        "25": {
+          "symbols": 29,
+          "reads_per_s": 7491,
+          "errors": 0,
+          "lag_ms": 1.57
+        },
+        "16": {
+          "symbols": 29,
+          "reads_per_s": 7623,
+          "errors": 0,
+          "lag_ms": 1.54
+        },
+        "32": {
+          "symbols": 29,
+          "reads_per_s": 7762,
+          "errors": 0,
+          "lag_ms": 1.89
+        },
+        "dim_25": {
+          "errors": 0,
+          "lag_ms": 0.32,
+          "reads_per_s": 7795,
+          "levels": [32, 64, 112],
+          "symbols": 29
+        },
+        "dim_16": {
+          "errors": 0,
+          "lag_ms": 0.28,
+          "reads_per_s": 7730,
+          "levels": [32, 64, 112],
+          "symbols": 29
+        },
+        "20": {
+          "symbols": 29,
+          "reads_per_s": 7834,
+          "errors": 0,
+          "lag_ms": 1.68
+        }
+      },
+      "backlight_step": {
+        "read_us": 25.9,
+        "mid_rise": {
+          "swing": 32,
+          "transitions": 10,
+          "t10_ms": 3.56,
+          "t90_ms": 5.51,
+          "skipped": { "no_edge": 0, "flat": 0, "gap": 0 },
+          "t50_ms": 4.54,
+          "t10_90_ms": 1.94
+        },
+        "fall": {
+          "swing": -80,
+          "transitions": 10,
+          "t10_ms": 0.08,
+          "t90_ms": 2.11,
+          "skipped": { "no_edge": 0, "flat": 0, "gap": 0 },
+          "t50_ms": 0.53,
+          "t10_90_ms": 2.03
+        },
+        "rise": {
+          "swing": 80,
+          "transitions": 10,
+          "t10_ms": 2.03,
+          "t90_ms": 4.18,
+          "skipped": { "no_edge": 0, "flat": 0, "gap": 0 },
+          "t50_ms": 2.83,
+          "t10_90_ms": 2.15
+        },
+        "bin_us": 50
+      },
+      "settle": {
+        "fall_tau_ms": 7.7,
+        "mid_rise_tau_ms": { "error": "no mid rise transition fitted" },
+        "rise_tau_ms": 6.3,
+        "settle_90_ms": 17.6
+      },
+      "noise": {
+        "fields": {
+          "mid": { "sd": 5.5, "p2p": 32 },
+          "black": { "sd": 0.0, "p2p": 0 },
+          "white": { "sd": 8.0, "p2p": 32 }
+        },
+        "backlight": {
+          "mid": { "sd": 5.9, "p2p": 32 },
+          "black": { "sd": 3.9, "p2p": 16 },
+          "white": { "sd": 8.3, "p2p": 32 }
+        }
+      },
+      "bleed": { "black_on": 32, "black_off": 32 },
+      "levels": {
+        "fields": {
+          "white": 112,
+          "mid_share": 0.4,
+          "black": 32,
+          "mid": 64,
+          "span": 80
+        },
+        "backlight": {
+          "white": 112,
+          "mid_share": 0.4,
+          "black": 32,
+          "mid": 64,
+          "span": 80
+        }
+      },
+      "temperature_c": {
+        "backlight_curve": 26.4,
+        "start": 26.1,
+        "flicker": 26.5,
+        "gamma_ramp": 26.3,
+        "levels": 26.1,
+        "ambient": 26.1,
+        "loopback": 26.6,
+        "bleed": 26.5,
+        "backlight_step": 26.6,
+        "settle": 26.5,
+        "end": 26.6
+      },
+      "frame_timing": {
+        "max_ms": 49,
+        "sd_ms": 0.9,
+        "mean_ms": 16.7,
+        "min_ms": 16,
+        "frames": 2136
+      },
+      "backlight_curve": {
+        "0.3": 32,
+        "0.2": 32,
+        "0.1": 32,
+        "0.0": 32,
+        "0.7": 64,
+        "0.6": 48,
+        "0.9": 80,
+        "0.8": 64,
+        "0.5": 32,
+        "0.4": 32,
+        "1.0": 112
+      },
+      "adc_step": 16,
+      "flicker": {
+        "0.5": { "verdict": "averages", "max": 48, "sd": 6.6, "min": 16 },
+        "0.9": { "verdict": "averages", "max": 96, "sd": 7.0, "min": 80 },
+        "0.25": { "verdict": "averages", "max": 48, "sd": 4.0, "min": 16 },
+        "0.74": { "verdict": "averages", "max": 64, "sd": 7.3, "min": 48 },
+        "1.0": { "verdict": "averages", "max": 128, "sd": 8.2, "min": 80 }
+      },
+      "edge_latency": {
+        "max_ms": 19.0,
+        "rises": 10,
+        "blind_ms": 12.0,
+        "upper_bounds": 0,
+        "min_ms": 12.7,
+        "mean_ms": 14.4
+      },
+      "ambient": 32
+    }
+  },
+  "frame_probe": {
+    "breakdown": {
+      "status": {
+        "frame": {
+          "max_ms": 57.41,
+          "frames": 60,
+          "mean_ms": 50.34,
+          "min_ms": 50.14,
+          "sd_ms": 0.92
+        },
+        "lights": { "max_ms": 0.68, "mean_ms": 0.65 },
+        "column": { "max_ms": 6.51, "mean_ms": 2.46 },
+        "alloc_bytes": 1014,
+        "poll": { "max_ms": 0.21, "mean_ms": 0.13 },
+        "clear": { "max_ms": 11.37, "mean_ms": 11.31 },
+        "bands": { "max_ms": 17.7, "mean_ms": 17.38 },
+        "present": { "max_ms": 19.19, "mean_ms": 16.83 },
+        "measure": { "max_ms": 2.55, "mean_ms": 1.27 }
+      },
+      "field": {
+        "frame": {
+          "max_ms": 23.36,
+          "frames": 60,
+          "mean_ms": 16.86,
+          "min_ms": 16.67,
+          "sd_ms": 0.85
+        },
+        "alloc_bytes": 238,
+        "poll": { "max_ms": 0.2, "mean_ms": 0.12 },
+        "clear": { "max_ms": 0.1, "mean_ms": 0.05 },
+        "measure": { "max_ms": 1.68, "mean_ms": 1.11 },
+        "present": { "max_ms": 17.9, "mean_ms": 12.22 },
+        "field": { "max_ms": 3.41, "mean_ms": 3.07 }
+      }
+    },
+    "temperature_c": {
+      "alloc": 30.3,
+      "refresh": 30.1,
+      "write": 30.3,
+      "fast_reads": 30.3,
+      "reads": 30.2,
+      "breakdown": 30.4,
+      "gc": 30.3,
+      "end": 30.3
+    },
+    "refresh": {
+      "max_ms": 16.75,
+      "mean_ms": 16.74,
+      "sd_ms": 0.01,
+      "hz": 59.7,
+      "min_ms": 16.74,
+      "frames": 60
+    },
+    "write": {
+      "max_ms": 7.84,
+      "frames": 60,
+      "mean_ms": 7.79,
+      "min_ms": 7.75,
+      "sd_ms": 0.01
+    },
+    "firmware": {
+      "set_framerate": false,
+      "version": "bw-1.27.0,   on 2026-04-10 (GNU 13.3.1 MinSizeRel)"
+    },
+    "alloc": {
+      "call_us": 5.07,
+      "quad_us": 103.84,
+      "pair_us": 2.87,
+      "calls": 1000,
+      "octet_us": 316.78
+    },
+    "gc": {
+      "frames_off": {
+        "max_ms": 53.45,
+        "frames": 120,
+        "mean_ms": 50.26,
+        "min_ms": 50.12,
+        "sd_ms": 0.29
+      },
+      "free_kb": 7739,
+      "alloc_kb": 264,
+      "screen": "status",
+      "frames_on": {
+        "max_ms": 50.33,
+        "frames": 120,
+        "mean_ms": 50.18,
+        "min_ms": 44.66,
+        "sd_ms": 0.51
+      },
+      "collect": { "max_ms": 20.86, "mean_ms": 19.82 }
+    },
+    "reads": {
+      "transfer_timed": {
+        "sd_us": 411.3,
+        "mean_us": 1837.3,
+        "calls": 545,
+        "per_s": 544,
+        "max_us": 4399
+      },
+      "loop": {
+        "sd_us": 1.9,
+        "mean_us": 62.6,
+        "calls": 5000,
+        "per_s": 15977,
+        "max_us": 117
+      },
+      "sample": {
+        "sd_us": 2.0,
+        "mean_us": 122.5,
+        "calls": 5000,
+        "per_s": 8162,
+        "max_us": 151
+      },
+      "listen": {
+        "sd_us": 80.2,
+        "mean_us": 481.3,
+        "calls": 2079,
+        "per_s": 2078,
+        "max_us": 1401
+      },
+      "detail": {
+        "step_data": {
+          "sd_us": 261.0,
+          "mean_us": 422.2,
+          "calls": 545,
+          "per_s": 2368,
+          "max_us": 2603
+        },
+        "light": 124,
+        "first": {
+          "sd_us": 407.3,
+          "mean_us": 1566.6,
+          "calls": 545,
+          "per_s": 638,
+          "max_us": 4116
+        },
+        "flicker": 0.0,
+        "pool": {
+          "sd_us": 19.0,
+          "mean_us": 154.1,
+          "calls": 545,
+          "per_s": 6490,
+          "max_us": 481
+        },
+        "later": { "error": "no calls" },
+        "phase": 5,
+        "learn_flicker": {
+          "sd_us": 157.7,
+          "mean_us": 223.3,
+          "calls": 545,
+          "per_s": 4478,
+          "max_us": 546
+        },
+        "filter_fine": {
+          "sd_us": 16.6,
+          "mean_us": 310.0,
+          "calls": 475,
+          "per_s": 3225,
+          "max_us": 410
+        }
+      },
+      "transfer": {
+        "sd_us": 517.5,
+        "mean_us": 1073.3,
+        "calls": 932,
+        "per_s": 932,
+        "max_us": 3684
+      },
+      "read": {
+        "sd_us": 2.4,
+        "mean_us": 70.5,
+        "calls": 5000,
+        "per_s": 14190,
+        "max_us": 147
+      }
+    },
+    "fast_reads": {
+      "dma_500k": {
+        "per_s": 496364,
+        "mean": 121.9,
+        "noise": { "256": 0.77, "4": 4.31, "64": 1.12, "1": 9.17, "16": 2.18 },
+        "reads": 4096,
+        "us": 8252
+      },
+      "viper": {
+        "per_s": 359393,
+        "mean": 125.5,
+        "noise": { "256": 0.65, "4": 2.94, "64": 0.94, "1": 5.91, "16": 1.62 },
+        "reads": 4096,
+        "us": 11397
+      },
+      "dma_100k": {
+        "per_s": 99873,
+        "mean": 122.3,
+        "noise": { "256": 0.7, "4": 4.5, "64": 1.14, "1": 8.99, "16": 2.23 },
+        "reads": 4096,
+        "us": 41012
+      }
+    }
+  },
+  "room_flicker": {
+    "3": {
+      "peak_hz": 120,
+      "peak_counts": 105.3,
+      "sd": 81.9,
+      "hz": { "50": 2.9, "100": 0.5, "120": 105.3, "60": 0.1 },
+      "mean": 353.0,
+      "read_us": 28.6,
+      "p2p": 271.1,
+      "reads": 8752,
+      "temp_c": 27.0
+    },
+    "2": {
+      "peak_hz": 120,
+      "peak_counts": 12.5,
+      "sd": 11.1,
+      "hz": { "50": 0.2, "100": 0.2, "120": 12.5, "60": 0.3 },
+      "mean": 1083.3,
+      "read_us": 28.6,
+      "p2p": 53.7,
+      "reads": 8750,
+      "temp_c": 26.6
+    },
+    "8": {
+      "peak_hz": 120,
+      "peak_counts": 0.6,
+      "sd": 1.2,
+      "hz": { "50": 0.2, "100": 0.1, "120": 0.6, "60": 0.1 },
+      "mean": 736.6,
+      "read_us": 29.8,
+      "p2p": 8.5,
+      "reads": 8402,
+      "temp_c": 27.2
+    },
+    "5": {
+      "peak_hz": 120,
+      "peak_counts": 1212.0,
+      "sd": 998.6,
+      "hz": { "50": 11.2, "100": 5.8, "120": 1212.0, "60": 6.2 },
+      "mean": 2608.6,
+      "read_us": 29.8,
+      "p2p": 3548.6,
+      "reads": 8385,
+      "temp_c": 27.1
+    },
+    "4": {
+      "peak_hz": 120,
+      "peak_counts": 1940.0,
+      "sd": 1586.9,
+      "hz": { "50": 34.2, "100": 3.3, "120": 1940.0, "60": 5.5 },
+      "mean": 4136.2,
+      "read_us": 28.6,
+      "p2p": 5509.1,
+      "reads": 8752,
+      "temp_c": 27.0
+    },
+    "7": {
+      "peak_hz": 120,
+      "peak_counts": 155.5,
+      "sd": 111.6,
+      "hz": { "50": 2.0, "100": 0.4, "120": 155.5, "60": 0.3 },
+      "mean": 385.1,
+      "read_us": 28.6,
+      "p2p": 351.1,
+      "reads": 8729,
+      "temp_c": 27.0
+    },
+    "6": {
+      "peak_hz": 120,
+      "peak_counts": 80.8,
+      "sd": 58.6,
+      "hz": { "50": 0.7, "100": 0.7, "120": 80.8, "60": 0.7 },
+      "mean": 240.3,
+      "read_us": 29.7,
+      "p2p": 201.1,
+      "reads": 8427,
+      "temp_c": 27.1
+    },
+    "1": {
+      "peak_hz": 120,
+      "peak_counts": 2.1,
+      "sd": 9.6,
+      "hz": { "50": 0.5, "100": 0.2, "120": 2.1, "60": 0.6 },
+      "mean": 204.5,
+      "read_us": 35.4,
+      "p2p": 33.1,
+      "reads": 7065,
+      "temp_c": 26.6
+    },
+    "9": {
+      "peak_hz": 120,
+      "peak_counts": 0.9,
+      "sd": 3.2,
+      "hz": { "50": 0.2, "100": 0.1, "120": 0.9, "60": 0.3 },
+      "mean": 455.7,
+      "read_us": 29.2,
+      "p2p": 15.1,
+      "reads": 8571,
+      "temp_c": 27.2
+    }
+  }
+}

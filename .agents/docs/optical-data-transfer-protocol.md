@@ -45,10 +45,31 @@ Names match [firmware/apps/share_wifi/protocol.py](../../firmware/apps/share_wif
 | `BACKLIGHT_PROVEN_MS` | 50 | the rung a continuous backlight badge treats as proven; faster ones are a gamble, and a bad CRC there demotes |
 | `FINE_MS` | 2 | a continuous badge pools its readings into samples this long for the data phase |
 | `COARSE_MS` | 8 | ... and this long for discovery and calibration. A once-a-frame caller gets one of each per call |
+| `HANDSHAKE_GAP_MS` | 7 | a continuous Follower in Peer Present drops the coarse sample in progress when its readings stop this long -- a present's 7.8 ms or more, not a call's ~1 **[measured-v2]** -- but never twice running. See "Peer present" |
 | `BACKLIGHT_EDGE_LAG_MS` | 1 | how late a continuous receiver sees a backlight edge: up to a PWM period, then the sensor's climb to `T_low` -- 0.3 ms dark and about 0 lit from the dim low **[measured-all]** |
 | `FLICKER_HZ` | 100, 120 | the mains flicker frequencies a continuous badge estimates and takes off its readings |
 | `FLICKER_TAU_MS` | 250 | how much dark time the flicker estimate averages over |
 | `FLICKER_MIN_COUNTS` | 4 | flicker smaller than this, a quarter of an ADC step, is left alone |
+| `FLICKER_MIN_POINTS` | 2 | a dark slot teaches the flicker only if its back half held this many samples |
+| `FLICKER_STEPS` | 320 | steps of one period in the filter's sine table: 1.1 degrees, 3125 us per step per Hz |
+| `FLICKER_ONE` | 1024 | the table's scale: the filter's per-sample arithmetic is whole numbers |
+| `FLICKER_SPAN_US` | 250 | a sample's span is rounded to this for the table of sin(x)/x |
+| `FLICKER_MAINS` | 50, 60 | the mains a fit tries: the better explains the window |
+| `FLICKER_HARMONICS` | 4 | harmonics of the mains fitted: 50-200 or 60-240 Hz |
+| `FLICKER_FIT_MS` | 200 | the Leader's fit window, from its own staircase, which the Follower watches dark |
+| `FLICKER_FIT_LEAD_MS` | 175 | how far past its opening gap the Leader's window starts: its fit then falls mid-step |
+| `FLICKER_FOLLOWER_FIT_MS` | 100 | the Follower fits this long after seeing the Leader quiet, from this long of samples: inside the Leader's 450 ms of dark with 50 to spare |
+| `FLICKER_FIT_MAX_NOISE` | 12 | counts a fit may leave unexplained: more, and the window was not steady -- the filter learns as before |
+| `FLICKER_FIT_SIGMAS` | 4 | a fitted harmonic counts only this many standard errors clear of the fit's noise |
+| `FLICKER_FIT_PASSES` | 2 | refinements of the fit's projections, each on what the others leave |
+| `FLICKER_MIN_SEEN` | 0.30 | a harmonic is fitted only if the window's samples keep this much of it through their averaging |
+| `FLICKER_BUFFER` | 96 | samples kept for the fit, ~290 ms |
+| `FLICKER_TRACK_POINTS` | 8 | samples a phase-lock update while a badge sends its staircase or waits out the gap |
+| `FLICKER_TRACK_GAIN` | 0.25 | the share of an update's timing error that moves the table |
+| `FLICKER_TRACK_MAX_STEPS` | 16 | an update's error is clipped to this many steps |
+| `FLICKER_RATE_MEMORY` | 0.99 | the drift's line keeps this much of its past an update |
+| `FLICKER_RATE_MIN_S` | 0.30 | the line's points must span this long before its slope is the rate |
+| `FLICKER_MAX_RATE` | 32 | steps a second the rate is bounded to: 0.1 Hz of mains drift |
 | `PIXEL_EDGE_MS` | 13 | how long after a pixel write begins a rise crosses `T_low`: 8.5-18.5 ms across runs **[measured-v2]**. A continuous receiver adds half a refresh for its peer's wait for vertical blank |
 | `BACKLIGHT_TX_MS` | 3 | how coarsely a continuous transmitter places a backlight symbol, for the end-of-slot guard |
 | `PIXEL_WINDOW_PERCENT` | 60 | where a continuous pixel receiver's read window opens, as a share of the slot |
@@ -421,31 +442,67 @@ measurements -- the listener's read rate, the backlight being live at once,
 the sensor's speed, the panel's settle, and when a pixel change reaches the
 panel (see "What the measurement found").
 
-**The loop.** `do_transfer()` in the app reads `light_level()` once a pass and
-calls `step()` with it. A change of backlight is a `display.backlight()` call,
+**The loop.** `do_transfer()` in the app reads a sample a pass:
+`read_sample()` reads `light_level()` back to back for `FINE_MS` (2 ms),
+or up to the next symbol boundary while transmitting (`deadline()`), with
+nothing but locals in the loop, and hands their mean, mean time and span to
+`Transfer.sample()`. A change of backlight is a `display.backlight()` call,
 made in the loop. Only a change of pixels returns to `run()`, whose present
 shows it -- blocking reading for up to a refresh and a 7.8 ms write. The
-buttons are polled every `POLL_PASSES` (16) passes, which also keeps
-`badge.ticks` moving. HOME is a pin interrupt on v2 and needs no polling
-**[source-v2]**. The backlight scheme's pixels are white for every symbol, so
-once a transfer is on it, nothing is presented until it ends: neither badge
-is ever blind.
+buttons are polled every `POLL_PASSES` (16) samples, about 50 ms, which also
+keeps `badge.ticks` moving. HOME is a pin interrupt on v2 and needs no
+polling **[source-v2]**. The backlight scheme's pixels are white for every
+symbol, so once a transfer is on it, nothing is presented until it ends:
+neither badge is ever presenting. It is blind only for the protocol's call
+between samples.
 
-**The protocol takes every reading.** `Transfer(continuous=True)` pools them
-into two streams:
+**The protocol takes a sample at a time.** Two streams:
 
 - **`FINE_MS` (2 ms) samples** for the data phase: a slot's window and an
-  edge's time are decided from them. Each is the mean of the readings in it,
-  at their mean time -- ~4-5 readings at the measured rate.
+  edge's time are decided from them. `sample()` hands one in whole;
+  `step()`, for a caller that reads one at a time -- once a frame, or the
+  tests -- pools readings into them.
 - **`COARSE_MS` (8 ms) samples** for discovery and calibration, whose
   detectors and buffers were sized for about one sample a frame:
   `BeaconDetector`'s 128-sample window, `StaircaseReader`'s 512,
-  `STEP_SAMPLES`.
-- **A once-a-frame caller is unchanged**: each call is one sample of each, at
-  its own time. Every test and simulator scenario written before this runs
-  as it did.
-- **The transmitted symbol is decided on every call**, so a continuous
-  transmitter changes it within a reading of the slot boundary.
+  `STEP_SAMPLES`. Pooled from fine samples, or from readings.
+- **A once-a-frame caller is unchanged**: each `step()` is one sample of
+  each, at its own time.
+- **The transmitted symbol changes at the boundary**: a sample being read
+  while transmitting ends at `deadline()`, the next slot boundary, so the
+  call that changes the symbol comes within a reading and the call's own
+  time of it.
+
+**What a reading costs.** On the badge, each Python operation costs
+microseconds, and a protocol call costs about a ms. The probe's
+`reads.transfer`, one protocol call per reading, ran:
+
+| Run | Pass | |
+|---|---|---|
+| 2026-10-06 | 380 µs | `step()` per reading, flicker trigonometry per reading |
+| 2026-10-06a | 705 µs | `step()` per reading, with a cheap path for a second reading in the same ms |
+| 2026-10-06b | 1,073 µs | the same, in a run 1.5 times slower throughout |
+
+**[measured-v2]** The cheap path never ran: `reads.detail` on 06b counted
+545 first readings of a ms and no others. A first reading cost ~1.6 ms --
+`step_data` 422 µs, the flicker's correction 310, its learning 223, the
+pooling 154 -- so the next reading was always in a new ms. Under
+MicroPython's unix port the same code ran six to fifteen times faster than
+the old: the port is no guide to the badge's cost, only to its shape.
+
+So the app now reads in a tight loop of its own and calls the protocol once
+a sample: per reading only `light_level()`, two adds and a clock read; per
+sample the ~1 ms call, reading nothing. The simulator models that,
+`LOOP_CALL_MS` (1.0 ms, x0.7-1.5) after every sample. The probe's
+`reads.transfer` is now a pass of that loop, `reads.detail` the call's
+parts and the readings a sample held. The app's loop also looks up a
+backlight and a pen only when the field or scheme changes.
+
+In simulation, sampling holds or improves everything in the dark -- 144 of
+144 under every stress, including all of them at once, where reading per
+reading gave 143 -- and ends the calibration failures in bright
+flicker. In a flickering lit room it settles a rung lower: 20 ms rather
+than 16 at 47%, 143 of 144 at a median 14.2 s against 141 at 13.4.
 
 **Rungs are per scheme.** `rung_for(sample, settle)` is the fastest rung with
 2.5 samples a slot and `SETTLE_SLOTS` settle times:
@@ -549,26 +606,110 @@ badge read it; with that, against everything worse at once it delivered 144
 against 98 with low off. The mirror `loopback` keeps an `off_25` and `off_16`
 block, low off, for comparison.
 
-**Mains flicker is filtered.** Every LED light measured flickered at 120 Hz,
-some by 30-47% of their light (`room_flicker`, 2026-10-06). At the lit
-mirror hold's 48 counts of room light, 47% is ±22 counts -- more than an
-ADC step, against gaps of 32-48 -- and noise inside a 16 ms slot. In
-simulation it took delivery from 144 to 93 of 144 on the lit room's 16 ms
-rung, and to 0 at three times the light; starting slower did not help (97).
-It is steady -- locked to the mains -- so in the data phase a continuous
-badge estimates it and takes it off every reading (`FlickerFilter`):
+**Mains flicker is fitted before calibration, then tracked.** Every LED
+light measured flickered at 120 Hz, some by 30-47% of their light
+(`room_flicker`, 2026-10-06), and not as a sine: the brightest rooms'
+spread implies harmonics at about half the 120 Hz component's size. At the
+lit mirror hold's 48 counts of room light, 47% is ±22 counts -- more than an
+ADC step, against gaps of 32-48.
 
-- **Learnt only from slots decided dark**, their back half, where the peer's
-  light is steady. Learnt from every reading it picked up 15% of the swing
-  where there was no flicker: beacons and staircases are periodic, and 100
-  and 120 Hz are harmonics of them.
-- Its components at 100 and 120 Hz, averaged over `FLICKER_TAU_MS` (250) of
-  dark -- slowly on purpose: weighting the first dark slots fully let one
-  misjudged slot set a wrong estimate that corrupted the readings teaching
-  it.
-- Taken off only when at least `FLICKER_MIN_COUNTS` (4).
-- It needs each reading's time in microseconds: `step(now, light, now_us)`.
-  Discovery and calibration are not filtered.
+*The simulator's lights* (`FLICKER_LIGHTS`, `build_loop(light=...,
+mains_drift_hz=...)`): "led60"/"led50" flicker at twice the mains with a 30%
+fourth harmonic, as measured; "half60"/"half50" once a cycle, with second and
+third harmonics, as no light measured did; any of them on a mains off
+nominal. Grids hold within about 0.02 Hz, which moves 120 Hz flicker 14
+degrees a second **[unmeasured here]**.
+
+*What the drift showed.* The filter that learnt flicker only from dark data
+slots, as a sine at 100 and 120 Hz, delivered 143 of 144 at 47% while the
+mains was exact -- and **77** with it 0.02 Hz off, 88 with the measured
+shape added, 0 with a once-a-cycle light, whose 50 or 60 Hz calibration's
+8 ms samples do not average away. A real room likely drifts.
+
+So each badge fits the room's flicker once, early, from a window in which
+its peer is known dark, and keeps the fit in step with the mains:
+
+- **The windows need no new step.** The Follower sees the Leader's opening
+  gap as quiet 30-300 ms into it, and the Leader stays dark through the gap
+  and its staircase's first step, low: 450 ms. So the Follower fits
+  `FLICKER_FOLLOWER_FIT_MS` (100) after seeing the quiet, from that long of
+  samples -- 150 ran into the step's end when the quiet was seen late. The
+  Leader fits from its own staircase, which the Follower watches dark,
+  `FLICKER_FIT_MS` (200) of it starting `FLICKER_FIT_LEAD_MS` (175) past the
+  gap, so the fit falls mid-step. Calibration's timing is unchanged, so a
+  badge with the fit pairs with one without.
+- **The fit.** A straight line -- a sensor still settling, which harmonics
+  would take for 50 Hz -- then each of `FLICKER_HARMONICS` (4) harmonics of
+  each mains in `FLICKER_MAINS` (50, 60), projected in whole numbers from the
+  sine table and refined `FLICKER_FIT_PASSES` (2) times; the mains that
+  explains more is the region. A full least squares took up to 21 ms under
+  the unix port; this takes 3.3. The simulator charges the badge 150 ms
+  for it, pessimistically, and nothing failed for it. On the badge it is
+  **[unmeasured-v2]**: Dev Mode's *probe frame timing* now times it, a
+  correction, a phase-lock point and both kinds of update under
+  `frame_probe.flicker_filter`, and *measure room flicker* runs the fit on
+  every capture -- replace the 150 ms with what they find.
+- **What it refuses.** A window it cannot explain to `FLICKER_FIT_MAX_NOISE`
+  (12 counts) was not dark and steady -- the Follower's 200 ms window once
+  held the end of the beacon -- and is tried again at half the length,
+  then left to the old filter. A harmonic its samples barely saw, kept
+  under `FLICKER_MIN_SEEN` (0.3) by their averaging, is not fitted: 240 Hz
+  in 4 ms samples is 4% visible, and dividing by that made 8-10 counts of
+  flicker from noise in a dark room. A harmonic under `FLICKER_FIT_SIGMAS`
+  (4) of its standard error, or `FLICKER_MIN_COUNTS`, is dropped; with
+  none left the room is steady and nothing is taken off or learnt.
+- **Correcting** is one look-up a sample: a table per span step of the
+  fitted flicker as a sample that long sees it, built once from a base
+  table per harmonic. Every sample is corrected from the fit on,
+  calibration's included -- and the Follower, which fits after its reader
+  has begun, reads what it had so far again, corrected, from the samples
+  it keeps. Uncorrected, the black at the staircase's start failed
+  calibration under once-a-cycle lights in 15 of 144.
+- **Tracking** is a phase lock on the table's offset. Each update is the
+  timing error that best explains a few samples the peer was dark for --
+  `FLICKER_TRACK_POINTS` (8) while this badge sends its staircase or waits
+  out the gap, the back half of a slot decided dark -- and moves the offset
+  by `FLICKER_TRACK_GAIN` (0.25) of it. The rate is the slope of a line
+  through the measured timings, forgetting `FLICKER_RATE_MEMORY` (0.99) an
+  update, used once its points span `FLICKER_RATE_MIN_S` (0.3 s); it
+  carries the timing through stretches with nothing dark to see, such as
+  reading the peer's staircase. A rate stepped by each error over the time
+  since the last was noise, 30 times the drift's, since updates can come
+  24 ms apart. The badges learn 6.2-7.3 steps a second of a true 6.4.
+- **The fallback** is the earlier filter: sines at `FLICKER_HZ` (100, 120),
+  learnt from the back half of slots decided dark, in proportion to the
+  time their samples cover, from as few as `FLICKER_MIN_POINTS` (2),
+  settling over `FLICKER_TAU_MS` (250) of dark. Its lessons stand: learnt
+  from every slot it picked up 15% of the swing as flicker; learnt shrunk
+  by a sample's averaging, the estimate ran 10-20% low.
+- Everything per sample is whole numbers from tables (`FLICKER_STEPS`,
+  `FLICKER_ONE`, `FLICKER_SPAN_US`); a time's place in a cycle is its
+  microseconds into the second. Floats only in the fit, and once a slot.
+
+In simulation, 144 transfers each, the fit's stall included:
+
+| Room | Before | Fitted |
+|---|---|---|
+| LED shape, mains 0.02 Hz off (60 / 50 Hz) | 88 / 86 | **144 / 144**, 10.6 s, 16 ms |
+| Pure 120 Hz, mains exact | 143, 14.2 s, mostly 20 ms | **144**, 10.6 s, 16 ms |
+| Pure 120 Hz, mains 0.02 Hz off | 77 | **144** |
+| Once a cycle, 60 / 50 Hz | 0 / 0 | **144 / 144** |
+| Once a cycle at 30% | 69 | **144** |
+| 47% at three times the light | 8-16 | 114; **144** with the handshake's gap drop |
+| the same at 100 Hz / LED shape at 50 Hz, 0.02 Hz off | -- | 138 / 86; **144 / 129** with the drop |
+| LED shape, mains 0.05 Hz off | 74 | 112 |
+| Dark, every stress, and lit without flicker | 143-144 | 144 each |
+
+Three times the light failed in the handshake, not the fit: 30 of 144, the
+Follower taking a missed beacon edge for quiet -- see "Peer present". Dropping
+a coarse sample cut short by a present brings it to 144, and the same room at
+100 Hz from 138 to 144, on v3 timing from 124 to 144, the pixels scheme from
+101 to 143, and a v3 Leader with a v2 Follower from 117 to 144 (a v2 Leader
+with a v3 Follower, 140 to 141, and 412 to 429 of 432 over seeds 9-32). Still failing: the LED shape at 50 Hz there
+(129, `ERR_LOST_PEER` in the data phase), and a mains 0.05 Hz off, 2.5 times
+what grids allow, where the lock falls behind. **None of this has
+run on the badge**: the drift and the harmonics are the simulator's
+assumptions, and no light has yet been measured flickering once a cycle.
 
 **A beacon must be two-sided.** A quiet window holding one outlier has the
 swing of a beacon, and its few crossings once averaged to a beacon's half
@@ -598,7 +739,7 @@ speed the light sets -- ds/dt = (I - s) * s / K, one constant fitted to
 | backlight, lit room (`room_light` 48), or the idealised sensor | **144** each | **10.5 s** | 16 ms |
 | backlight, lit, 30% flicker at 120 Hz | 144 | 12.1 s | 16-20 ms |
 | backlight, lit, 47% flicker | 141 | 13.4 s | 16-20 ms |
-| backlight, 47% flicker at three times the light (150 counts) | 16 | -- | calibration fails |
+| backlight, 47% flicker at three times the light (150 counts) | 144 | 10.6 s | 16 ms |
 | backlight, dark: mirror; peer aligned; peer overlapping; v3; slow panel | **144** each | 15.3 s | 32 ms |
 | backlight, dark, sensor 1.5x or 2x slower, or noise sd 9 | **144** each | 15.3 s | 32 ms |
 | backlight, dark, reads 4x slower (one every 2 ms) | 139 | 24.2 s | 32-80 ms |
@@ -608,11 +749,12 @@ speed the light sets -- ds/dt = (I - s) * s / K, one constant fitted to
 | pixels, everything worse at once | 82 | 23.8 s | 80-100 ms |
 
 The backlight rows are with the dim low and the flicker filter, against a
-simulator that takes light as PWM duty past the driver's threshold. The
-flicker filter works in the data phase only, so bright flickering light
-still fails calibration: at three times the lit mirror hold's light, 16 of
-144. Whether a hold ever lets in that much is not known -- the flicker tool,
-held facing the room, read 240-385, against 48 at the mirror hold.
+simulator that takes light as PWM duty past the driver's threshold. At the
+time the flicker filter worked in the data phase only, so bright flickering
+light failed calibration: at three times the lit mirror hold's light, 16 of
+144. Fitted before calibration it delivers 114, and 144 with the handshake's
+gap drop (see "Mains flicker is fitted" and "Peer present"). Whether a hold ever lets in that much is not known -- the flicker
+tool, held facing the room, read 240-385, against 48 at the mirror hold.
 
 With calibration in 200 ms steps, no breaking in and low off, before this
 section's last changes, the dark backlight rows took 16.6 s,
@@ -651,7 +793,39 @@ delay -- one reason the once-a-frame path is no longer what the app runs.
 - a peer badge's swing and speed, which only the 2nd-badge tool measures;
 - whether a collection, 16-64 ms, ever lands inside a transfer's data phase.
   `gc.collect()` runs at the start of a transfer and between blocks, never
-  in the loop.
+  in the loop;
+- that a present on v3 leaves more than `HANDSHAKE_GAP_MS` (7 ms) of dead
+  time, as the handshake's gap drop assumes: the simulator's `PRESENT_MS_V3`
+  (11) is **[inferred-v3]**, not measured.
+
+**Open issues**, found while fixing the bright room's handshake and left
+for their own change:
+
+- **A collection during calibration.** `gc.collect()` costs 16-64 ms on v2
+  **[measured-v2]**; one inside a staircase stretches a step, or stalls the
+  Follower's fit window. The simulator has no model of it.
+- **The Follower's fit stall can swallow a step.** On the pixels scheme in
+  the lit room at 47% flicker, 32 seeds: 574 of 576 before the gap drop,
+  562 with the drop as first tried, in calibration as well; 425 of 432
+  over seeds 9-32 with it as shipped, against 430. The traces put the
+  Follower's 150 ms fit stall (`LOOP_FIT_MS`, pessimistic) on its first
+  middle step.
+- **`quiet_ms()` takes its midpoint from the window's min and max**, so one
+  outlier moves it. The gap drop removes the outliers a present makes, not
+  the fragility; a robust midpoint (the k-th extreme) was erratic in
+  simulation -- 144, 132 and 123 of 144 for k of 2, 3 and 5.
+- **Six times the light (300 counts) delivers 0 of 144**, before and after:
+  `ERR_NO_PEER` on the Leader in all, the handshake never completing.
+- **Calls that outlast `HANDSHAKE_GAP_MS`.** With every call 7-15 ms --
+  ten times the measured cost -- the dark mirror delivers 269 of 432
+  against 268, but 15 of its failures move into the handshake
+  (`ERR_NO_PEER` / `ERR_CONTRAST`). At 3.5-7.5 ms (`call_ms` 5), over 32
+  seeds, it is 534 of 576 with the drop against 545 without; the extra
+  failures are data-phase `ERR_LOST_PEER`, and a sign test gives p ~ 0.12,
+  so the difference is not shown to be real.
+- **A once-a-cycle light at 60 Hz** (`half60`, dark backlight scheme)
+  delivered 142 of 144 with the drop against 144, and 427 of 432 against
+  430 over seeds 9-32: within seed noise, but in the wrong direction.
 
 Dev Mode's mirror `loopback` test is the first check: one badge sends a
 symbol block on its own backlight and decodes its reflection with this
@@ -981,6 +1155,27 @@ One slot per symbol. Nine symbols each, except Complete (six) and Complete Ack
 - It then beacons alternating black and high every `PRESENT_HALF_MS` until the
   Announce Pattern stops: no crossing of the window's midpoint for more than
   `ANNOUNCE_HALF_MS + 30` ms. It then starts measuring the staircase.
+- A continuous Follower drops the coarse sample it is pooling whenever its
+  readings stop for more than `HANDSHAKE_GAP_MS` (7) -- dead time, from the
+  end of one fine sample to the start of the next, in `ticks_us` -- unless
+  the sample in progress already follows a drop.
+
+> Its own presents stop its readings for 8-25 ms, and the coarse sample one
+> interrupts then closes on a few ms of readings, which average little of
+> 120 Hz flicker away. At 47% flicker on three times the lit room's light,
+> ±70 counts against an 80-count swing, one such sample a beacon half read
+> 45 counts high, lifted the window's `(min + max) / 2` over the Leader's
+> rising edge, and the missed crossing read as quiet: the Follower began
+> reading a staircase the Leader had not started, in 19 of 192 runs, and
+> 30 of 144 transfers failed -- 24 refusing that staircase, 6 with the
+> Leader never seeing the Follower's beacon out (`ERR_NO_PEER`). No fit can
+> help here: before the staircase the Leader is never dark. "Never twice
+> running" is what keeps a badge whose every call outlasts the threshold
+> closing coarse samples; without it a simulated badge with 10 ms calls
+> never left the handshake. Only the Follower's handshake drops: the
+> Leader's detector sees the Follower's black-to-high beacon, twice the
+> swing, and dropping in calibration as well cost the pixels scheme 6 of
+> 144 in a lit room. Receiver-side, so it pairs with a badge without it.
 - Its only job is to tell the Leader that someone is pointed at it, so the Leader can
   stop announcing and start calibrating.
 - The Follower also exits with `ERR_NO_PEER` after `ANNOUNCE_TIMEOUT_MS`.
