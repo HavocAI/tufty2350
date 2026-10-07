@@ -293,7 +293,7 @@ def started_pair(payload=(b"HomeNet", b"hunter2!!"), start_ms=None):
     for side in (leader, follower):
         side.levels = levels()
         side.now = 0
-        index = side.optimistic_index() if start_ms is None \
+        index = side.conservative_index() if start_ms is None \
             else protocol.SLOT_LADDER.index(start_ms)
         side.start_data(0, index)
     return leader, follower

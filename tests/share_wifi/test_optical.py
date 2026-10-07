@@ -249,8 +249,8 @@ def test_transfers_start_on_proven_ground():
     # There is no gamble rung on pixels. A transfer starts at the fastest rate
     # the measured panel allows, which is 80ms.
     transfer = protocol.Transfer(True, (b"n", b"password1"), frame_ms=lambda: 11)
-    assert transfer.optimistic_index() == transfer.conservative_index()
-    assert protocol.SLOT_LADDER[transfer.optimistic_index()] == 80
+    assert transfer.start_index() == transfer.conservative_index()
+    assert protocol.SLOT_LADDER[transfer.start_index()] == 80
 
 
 def test_there_is_no_optimistic_rung():
@@ -277,20 +277,20 @@ def test_there_is_no_optimistic_rung():
         protocol.BACKLIGHT_PROVEN_MS
 
 
-def test_optimistic_index_cannot_run_off_the_ladder():
+def test_start_index_cannot_run_off_the_ladder():
     # A badge already at the fastest rung must not index past it.
     transfer = protocol.Transfer(True, (b"n", b"password1"), frame_ms=lambda: 1)
-    assert transfer.optimistic_index() <= len(protocol.SLOT_LADDER) - 1
+    assert transfer.start_index() <= len(protocol.SLOT_LADDER) - 1
 
 
 def test_demoting_from_the_starting_rung_steps_one_rung_slower():
     # Demotion is the only rate change there is now, and it must move exactly
     # one rung: a badge that skipped one would land somewhere its peer is not.
     transfer = protocol.Transfer(True, (b"n", b"password1"), frame_ms=lambda: 11)
-    transfer.clock.set_index(transfer.optimistic_index())
+    transfer.clock.set_index(transfer.start_index())
     assert protocol.SLOT_LADDER[transfer.clock.index] == 80
     transfer.clock.slow_down()
-    assert transfer.clock.index == transfer.optimistic_index() - 1
+    assert transfer.clock.index == transfer.start_index() - 1
     assert protocol.SLOT_LADDER[transfer.clock.index] == 100
 
 

@@ -156,8 +156,9 @@ def test_the_widest_ssids_fit_every_list_and_message():
         checker.where = "connect %r" % name[:8]
         app.start_connect(name)
         frame(namespace)                        # Connecting
-        app.status_readable = False
+        namespace["wifi"].status_raises = True  # STATUS_UNREADABLE
         frame(namespace)
+        namespace["wifi"].status_raises = False
         for message in ("Incorrect password. (-3)",
                         "Access point %s not found. (-2)" % name,
                         "Timed out\nWi-Fi status unavailable (1)"):

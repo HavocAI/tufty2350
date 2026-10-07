@@ -501,8 +501,8 @@ def load_app(name, max_frames=0, networks=None, run_frames=0,
     for module_name, module in (modules or {}).items():
         sys.modules[module_name] = module
 
-    # An app folder is a package, but exec() gives no package context, so the
-    # app's relative import falls back to an absolute one. Make that resolve.
+    # The launcher puts the app's folder on sys.path before importing it, so
+    # an app imports its sibling modules by plain name. Do the same.
     app_dir = os.path.join(APPS, name)
     if app_dir not in sys.path:
         sys.path.insert(0, app_dir)
@@ -536,9 +536,8 @@ def load_app(name, max_frames=0, networks=None, run_frames=0,
     app_builtins["print"] = lambda *a: printed.append(
         " ".join(str(item) for item in a))
 
-    # exec() has no package context, so a relative import raises. Supplying
-    # these makes it raise ImportError -- which the app's fallback catches --
-    # rather than KeyError, which it does not.
+    # exec() has no package context. Supplying these makes a relative import,
+    # should an app attempt one, raise ImportError rather than KeyError.
     namespace = {"__name__": name, "__package__": None,
                  "__builtins__": app_builtins}
     try:

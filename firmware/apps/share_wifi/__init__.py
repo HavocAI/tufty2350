@@ -22,66 +22,36 @@ import time
 import wifi
 
 # Absolute, not relative: the launcher does sys.path.insert(0, app_dir) before
-# importing an app, so sibling modules are plain top-level imports. The
-# fallback covers being imported as a package instead. Named rather than `*`,
-# so every protocol name the app depends on is listed here.
-try:
-    from protocol import (
-        ERR_CANCELLED, ERR_CONTRAST, ERR_CRC, ERR_DECODE, ERR_LOST_PEER,
-        BACKLIGHT_INDEX, ERR_NO_PEER, FAST_INDEX, FINE_MS, LEVEL_SCHEMES, LOW,
-        OK,
-        PHASE_ANNOUNCE, PHASE_DONE, PHASE_PRESENT,
-        SCHEME_BACKLIGHT, SCHEME_FIELDS, FlickerFilter, Levels, SlotClock,
-        SlotReceiver, Transfer, parse_payload,
-    )
-except ImportError:
-    from .protocol import (
-        ERR_CANCELLED, ERR_CONTRAST, ERR_CRC, ERR_DECODE, ERR_LOST_PEER,
-        BACKLIGHT_INDEX, ERR_NO_PEER, FAST_INDEX, FINE_MS, LEVEL_SCHEMES, LOW,
-        OK,
-        PHASE_ANNOUNCE, PHASE_DONE, PHASE_PRESENT,
-        SCHEME_BACKLIGHT, SCHEME_FIELDS, FlickerFilter, Levels, SlotClock,
-        SlotReceiver, Transfer, parse_payload,
-    )
+# importing an app, on v2 and v3 alike, so sibling modules are plain top-level
+# imports. Named rather than `*`, so every name the app depends on is listed.
+from protocol import (
+    ERR_CANCELLED, ERR_CONTRAST, ERR_CRC, ERR_DECODE, ERR_LOST_PEER,
+    BACKLIGHT_INDEX, ERR_NO_PEER, FAST_INDEX, FINE_MS, LEVEL_SCHEMES, LOW,
+    OK,
+    PHASE_ANNOUNCE, PHASE_DONE, PHASE_PRESENT,
+    SCHEME_BACKLIGHT, SCHEME_FIELDS, FlickerFilter, Levels, SlotClock,
+    SlotReceiver, Transfer, parse_payload,
+)
 
 # Dev Mode's measurement engine: pure, like the protocol, and imported the same
 # way. Its PHASE_DONE is not imported -- the protocol's has the same name.
-try:
-    from measure import (
-        PHASE_ANSWERING, PHASE_CALLING, PHASE_MEASURING, PHASE_NOISE,
-        PHASE_SENDING, TOOL_MIRROR, TOOL_SECOND_BADGE, MirrorRun, SecondBadgeRun,
-        core_temp_c, merge_results, pages, tool_result,
-    )
-except ImportError:
-    from .measure import (
-        PHASE_ANSWERING, PHASE_CALLING, PHASE_MEASURING, PHASE_NOISE,
-        PHASE_SENDING, TOOL_MIRROR, TOOL_SECOND_BADGE, MirrorRun, SecondBadgeRun,
-        core_temp_c, merge_results, pages, tool_result,
-    )
+from measure import (
+    PHASE_ANSWERING, PHASE_CALLING, PHASE_MEASURING, PHASE_NOISE,
+    PHASE_SENDING, TOOL_MIRROR, TOOL_SECOND_BADGE, MirrorRun, SecondBadgeRun,
+    core_temp_c, merge_results, pages, tool_result,
+)
 
 # Dev Mode's frame timing probe: pure too, with the badge handed in as hooks.
-try:
-    from probe import (
-        FAST_READS, STEP_TITLES, STEPS, TOOL_PROBE, FrameProbe, Hooks,
-        TimeStats,
-    )
-except ImportError:
-    from .probe import (
-        FAST_READS, STEP_TITLES, STEPS, TOOL_PROBE, FrameProbe, Hooks,
-        TimeStats,
-    )
+from probe import (
+    FAST_READS, STEP_TITLES, STEPS, TOOL_PROBE, FrameProbe, Hooks,
+    TimeStats,
+)
 
 # Dev Mode's room-flicker tool: pure, the sensor and clock handed in.
-try:
-    from flicker import (
-        DRIFT_WINDOWS, TOOL_FLICKER, Capture, Drift, analyse, drift_hz,
-        summary,
-    )
-except ImportError:
-    from .flicker import (
-        DRIFT_WINDOWS, TOOL_FLICKER, Capture, Drift, analyse, drift_hz,
-        summary,
-    )
+from flicker import (
+    DRIFT_WINDOWS, TOOL_FLICKER, Capture, Drift, analyse, drift_hz,
+    summary,
+)
 
 badge.mode(HIRES | VSYNC)
 
@@ -110,21 +80,10 @@ MARGIN = 6
 LINE_HEIGHT = 16
 ALIGN_LINE = 2                  # px: the alignment screen's middle line
 
-# Dev Mode's handshake screen -- the one screen that shows a field and text
-# together -- puts the field in TWO BANDS, one down each edge, with the text
-# between them. Two rather than one half because the sensor is not central: it
-# sits about 1mm outside the RIGHT edge at mid height and reads a patch near
-# itself, and two badges facing each other are mirrored, so one band would be a
-# bet on how they are held. The text column is drawn on black and must not
-# animate: a sensor whose patch straddles a band edge picks some of it up.
-# Transfers and tests used this layout too, until it measured at three 60 Hz
-# refreshes a frame; they now fill the whole screen.
 
-
-# `font.<name>` works on current firmware, but was seen raising on an older
-# build, so resolve defensively and treat a missing font as "keep the default".
-# `rom_font` is not a real name on any build; it is probed only because an
-# older one was thought to have it.
+# The named fonts are `font.<name>` on v3 and `rom_font.<name>` on v2 -- the
+# badge's firmware -- where `font` is the vector type and has none. Both are
+# probed by bare name; a missing font keeps the default rather than crashing.
 def pick_font(*names):
     spaces = []
     try:
@@ -339,22 +298,25 @@ def radio_ssid(name):
         return raw
 
 
-def load_networks():
-    """Every saved network, as {escaped ssid: (key, security)}.
+def load_state(name):
+    """`name`'s state file as a dict, {} when missing, unreadable or not a dict.
 
     State.load() returns a bool and fills the dict it was handed, whatever the
     prose says; taking the return value when it happens to be a dict costs one
-    comparison and covers a build that does. Returning {} on an unexpected
-    shape would silently forget every saved network.
+    comparison and covers a build that does.
     """
     loaded = {}
     try:
-        returned = State.load(CONFIG, loaded)
+        returned = State.load(name, loaded)
     except Exception:   # noqa: BLE001 - a corrupt file must not stop the app
         return {}
-    raw = returned if isinstance(returned, dict) else loaded
-    if not isinstance(raw, dict):
-        return {}
+    data = returned if isinstance(returned, dict) else loaded
+    return data if isinstance(data, dict) else {}
+
+
+def load_networks():
+    """Every saved network, as {escaped ssid: (key, security)}."""
+    raw = load_state(CONFIG)
     networks = {}
     for name in raw:
         networks[name] = stored_entry(raw[name])
@@ -455,15 +417,20 @@ def sample_light():
     return b
 
 
+def dark_mirror_levels():
+    # The dark mirror run's black, middle and white, in counts.
+    levels = Levels()
+    levels.fit(32, 64, 112)
+    return levels
+
+
 def probe_receiver():
     # The probe's listener: a data-phase slot receiver on the 50 ms rung, with
     # the dark mirror run's levels and a v2 frame. What it decides is thrown
     # away; only what a pass of it costs is kept.
-    levels = Levels()
-    levels.fit(32, 64, 112)
     clock = SlotClock()
     clock.start(time.ticks_ms(), FAST_INDEX)
-    return SlotReceiver(clock, levels, 17)
+    return SlotReceiver(clock, dark_mirror_levels(), 17)
 
 
 def probe_listener():
@@ -473,9 +440,7 @@ def probe_listener():
     transfer = Transfer(False, frame_ms=lambda: 17,
                         schemes=(SCHEME_FIELDS, SCHEME_BACKLIGHT),
                         continuous=True)
-    levels = Levels()
-    levels.fit(32, 64, 112)
-    transfer.levels = levels
+    transfer.levels = dark_mirror_levels()
     transfer.scheme = SCHEME_BACKLIGHT
     now = time.ticks_ms()
     transfer.now = now
@@ -613,39 +578,38 @@ except NameError:
     _HAS_ALIGN = False
 
 
-def body_box(top=0):
+def body_box():
     """The area between the title and the help line, as (x, y, w, h)."""
-    return (MARGIN, MARGIN + top, screen.width - 2 * MARGIN,
-            screen.height - 2 * MARGIN - LINE_HEIGHT - top)
+    return (MARGIN, MARGIN, screen.width - 2 * MARGIN,
+            screen.height - 2 * MARGIN - LINE_HEIGHT)
 
 
-def band_width():
-    """How wide each band is: a quarter of the screen, each edge."""
-    return screen.width // 4
+def draw_bands(pen):
+    """Dev Mode's handshake screen: black, with `pen` in a band down each
+    edge, a quarter of the screen wide, and its status between them.
 
-
-def signal_boxes():
-    """Dev Mode's handshake bands, as (x, y, w, h) tuples.
-
-    The protocol transmits on the whole screen now (see show_field()); only
-    Dev Mode's handshake still uses bands, so its status can sit between them.
-    Hard to the screen edges: the sensor sits a millimetre outside them, so the
-    outermost pixels are the ones that couple best.
+    The one screen that shows a field and text together. Two bands rather
+    than one half because the sensor is not central: it sits about 1mm
+    outside the RIGHT edge at mid height and reads a patch near itself, and
+    two badges facing each other are mirrored, so one band would be a bet on
+    how they are held. Hard to the screen edges, where the pixels couple
+    best. The text column is drawn on black and must not animate: a sensor
+    whose patch straddles a band edge picks some of it up. Transfers and
+    tests used this layout too, until it measured at three 60 Hz refreshes a
+    frame; they now fill the whole screen.
     """
-    band = band_width()
-    return ((0, 0, band, screen.height),
-            (screen.width - band, 0, band, screen.height))
+    fill(color.black)
+    band = screen.width // 4
+    screen.pen = pen
+    screen.rectangle(0, 0, band, screen.height)
+    screen.rectangle(screen.width - band, 0, band, screen.height)
 
 
-def text_column(top=0, bottom=0):
-    """The middle, between the two bands and inside its margins.
-
-    Only Dev Mode's handshake screen uses this; menus have the whole width.
-    """
-    band = band_width()
-    return (band + MARGIN, MARGIN + top,
-            screen.width - 2 * band - 2 * MARGIN,
-            screen.height - 2 * MARGIN - top - bottom)
+def text_column():
+    """The middle, between draw_bands()' two bands and inside its margins."""
+    band = screen.width // 4
+    return (band + MARGIN, MARGIN, screen.width - 2 * band - 2 * MARGIN,
+            screen.height - 2 * MARGIN)
 
 
 # --- signalling: the whole screen, at LORES ---------------------------------
@@ -698,6 +662,7 @@ def measure_refresh():
 
 def show_full(pen, backlight):
     """The whole screen in `pen` at `backlight`, each set only if it changed.
+    True if the pixels changed, which only a present will show.
 
     The backlight scheme's symbols share one pen, so a change between them is
     a display.backlight() call and no fill: the framebuffer already holds the
@@ -706,9 +671,11 @@ def show_full(pen, backlight):
     if _SHOWN[1] != backlight:
         display.backlight(backlight)
         _SHOWN[1] = backlight
-    if _SHOWN[0] is not pen:
-        fill(pen)
-        _SHOWN[0] = pen
+    if _SHOWN[0] is pen:
+        return False
+    fill(pen)
+    _SHOWN[0] = pen
+    return True
 
 
 def show_backlight(backlight):
@@ -899,6 +866,15 @@ def draw_centered(text, pen=None):
     draw_text(text, body_box(), center=True, middle=True)
 
 
+def draw_screen(title, body, help_text=None, pen=None):
+    """A text screen: title, centred body and, if given, the help line."""
+    fill(color.black)
+    draw_title(title)
+    draw_centered(body, pen)
+    if help_text:
+        draw_help(help_text)
+
+
 def menu_top():
     """Where a list's first row goes: one line below the title."""
     return MARGIN + LINE_HEIGHT + MARGIN
@@ -927,6 +903,16 @@ def page_label(page, pages):
     return label
 
 
+def draw_paged_title(title, label, label_width):
+    """The title, with `label` -- "n/N", or None -- at the right."""
+    if not label:
+        draw_title(title)
+        return
+    draw_title(title, reserve=label_width + MARGIN)
+    draw_text(label, (screen.width - MARGIN - label_width, MARGIN,
+                      label_width, LINE_HEIGHT))
+
+
 def draw_menu(title, items, cursor, help_text, empty="Nothing here"):
     """A list, paged when it has more rows than fit.
 
@@ -941,10 +927,7 @@ def draw_menu(title, items, cursor, help_text, empty="Nothing here"):
     page = cursor // rows if count else 0
     if pages > 1:
         label = page_label(page, pages)
-        label_width = screen.measure_text(label)[0]
-        draw_title(title, reserve=label_width + MARGIN)
-        draw_text(label, (screen.width - MARGIN - label_width, MARGIN,
-                          label_width, LINE_HEIGHT))
+        draw_paged_title(title, label, screen.measure_text(label)[0])
     else:
         draw_title(title)
     if not items:
@@ -1258,10 +1241,7 @@ def fast_reads():
 
     def ready():
         if not held:
-            try:
-                import fastadc
-            except ImportError:
-                from . import fastadc
+            import fastadc
             held.append(fastadc)
             held.append(fastadc.buffer(FAST_READS))
         fastadc, buf = held
@@ -1298,21 +1278,6 @@ def firmware_info():
     return info
 
 
-def load_measurements():
-    """The measurements file as a dict, {} when there is none or it is unreadable.
-
-    The same dance as load_networks(): State.load() returns a bool and fills
-    the dict it was handed.
-    """
-    loaded = {}
-    try:
-        returned = State.load(MEASUREMENTS, loaded)
-    except Exception:   # noqa: BLE001 - a corrupt file must not stop the app
-        return {}
-    data = returned if isinstance(returned, dict) else loaded
-    return data if isinstance(data, dict) else {}
-
-
 class App:
     def __init__(self):
         self.screen = MAIN
@@ -1324,7 +1289,6 @@ class App:
         # list is opened: seeding there would re-check secrets for no reason.
         seed_own_network(self.networks)
         self.names = sorted(self.networks)
-        self.labels = []
         self.relabel()
         self.transfer = None
         self.error = None
@@ -1338,7 +1302,6 @@ class App:
         self.align_leader = False
         self.align_payload = None
         self.align_from = MAIN
-        self.status_readable = True
         self.retry_target = None
         # Dev Mode: the run in progress and what it has measured so far.
         self.measure_tool = None
@@ -1374,6 +1337,20 @@ class App:
         # display measurements: (title, label, label width, lines) per page.
         self.pages = []
         self.page = 0
+        # Bound once, so a frame's dispatch is a lookup and allocates nothing.
+        self.handlers = {
+            MAIN: self.do_main, PICK_SHARE: self.do_pick_share,
+            ALIGN: self.do_align, TRANSFER: self.do_transfer,
+            RESULT: self.do_result, CONNECT_LIST: self.do_connect_list,
+            CONNECTING: self.do_connecting,
+            CONNECT_RESULT: self.do_connect_result, DEV: self.do_dev,
+            DEV_ROLE: self.do_dev_role, DEV_PROMPT: self.do_dev_prompt,
+            DEV_MEASURE: self.do_dev_measure, DEV_SAVED: self.do_dev_saved,
+            DEV_DISPLAY: self.do_dev_display,
+            DEV_PROBE_PROMPT: self.do_dev_probe_prompt,
+            DEV_PROBE: self.do_dev_probe, DEV_FLICKER: self.do_dev_flicker,
+            DEV_FLICKER_DRIFT: self.do_dev_flicker_drift,
+        }
 
     # -- main menu
 
@@ -1387,11 +1364,7 @@ class App:
         caselights_for("idle")
         if badge.pressed(BUTTON_A):
             choice = self.menu_items[self.cursor]
-            if choice == "Share":
-                self.refresh_networks()
-                self.cursor = 0
-                self.screen = PICK_SHARE
-            elif choice == "Receive":
+            if choice == "Receive":
                 self.to_align(leader=False)
             elif choice == DEV_MODE:
                 self.cursor = 0
@@ -1399,7 +1372,7 @@ class App:
             else:
                 self.refresh_networks()
                 self.cursor = 0
-                self.screen = CONNECT_LIST
+                self.screen = PICK_SHARE if choice == "Share" else CONNECT_LIST
 
     def refresh_networks(self):
         self.networks = load_networks()
@@ -1451,10 +1424,8 @@ class App:
         elif badge.pressed(BUTTON_B):
             # Back where it came from: the network list, the main screen, or
             # the failed transfer's result -- which offers the retry again.
-            if self.align_from == PICK_SHARE:
-                self.screen = PICK_SHARE
-            elif self.align_from == RESULT:
-                self.screen = RESULT
+            if self.align_from in (PICK_SHARE, RESULT):
+                self.screen = self.align_from
             else:
                 self.to_main()
 
@@ -1511,15 +1482,10 @@ class App:
             if field != shown_field or scheme != shown_scheme:
                 shown_field = field
                 shown_scheme = scheme
-                backlight = FIELD_BACKLIGHT[scheme].get(field, 1.0)
-                if _SHOWN[1] != backlight:
-                    show_backlight(backlight)
-                pen = FIELD_COLOR[scheme].get(field, color.black)
-                if _SHOWN[0] is not pen:
+                if show_full(FIELD_COLOR[scheme].get(field, color.black),
+                             FIELD_BACKLIGHT[scheme].get(field, 1.0)):
                     # The whole screen is the field and nothing else is
-                    # drawn.
-                    fill(pen)
-                    _SHOWN[0] = pen
+                    # drawn; run() presents it.
                     transfer_lights(transfer)
                     return
             passes += 1
@@ -1532,11 +1498,9 @@ class App:
                 return
 
     def finish_transfer(self, transfer):
-        badge.caselights(0.0)
         # The single exit from the transfer screen, so the only place the
         # backlight has to go back down and HIRES come back.
-        end_signalling()
-        display.backlight(BACKLIGHT_NORMAL)
+        restore_panel()
         if transfer.result != OK:
             self.error = transfer.result
             self.screen = RESULT
@@ -1560,11 +1524,10 @@ class App:
         self.start_connect(name)
 
     def do_result(self):
-        fill(color.black)
         if self.error:
-            draw_title("Transfer failed")
-            draw_centered(ERROR_TEXT.get(self.error, self.error), color.smoke)
-            draw_help("A - Main Menu   B - Retry")
+            draw_screen("Transfer failed",
+                        ERROR_TEXT.get(self.error, self.error),
+                        "A - Main Menu   B - Retry", color.smoke)
             caselights_for("error")
             if badge.pressed(BUTTON_B) and self.retry_target:
                 leader, payload = self.retry_target
@@ -1572,9 +1535,7 @@ class App:
             elif badge.pressed(BUTTON_A):
                 self.to_main()
         else:
-            draw_title("Done")
-            draw_centered(self.message)
-            draw_help("Any button - Main Menu")
+            draw_screen("Done", self.message, "Any button - Main Menu")
             caselights_for("idle")
             if badge.pressed():
                 self.to_main()
@@ -1624,13 +1585,9 @@ class App:
         # Read once a frame and used twice: on a badge whose firmware raises
         # from status(), asking again is a second exception for nothing.
         code, description, readable = wifi_status()
-        self.status_readable = readable
 
-        fill(color.black)
-        draw_title("Connecting")
         dots = "." * (1 + (badge.ticks // 400) % 3)
-        draw_centered(self.connect_name + "\n" + dots)
-        draw_help("B - Back")
+        draw_screen("Connecting", self.connect_name + "\n" + dots, "B - Back")
         caselights_for("busy")
         if not readable:
             screen.pen = color.smoke
@@ -1668,20 +1625,16 @@ class App:
             self.screen = CONNECT_RESULT
 
     def do_connect_result(self):
-        fill(color.black)
         caselights_for("idle")
         if self.error:
-            draw_title("Connection failed")
-            draw_centered(self.message, color.smoke)
-            draw_help("A - Retry   B - Back")
+            draw_screen("Connection failed", self.message,
+                        "A - Retry   B - Back", color.smoke)
             if badge.pressed(BUTTON_A):
                 self.start_connect(self.connect_name)
             elif badge.pressed(BUTTON_B):
                 self.screen = CONNECT_LIST
         else:
-            draw_title("Connected")
-            draw_centered(self.message)
-            draw_help("Any button - Back")
+            draw_screen("Connected", self.message, "Any button - Back")
             if badge.pressed():
                 self.screen = CONNECT_LIST
 
@@ -1731,10 +1684,8 @@ class App:
     def do_dev_role(self):
         # No way back from here: B is "I go second". B at the prompt that
         # follows is the way out.
-        fill(color.black)
-        draw_title("Who goes first?")
-        draw_centered("One badge must choose each.")
-        draw_help("A - I go first   B - I go second")
+        draw_screen("Who goes first?", "One badge must choose each.",
+                    "A - I go first   B - I go second")
         caselights_for("attention")    # waiting on the user
         if badge.pressed(BUTTON_A):
             self.begin_tool(TOOL_SECOND_BADGE, True)
@@ -1760,10 +1711,8 @@ class App:
             # The hold a transfer uses, so the swing measured is its swing.
             draw_alignment(self.prompt_text, CONDITION_TITLES[self.condition])
         else:
-            fill(color.black)
-            draw_title(CONDITION_TITLES[self.condition])
-            draw_centered(self.prompt_text)
-            draw_help("A - Start   B - Cancel")
+            draw_screen(CONDITION_TITLES[self.condition], self.prompt_text,
+                        "A - Start   B - Cancel")
         caselights_for("attention")    # waiting on the user
         if badge.pressed(BUTTON_B):
             self.cancel_measure()
@@ -1836,11 +1785,7 @@ class App:
             if self.signalling:
                 end_signalling()
                 self.signalling = False
-            screen.pen = color.black
-            screen.clear()
-            screen.pen = pixels_pen(run.pixels)
-            for x, y, width, height in signal_boxes():
-                screen.rectangle(x, y, width, height)
+            draw_bands(pixels_pen(run.pixels))
             self.draw_measure_column()
             display.backlight(run.backlight)
             # Case lights stay off while measuring: in the dark-room run they
@@ -1938,26 +1883,24 @@ class App:
             self.dark_result = result
             self.prompt_for("lit")
         else:
-            self.save_measurements(self.dark_result, result)
+            role = None
+            if self.measure_tool == TOOL_SECOND_BADGE:
+                role = "first" if self.measure_first else "second"
+            self.save_measurements(self.measure_tool,
+                                   tool_result(self.dark_result, result, role))
             self.dark_result = None
-            self.screen = DEV_SAVED
         gc.collect()
 
-    def save_measurements(self, dark, lit):
-        role = None
-        if self.measure_tool == TOOL_SECOND_BADGE:
-            role = "first" if self.measure_first else "second"
-        entry = tool_result(dark, lit, role)
-        # Merged here so the other tool's object is kept as it was, then
+    def save_measurements(self, tool, entry):
+        # Merged here so the other tools' objects are kept as they were, then
         # written in one go -- the one write a run makes.
-        merged = merge_results(load_measurements(), self.measure_tool, entry)
+        merged = merge_results(load_state(MEASUREMENTS), tool, entry)
         try:
             write_measurements(merged)
             self.saved_ok = True
-        except OSError:
+        except Exception:   # noqa: BLE001 - OSError, or run() would reset
             self.saved_ok = False
-        except Exception:   # noqa: BLE001 - run() would turn it into a reset
-            self.saved_ok = False
+        self.screen = DEV_SAVED
 
     def cancel_measure(self):
         # Nothing is saved: the dark result, if any, is dropped with the run.
@@ -1969,14 +1912,9 @@ class App:
         gc.collect()
 
     def do_dev_saved(self):
-        fill(color.black)
-        draw_title("Done")
-        if self.saved_message:
-            draw_centered(self.saved_message)
-        else:
-            draw_centered("Measurements saved" if self.saved_ok
-                          else "Could not save measurements")
-        draw_help("Any button - Back")
+        draw_screen("Done", self.saved_message or (
+            "Measurements saved" if self.saved_ok
+            else "Could not save measurements"), "Any button - Back")
         caselights_for("attention")    # waiting on the user
         if badge.pressed():
             self.to_dev(self.tool_index())
@@ -1985,7 +1923,7 @@ class App:
 
     def open_measurements(self):
         """Build every page once, here, rather than per frame."""
-        data = load_measurements()
+        data = load_state(MEASUREMENTS)
         self.pages = []
         self.page = 0
         built = []
@@ -2010,15 +1948,14 @@ class App:
         self.screen = DEV_DISPLAY
 
     def do_dev_display(self):
-        fill(color.black)
         caselights_for("idle")
         if not self.pages:
-            draw_title("Measurements")
-            draw_centered("No measurements saved")
-            draw_help("Any button - Back")
+            draw_screen("Measurements", "No measurements saved",
+                        "Any button - Back")
             if badge.pressed():
                 self.to_dev(DISPLAY_INDEX)
             return
+        fill(color.black)
         if (badge.pressed(BUTTON_A) or badge.pressed(BUTTON_B)
                 or badge.pressed(BUTTON_C)):
             self.to_dev(DISPLAY_INDEX)
@@ -2029,12 +1966,7 @@ class App:
         if badge.pressed(BUTTON_DOWN):
             self.page = (self.page + 1) % count
         title, label, label_width, lines = self.pages[self.page]
-        if label:
-            draw_title(title, reserve=label_width + MARGIN)
-            draw_text(label, (screen.width - MARGIN - label_width, MARGIN,
-                              label_width, LINE_HEIGHT))
-        else:
-            draw_title(title)
+        draw_paged_title(title, label, label_width)
         screen.pen = color.white
         y = menu_top()
         width = screen.width - 2 * MARGIN
@@ -2047,12 +1979,11 @@ class App:
     # -- probe frame timing
 
     def do_dev_probe_prompt(self):
-        fill(color.black)
-        draw_title("Probe frame timing")
-        draw_centered("Times the display, each part of a measuring frame "
-                      "and how fast the sensor reads. Takes about 25 s; "
-                      "the screen flashes and goes dark.")
-        draw_help("A - Start   B - Back")
+        draw_screen("Probe frame timing",
+                    "Times the display, each part of a measuring frame "
+                    "and how fast the sensor reads. Takes about 25 s; "
+                    "the screen flashes and goes dark.",
+                    "A - Start   B - Back")
         caselights_for("idle")
         if badge.pressed(BUTTON_B):
             self.to_dev(TOOL_INDEX[TOOL_PROBE])
@@ -2073,13 +2004,17 @@ class App:
                   ("column", self.draw_measure_column),
                   ("lights", self.probe_lights),
                   ("measure", self.probe_measure))
+        self.probe_receiver = probe_receiver()
+        self.probe_listener = probe_listener()
+        self.probe_passes = 0
+        self.probe_timed = TimedListener(probe_listener())
         hooks = Hooks(
             present=display.update,
             set_vsync=getattr(display, "set_vsync", None),
             poll=badge.poll, clear=badge.clear,
             screens=(("field", self.probe_start_field, field),
                      ("status", self.probe_start_status, status)),
-            cancelled=self.probe_cancelled,
+            cancelled=lambda: badge.pressed(BUTTON_B),
             collect=gc.collect, enable=gc.enable, disable=gc.disable,
             mem_alloc=getattr(gc, "mem_alloc", None),
             mem_free=getattr(gc, "mem_free", None),
@@ -2088,13 +2023,9 @@ class App:
                    ("sample", sample_light), ("listen", self.probe_listen),
                    ("transfer", self.probe_transfer),
                    ("transfer_timed", self.probe_transfer_timed)),
-            reads_detail=self.probe_transfer_detail,
+            reads_detail=self.probe_timed.result,
             temp=core_temp_reader(), fast=fast_reads(),
             flicker_filter=FlickerFilter)
-        self.probe_receiver = probe_receiver()
-        self.probe_listener = probe_listener()
-        self.probe_passes = 0
-        self.probe_timed = TimedListener(probe_listener())
         self.probe = FrameProbe(hooks, firmware_info())
         self.screen = DEV_PROBE
 
@@ -2113,19 +2044,12 @@ class App:
         self.probe_run.begin(time.ticks_ms())
         self.status_number = -1
 
-    def probe_cancelled(self):
-        return badge.pressed(BUTTON_B)
-
     def probe_field(self):
         display.backlight(self.probe_run.backlight)
         fill(pixels_pen(self.probe_run.pixels))
 
     def probe_bands(self):
-        screen.pen = color.black
-        screen.clear()
-        screen.pen = pixels_pen(self.probe_run.pixels)
-        for x, y, width, height in signal_boxes():
-            screen.rectangle(x, y, width, height)
+        draw_bands(pixels_pen(self.probe_run.pixels))
 
     def probe_lights(self):
         display.backlight(self.probe_run.backlight)
@@ -2150,9 +2074,6 @@ class App:
         if self.probe_passes % POLL_PASSES == 0:
             badge.poll()
             badge.pressed(BUTTON_B)
-
-    def probe_transfer_detail(self):
-        return self.probe_timed.result()
 
     def probe_transfer(self):
         # One pass of the transfer's own listen loop, as do_transfer() runs
@@ -2185,11 +2106,10 @@ class App:
         if probe.done:
             self.save_probe()
             return
-        fill(color.black)
-        draw_title("Probe frame timing")
-        draw_centered("%s %d/%d" % (STEP_TITLES[probe.step_name],
-                                    probe.index + 1, len(STEPS)))
-        draw_help("B - Cancel")
+        draw_screen("Probe frame timing",
+                    "%s %d/%d" % (STEP_TITLES[probe.step_name],
+                                  probe.index + 1, len(STEPS)),
+                    "B - Cancel")
         caselights_for("idle")
         # Shown before the step, which blocks for up to 12 s.
         display.update()
@@ -2209,15 +2129,13 @@ class App:
 
     def do_dev_flicker(self):
         results = self.flicker_results
-        fill(color.black)
-        draw_title(FLICKER_TITLE)
         if results:
-            draw_centered("%d measured. Last: %s" % (len(results),
-                                                    summary(results[-1])))
+            body = "%d measured. Last: %s" % (len(results),
+                                             summary(results[-1]))
         else:
-            draw_centered("Hold the badge where it will be used, sensor "
-                          "towards the room. A measures for about 30 s.")
-        draw_help(FLICKER_HELP)
+            body = ("Hold the badge where it will be used, sensor "
+                    "towards the room. A measures for about 30 s.")
+        draw_screen(FLICKER_TITLE, body, FLICKER_HELP)
         caselights_for("idle")
         if badge.pressed(BUTTON_A):
             self.measure_flicker()
@@ -2227,9 +2145,7 @@ class App:
     def measure_flicker(self):
         # Shown first: the capture and its analysis block for a second or two,
         # and the drift that follows keeps the screen dark.
-        fill(color.black)
-        draw_title(FLICKER_TITLE)
-        draw_centered(FLICKER_MEASURING)
+        draw_screen(FLICKER_TITLE, FLICKER_MEASURING)
         display.update()
         temp = core_temp_reader()
         # The badge's own light off while it reads -- backlight and case
@@ -2291,24 +2207,12 @@ class App:
         numbered = {}
         for i in range(len(results)):
             numbered[str(i + 1)] = results[i]
-        merged = merge_results(load_measurements(), TOOL_FLICKER, numbered)
-        try:
-            write_measurements(merged)
-            self.saved_ok = True
-        except Exception:   # noqa: BLE001 - OSError, or run() would reset
-            self.saved_ok = False
-        self.screen = DEV_SAVED
+        self.save_measurements(TOOL_FLICKER, numbered)
 
     def save_probe(self):
         results = self.probe.results()
         self.end_probe()
-        merged = merge_results(load_measurements(), TOOL_PROBE, results)
-        try:
-            write_measurements(merged)
-            self.saved_ok = True
-        except Exception:   # noqa: BLE001 - OSError, or run() would reset
-            self.saved_ok = False
-        self.screen = DEV_SAVED
+        self.save_measurements(TOOL_PROBE, results)
 
     def end_probe(self):
         self.probe = None
@@ -2326,42 +2230,7 @@ class App:
         self.transfer = None
 
     def frame(self):
-        if self.screen == MAIN:
-            self.do_main()
-        elif self.screen == PICK_SHARE:
-            self.do_pick_share()
-        elif self.screen == ALIGN:
-            self.do_align()
-        elif self.screen == TRANSFER:
-            self.do_transfer()
-        elif self.screen == RESULT:
-            self.do_result()
-        elif self.screen == CONNECT_LIST:
-            self.do_connect_list()
-        elif self.screen == CONNECTING:
-            self.do_connecting()
-        elif self.screen == CONNECT_RESULT:
-            self.do_connect_result()
-        elif self.screen == DEV:
-            self.do_dev()
-        elif self.screen == DEV_ROLE:
-            self.do_dev_role()
-        elif self.screen == DEV_PROMPT:
-            self.do_dev_prompt()
-        elif self.screen == DEV_MEASURE:
-            self.do_dev_measure()
-        elif self.screen == DEV_SAVED:
-            self.do_dev_saved()
-        elif self.screen == DEV_DISPLAY:
-            self.do_dev_display()
-        elif self.screen == DEV_PROBE_PROMPT:
-            self.do_dev_probe_prompt()
-        elif self.screen == DEV_PROBE:
-            self.do_dev_probe()
-        elif self.screen == DEV_FLICKER:
-            self.do_dev_flicker()
-        elif self.screen == DEV_FLICKER_DRIFT:
-            self.do_dev_flicker_drift()
+        self.handlers[self.screen]()
 
 
 app = App()

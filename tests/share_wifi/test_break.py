@@ -307,25 +307,23 @@ def test_a_continuous_badge_filters_only_in_the_data_phase():
     calls = []
     t.flicker.correct = \
         lambda now_us, value, span_us=0: calls.append(now_us) or value
-    for ms in range(10):                    # discovery: not filtered
-        t.step(ms, 32, ms * 1000)
+    for ms in range(0, 10, 2):              # discovery: not filtered
+        t.sample(ms, ms, 32, ms * 1000, 2000)
     assert not calls
     t.start_data(9, P.BACKLIGHT_INDEX)
-    for ms in range(10, 20):
-        t.step(ms, 32, ms * 1000)
-        t.step(ms, 32, ms * 1000 + 500)     # the same ms: only summed
-    # Once a fine sample, at its readings' mean time: not once a reading.
-    assert len(calls) == 5, calls
-    assert calls[-1] == 17250, calls        # 16500-18000 ms, four readings
+    for ms in range(10, 20, 2):
+        t.sample(ms, ms, 32, ms * 1000, 2000)
+    # Once a sample, at the time it was handed in.
+    assert calls == [ms * 1000 for ms in range(10, 20, 2)], calls
 
 
 def test_a_reading_in_the_same_ms_only_adds_to_the_sums():
     t = continuous(False)
     t.levels = levels()
-    t.step(0, 32, 0)
-    field = t.step(1, 32, 1000)
+    t.step(0, 32)
+    field = t.step(1, 32)
     before = (t.fine_n, t.fine_sum, t.coarse_n, t.coarse_sum)
-    assert t.step(1, 48, 1400) == field
+    assert t.step(1, 48) == field
     assert (t.fine_n, t.fine_sum, t.coarse_n, t.coarse_sum) == \
         (before[0] + 1, before[1] + 48, before[2] + 1, before[3] + 48)
 

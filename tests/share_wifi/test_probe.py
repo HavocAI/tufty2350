@@ -202,6 +202,13 @@ def test_the_steps_run_in_order_one_per_call():
     assert out["firmware"] == INFO
 
 
+def test_every_step_is_a_method_of_its_name():
+    # step() dispatches by name: a step without a method would only ever
+    # record an AttributeError.
+    for name in P.STEPS:
+        assert callable(getattr(P.FrameProbe, name, None)), name
+
+
 def test_refresh_reads_the_panel_period_and_rate():
     probe, _ = run_all(Badge())
     refresh = probe.results()["refresh"]

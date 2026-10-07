@@ -142,6 +142,10 @@ def ms(us):
     return round(us / 1000.0, 2)
 
 
+def _error(error):
+    return {"error": "%s: %s" % (type(error).__name__, error)}
+
+
 class Hooks:
     """What the probe needs from the badge, each a callable.
 
@@ -219,26 +223,11 @@ class FrameProbe:
             self.temps[name] = self.hooks.temp()
         # A firmware without something a step uses fails that step, not the
         # probe: under run() an exception is the error screen and a reset.
+        # Each step is the method of its name.
         try:
-            if name == "refresh":
-                result = self.refresh()
-            elif name == "write":
-                result = self.write()
-            elif name == "breakdown":
-                result = self.breakdown()
-            elif name == "reads":
-                result = self.read_rates()
-            elif name == "fast_reads":
-                result = self.fast_reads()
-            elif name == "alloc":
-                result = alloc_costs(self.hooks.ticks_us)
-            elif name == "flicker_filter":
-                result = filter_costs(self.hooks.flicker_filter,
-                                      self.hooks.ticks_us)
-            else:
-                result = self.gc()
+            result = getattr(self, name)()
         except Exception as error:     # noqa: BLE001
-            result = {"error": "%s: %s" % (type(error).__name__, error)}
+            result = _error(error)
         self.out[name] = result
         self.index += 1
 
@@ -248,9 +237,7 @@ class FrameProbe:
         if self.hooks.temp is None:
             self.out["temperature_c"] = {"error": "no temperature sensor"}
         else:
-            temps = {}
-            for key in self.temps:
-                temps[key] = self.temps[key]
+            temps = dict(self.temps)
             temps["end"] = self.hooks.temp()
             self.out["temperature_c"] = temps
         return self.out
@@ -291,8 +278,9 @@ class FrameProbe:
 
     # -- breakdown
 
-    def frames(self, parts, count, stats, frame_stats):
-        """`count` frames the way run() draws them, each part timed.
+    def frames(self, begin, parts, count):
+        """`count` frames the way run() draws them, each part timed, after
+        calling `begin`: (stats, frame_stats, finished).
 
         `stats` holds one TimeStats per part, then poll, clear and present;
         `frame_stats` the time from one frame's start to the next's.
@@ -300,6 +288,9 @@ class FrameProbe:
         hooks = self.hooks
         ticks_us = hooks.ticks_us
         n = len(parts)
+        stats = [TimeStats() for _ in range(n + 3)]
+        frame_stats = TimeStats()
+        begin()
         start = ticks_us()
         for _ in range(count):
             t = ticks_us()
@@ -322,8 +313,8 @@ class FrameProbe:
             start = t
             if hooks.cancelled():
                 self.cancelled = True
-                return False
-        return True
+                return stats, frame_stats, False
+        return stats, frame_stats, True
 
     def allocation(self, parts):
         """Mean heap growth per frame over ALLOC_FRAMES frames, untimed.
@@ -351,17 +342,10 @@ class FrameProbe:
                 break
         return round(grown.mean_us()) if grown.n else None
 
-    def screen_frames(self, start, parts, count):
-        stats = [TimeStats() for _ in range(len(parts) + 3)]
-        frame_stats = TimeStats()
-        start()
-        finished = self.frames(parts, count, stats, frame_stats)
-        return stats, frame_stats, finished
-
     def breakdown(self):
         out = {}
         for name, start, parts in self.hooks.screens:
-            stats, frame_stats, finished = self.screen_frames(
+            stats, frame_stats, finished = self.frames(
                 start, parts, BREAKDOWN_FRAMES)
             entry = {"frame": frame_stats.result()}
             for i in range(len(parts)):
@@ -382,7 +366,7 @@ class FrameProbe:
 
     # -- reads
 
-    def read_rates(self):
+    def reads(self):
         """Each of hooks.reads looped with nothing presented, as listening
         on a static screen would be: run() presents every frame, and the
         present blocks reading for most of one."""
@@ -399,8 +383,7 @@ class FrameProbe:
             try:
                 out["detail"] = hooks.reads_detail()
             except Exception as error:     # noqa: BLE001
-                out["detail"] = {"error": "%s: %s" % (type(error).__name__,
-                                                      error)}
+                out["detail"] = _error(error)
         return out
 
     # -- fast reads
@@ -418,11 +401,19 @@ class FrameProbe:
                 values, us = capture()
                 out[name] = fast_stats(values, us)
             except Exception as error:     # noqa: BLE001
-                out[name] = {"error": "%s: %s" % (type(error).__name__, error)}
+                out[name] = _error(error)
             if hooks.cancelled():
                 self.cancelled = True
                 break
         return out
+
+    # -- alloc and the flicker filter: module functions, below
+
+    def alloc(self):
+        return alloc_costs(self.hooks.ticks_us)
+
+    def flicker_filter(self):
+        return filter_costs(self.hooks.flicker_filter, self.hooks.ticks_us)
 
     # -- gc
 
@@ -440,13 +431,13 @@ class FrameProbe:
             out["alloc_kb"] = hooks.mem_alloc() // 1024
             out["free_kb"] = hooks.mem_free() // 1024
         out["screen"], start, parts = hooks.screens[-1]
-        _, on, finished = self.screen_frames(start, parts, GC_FRAMES)
+        _, on, finished = self.frames(start, parts, GC_FRAMES)
         out["frames_on"] = on.result()
         if not finished:
             return out
         hooks.disable()
         try:
-            _, off, _ = self.screen_frames(start, parts, GC_FRAMES)
+            _, off, _ = self.frames(start, parts, GC_FRAMES)
         finally:
             hooks.enable()
         out["frames_off"] = off.result()
@@ -579,12 +570,6 @@ def filter_room(start_us, count):
     return ts, vs, spans
 
 
-def _timed(call, ticks_us):
-    t = ticks_us()
-    call()
-    return time.ticks_diff(ticks_us(), t)
-
-
 def filter_costs(flicker_filter, ticks_us):
     """What FlickerFilter's work costs on this badge, in us: the first fit
     -- which also fills the protocol's gain tables, unless a fit already ran
@@ -600,17 +585,16 @@ def filter_costs(flicker_filter, ticks_us):
     fit_v = vs[:FILTER_SAMPLES]
     fit_s = spans[:FILTER_SAMPLES]
     half = FILTER_SAMPLES // 2
-    follow_t = fit_t[half:]
-    follow_v = fit_v[half:]
-    follow_s = fit_s[half:]
-    out = {"samples": FILTER_SAMPLES, "follower_samples": len(follow_t)}
+    out = {"samples": FILTER_SAMPLES,
+           "follower_samples": FILTER_SAMPLES - half}
     flicker = flicker_filter()
-    verdict = []
-    out["fit_first_us"] = _timed(
-        lambda: verdict.append(flicker.fit(fit_t, fit_v, fit_s)), ticks_us)
-    out["verdict"] = verdict[0]
+    t = ticks_us()
+    verdict = flicker.fit(fit_t, fit_v, fit_s)
+    out["fit_first_us"] = time.ticks_diff(ticks_us(), t)
+    out["verdict"] = verdict
     for name, a, b, c in (("fit", fit_t, fit_v, fit_s),
-                          ("fit_follower", follow_t, follow_v, follow_s)):
+                          ("fit_follower", fit_t[half:], fit_v[half:],
+                           fit_s[half:])):
         stats = TimeStats()
         for _ in range(FILTER_FITS):
             fresh = flicker_filter()
@@ -618,12 +602,13 @@ def filter_costs(flicker_filter, ticks_us):
             fresh.fit(a, b, c)
             stats.add(time.ticks_diff(ticks_us(), t))
         out[name] = stats.rate()
-    if verdict[0] != "flicker":
+    if verdict != "flicker":
         return out
     # The rest on the first filter, as a transfer goes on from its fit.
     first = FILTER_SAMPLES
-    out["correct_first_us"] = _timed(
-        lambda: flicker.correct(ts[first], vs[first], spans[first]), ticks_us)
+    t = ticks_us()
+    flicker.correct(ts[first], vs[first], spans[first])
+    out["correct_first_us"] = time.ticks_diff(ticks_us(), t)
     stats = TimeStats()
     for i in range(FILTER_CORRECTS):
         k = first + i % tracked

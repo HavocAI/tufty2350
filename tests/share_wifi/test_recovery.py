@@ -120,9 +120,9 @@ def assert_recovers(payload, after_bytes, scenario="ideal", seed=1):
 def test_a_framing_failure_early_in_a_block_recovers_on_one_rung():
     leader = assert_recovers(simulator.TYPICAL, after_bytes=3)
     start = Transfer(True, simulator.TYPICAL, frame_ms=lambda: 11)
-    assert leader.clock.index == start.optimistic_index() - 1, \
+    assert leader.clock.index == start.start_index() - 1, \
         "one failure should cost exactly one rung, not %d" % (
-            start.optimistic_index() - leader.clock.index)
+            start.start_index() - leader.clock.index)
 
 
 def test_a_framing_failure_late_in_a_block_recovers_on_one_rung():

@@ -155,6 +155,9 @@ _QUARTER = FLICKER_STEPS // 4
 # and STEPS / 1e6 is 1 / 15625. (ticks_us wraps at 2**30 us, not a whole
 # second: one phase jump every 17.9 minutes.)
 _US_PER_STEP_HZ = 1000000 // FLICKER_STEPS
+# Span steps in a table: up to two samples' length.
+_SPAN_STEPS = 4 * FINE_MS * 1000 // FLICKER_SPAN_US + 1
+_SPAN_LAST = _SPAN_STEPS - 1
 
 
 def _span_table(hz, grow):
@@ -162,7 +165,7 @@ def _span_table(hz, grow):
     per FLICKER_SPAN_US step of span up to two samples' length, that or its
     inverse, scaled by FLICKER_ONE."""
     out = []
-    for k in range(4 * FINE_MS * 1000 // FLICKER_SPAN_US + 1):
+    for k in range(_SPAN_STEPS):
         x = math.pi * k * FLICKER_SPAN_US * hz / 1000000.0
         shrink = math.sin(x) / x if x else 1.0
         out.append(int(round(FLICKER_ONE * (1 / shrink if grow else shrink))))
@@ -246,20 +249,13 @@ def _gains(mains, h):
     key = mains * 16 + h
     out = _GAINS.get(key)
     if out is None:
-        values = []
-        for k in range(4 * FINE_MS * 1000 // FLICKER_SPAN_US + 1):
-            x = math.pi * h * mains * k * FLICKER_SPAN_US / 1000000.0
-            values.append(int(round(FLICKER_ONE * (math.sin(x) / x if x
-                                                   else 1.0))))
-        out = tuple(values)
-        _GAINS[key] = out
+        out = _GAINS[key] = _span_table(mains * h, False)
     return out
 
 
 def _span_step(span_us):
     k = (span_us + FLICKER_SPAN_US // 2) // FLICKER_SPAN_US
-    last = len(_SHRINK[0]) - 1
-    return k if k < last else last
+    return k if k < _SPAN_LAST else _SPAN_LAST
 
 
 class FlickerFilter:
@@ -317,6 +313,10 @@ class FlickerFilter:
         # steps and unwrapped; weighted sums of 1, t, m, t*t, t*m.
         self.fit_us = 0
         self.lw = self.lt = self.lm = self.ltt = self.ltm = 0.0
+        self.clear_track()
+
+    def clear_track(self):
+        """Clears the tracker's sums toward the next phase-lock update."""
         self.tn = 0
         self.tr = self.td = self.trd = self.tdd = 0
 
@@ -369,11 +369,9 @@ class FlickerFilter:
         slope = (n * sxy - sx * sy) / spread if spread else 0.0
         level = (sy - slope * sx) / n
         flat = [0] * n
-        total = 0
         for k in range(n):
             x = time.ticks_diff(ts[k], middle) // 1000
             flat[k] = int(round(vs[k] - level - slope * x))
-            total += flat[k] * flat[k]
         best = None
         for mains in FLICKER_MAINS:
             found = self.fit_mains(ts, flat, spans, mains)
@@ -407,7 +405,7 @@ class FlickerFilter:
         strongest = 0.0
         for h in range(FLICKER_HARMONICS):
             a, b = harmonics[h]
-            size = math.sqrt(a * a + b * b)
+            size = sizes[h]
             if (size * seen[h] >= FLICKER_FIT_SIGMAS * error
                     and size >= FLICKER_MIN_COUNTS):
                 kept.append((a, b))
@@ -595,8 +593,7 @@ class FlickerFilter:
                 self.anchor_us = now
                 self.off_m = int(self.offset * 1000)
                 self.rate_m = int(self.rate * 1000)
-        self.tn = 0
-        self.tr = self.td = self.trd = self.tdd = 0
+        self.clear_track()
 
     def correct(self, now_us, value, span_us=0):
         """`value` less the flicker estimated at `now_us`, as a whole count.
@@ -663,8 +660,7 @@ class FlickerFilter:
             if dark:
                 self.update()
             else:
-                self.tn = 0
-                self.tr = self.td = self.trd = self.tdd = 0
+                self.clear_track()
             return
         n = self.count
         if dark and n >= FLICKER_MIN_POINTS:
@@ -694,9 +690,8 @@ class FlickerFilter:
                 out = max(out, math.sqrt(a * a + b * b))
             return out
         for i in range(len(FLICKER_HZ)):
-            a = math.sqrt(self.amp[2 * i] ** 2 + self.amp[2 * i + 1] ** 2)
-            if a > out:
-                out = a
+            out = max(out, math.sqrt(self.amp[2 * i] ** 2
+                                     + self.amp[2 * i + 1] ** 2))
         return out
 
 
@@ -954,17 +949,11 @@ COMPLETE_ACK = "__- __- "
 #
 # Begin Block is deliberately absent: its trailing black is the boundary with
 # the payload, and matching a slot early would take it for a Field Separator.
-def _without_trailing_black(pattern):
-    while pattern.endswith(LOW):
-        pattern = pattern[:-1]
-    return pattern
-
-
-CRC_GOOD_TAIL = _without_trailing_black(CRC_GOOD)
-CRC_BAD_TAIL = _without_trailing_black(CRC_BAD)
-COMPLETE_TAIL = _without_trailing_black(COMPLETE)
-COMPLETE_ACK_TAIL = _without_trailing_black(COMPLETE_ACK)
-SYNC_ERROR_TAIL = _without_trailing_black(SYNC_ERROR)
+CRC_GOOD_TAIL = CRC_GOOD.rstrip(LOW)
+CRC_BAD_TAIL = CRC_BAD.rstrip(LOW)
+COMPLETE_TAIL = COMPLETE.rstrip(LOW)
+COMPLETE_ACK_TAIL = COMPLETE_ACK.rstrip(LOW)
+SYNC_ERROR_TAIL = SYNC_ERROR.rstrip(LOW)
 
 
 # --- exit values ------------------------------------------------------------
@@ -1021,19 +1010,25 @@ class BeaconDetector:
         if self.count < self.CAPACITY:
             self.count += 1
 
-    # Indices of the samples inside the window, oldest first. Fills a
-    # preallocated list rather than building a new one every frame.
+    # Indices of the samples inside the window, oldest first, and their
+    # range in `lo` and `hi`. Fills a preallocated list rather than building a
+    # new one every frame.
     def _fill_window(self):
-        if not self.count:
-            return 0
         newest = self.times[(self.head - 1) % self.CAPACITY]
-        found = 0
+        found = lo = hi = 0
         for i in range(self.count):
             idx = (self.head - 1 - i) % self.CAPACITY
             if time.ticks_diff(newest, self.times[idx]) > self.WINDOW_MS:
                 break
             self.window[found] = idx
+            value = self.values[idx]
+            if not found or value < lo:
+                lo = value
+            if not found or value > hi:
+                hi = value
             found += 1
+        self.lo = lo
+        self.hi = hi
         for i in range(found // 2):             # reverse in place, chronological
             self.window[i], self.window[found - 1 - i] = \
                 self.window[found - 1 - i], self.window[i]
@@ -1045,17 +1040,10 @@ class BeaconDetector:
         if count < 8:
             return None
 
-        lo = hi = self.values[self.window[0]]
-        for i in range(count):
-            value = self.values[self.window[i]]
-            if value < lo:
-                lo = value
-            elif value > hi:
-                hi = value
-        if hi - lo < MIN_SWING:
+        if self.hi - self.lo < MIN_SWING:
             return None
 
-        mid = (lo + hi) // 2
+        mid = (self.lo + self.hi) // 2
         # A beacon spends about half its time either side of its middle. A
         # quiet window with an outlier in it has the swing but not that:
         # without this, a few such crossings once averaged to a beacon's half
@@ -1088,16 +1076,9 @@ class BeaconDetector:
         count = self._fill_window()
         if count < 4:
             return 0
-        lo = hi = self.values[self.window[0]]
-        for i in range(count):
-            value = self.values[self.window[i]]
-            if value < lo:
-                lo = value
-            elif value > hi:
-                hi = value
-        if hi - lo < MIN_SWING:
+        if self.hi - self.lo < MIN_SWING:
             return time.ticks_diff(now, self.times[self.window[0]])
-        mid = (lo + hi) // 2
+        mid = (self.lo + self.hi) // 2
         above = self.values[self.window[0]] >= mid
         last = self.times[self.window[0]]
         for i in range(1, count):
@@ -1116,14 +1097,7 @@ class BeaconDetector:
         count = self._fill_window()
         if not count:
             return None
-        lo = hi = self.values[self.window[0]]
-        for i in range(count):
-            value = self.values[self.window[i]]
-            if value < lo:
-                lo = value
-            elif value > hi:
-                hi = value
-        mid = (lo + hi) // 2
+        mid = (self.lo + self.hi) // 2
         dark = sorted(self.values[self.window[i]] for i in range(count)
                       if self.values[self.window[i]] <= mid)
         return dark[len(dark) // 2]
@@ -1179,16 +1153,11 @@ class Levels:
 # longer black gaps. Self identifying without thresholds, because it is the only
 # signal that steps monotonically through three levels, and its closing gap is a
 # shared time reference both badges can find.
-def staircase_body_ms(reps=CAL_REPS, plateau=PLATEAU_MS):
-    return reps * 3 * plateau
-
-
 def staircase_ms(reps=CAL_REPS, plateau=PLATEAU_MS):
-    return CAL_GAP_MS + staircase_body_ms(reps, plateau) + CAL_GAP_MS
+    return 2 * CAL_GAP_MS + reps * 3 * plateau
 
 
 # A FAST badge's staircase, the shortest there is.
-STAIRCASE_BODY_MS = staircase_body_ms()
 STAIRCASE_MS = staircase_ms()
 
 
@@ -1211,7 +1180,7 @@ def staircase_field(elapsed, order=ASCENDING, reps=CAL_REPS,
     if elapsed < CAL_GAP_MS:
         return LOW
     body = elapsed - CAL_GAP_MS
-    if body >= staircase_body_ms(reps, plateau):
+    if body >= reps * 3 * plateau:
         return LOW
     return order[(body // plateau) % 3]
 
@@ -1228,14 +1197,12 @@ def staircase_order(values, levels):
 
 
 def staircase_slow(values, levels):
-    """True if a measured staircase is a SLOW badge's: SLOW_STEPS_MIN or more
-    high steps, where a FAST one has CAL_REPS."""
+    """True if a measured staircase has SLOW_STEPS_MIN or more high steps."""
     return staircase_steps(values, levels)[2] >= SLOW_STEPS_MIN
 
 
 def staircase_lit(values, levels):
-    """True if a measured staircase is a LIT badge's: LIT_STEPS_MAX or fewer
-    high steps, where a FAST one has CAL_REPS."""
+    """True if a measured staircase has LIT_STEPS_MAX or fewer high steps."""
     return staircase_steps(values, levels)[2] <= LIT_STEPS_MAX
 
 
@@ -1284,11 +1251,6 @@ def separation(levels):
     if levels.middle_samples * 2 < levels.high_samples:
         return 0
     return min(levels.grey - levels.black, levels.white - levels.grey)
-
-
-def median(values):
-    values.sort()
-    return values[len(values) // 2]
 
 
 def quantile(sorted_values, fraction):
@@ -1501,9 +1463,8 @@ def block_symbols(tokens):
     for token in tokens:
         if token == SEPARATOR:
             out.append(LOW)
-            continue
-        for shift in range(7, -1, -1):          # most significant bit first
-            out.append(HIGH if (token >> shift) & 1 else MID)
+        else:
+            out.extend(bits_symbols(token, 8))  # most significant bit first
     return out
 
 
@@ -1533,8 +1494,7 @@ class SlotClock:
 
     def start(self, now, ladder_index):
         self.epoch = now
-        self.index = ladder_index
-        self.duration = SLOT_LADDER[ladder_index]
+        self.set_index(ladder_index)
 
     def slow_down(self):
         # Index 0 is the slowest rung, so stepping slower means stepping down.
@@ -1686,10 +1646,6 @@ BACKLIGHT_INDEX = rung_for(FINE_MS, BACKLIGHT_SETTLE_MS)
 BACKLIGHT_LIT_INDEX = rung_for(FINE_MS, BACKLIGHT_LIT_SETTLE_MS)
 
 
-def class_index(slow):
-    return SLOW_INDEX if slow else FAST_INDEX
-
-
 class Transfer:
     # `schemes` are the light-level schemes this badge may transmit with, from
     # LEVEL_SCHEMES. SCHEME_FIELDS is always among them: it is what beacons use
@@ -1713,11 +1669,6 @@ class Transfer:
         self.coarse_n = self.coarse_sum = self.coarse_tsum = 0
         self.coarse_base = None
         self.coarse_t = self.coarse_v = 0
-        # The microsecond time of the reading that finished the last fine
-        # sample, and how many readings it held: a sample's midpoint is half
-        # way from the one to the next.
-        self.fine_end_us = None
-        self.fine_count = 0
         # The handshake's gap check: where the last fine sample ended, and
         # whether the coarse sample in progress follows a drop.
         self.sample_end_us = None
@@ -1775,45 +1726,22 @@ class Transfer:
         self.receiver = None
         self.started = 0
         self.phase_started = 0
-        self.received = []
         self.blocks = []
-        self.block_index = 0
-        self.retries = 0
         self.tx = []            # symbols still to transmit
         self.rx = []            # symbols decoded this phase
-        self.idle_slots = 0
         self.reader = StaircaseReader()
         self.pending_tokens = []
-        self.sub = 0
-        self.tokens = []
-        self.bits = []
-        self.in_block = False
-        self.pending_slow_down = False
         self.expected_crc = 0
-        self.replying = False
-        self.crc_started = False
         self.saw_announce = False
         self.finishing = False
         self.epoch = 0
         self.now = 0
-        # Phase-lock tracking. Scalars, deliberately: this is touched every
-        # frame and nothing in the per-frame path may allocate.
-        self.dark_since = None
+        # The phase lock's last sample. Scalars, so the per-frame path
+        # allocates nothing.
         self.prev_time = 0
         self.prev_light = 0
-        self.have_prev = False
-        self.complete_tries = 0
-        self.wait_slots = 0
-        self.stall_slots = 0
-        self.attempts = 0
-        self.want_resend = False
-        self.resend_requests = 0
-        self.block_started = 0
         self.tx_slot = 0
-        # A framed block awaiting its verdict. Not `pending_tokens`, which is
-        # empty for an empty block as well as for no block at all.
-        self.pending_block = False
-        self.blocks_accepted = 0
+        self.clear_data(0)
         self.phase = PHASE_ANNOUNCE if leader else PHASE_PRESENT
         # No bytes at all is still one block, an empty one: it is what tells
         # the Follower the payload is a single empty field, and a Leader with
@@ -1829,6 +1757,8 @@ class Transfer:
         self.rx = []
         self.tx = []
         self.detector.reset()
+        if phase == PHASE_CAL_RECV:
+            self.reader = StaircaseReader()
         # Points collected toward a flicker update belong to the phase they
         # were read in: the peer may not be dark in the next.
         self.flicker.close(False)
@@ -1877,30 +1807,15 @@ class Transfer:
 
     # -- the entry point: once a frame, or once a reading
 
-    def step(self, now, light, now_us=None):
+    def step(self, now, light):
         """The field to show now. Call once a frame with that frame's reading,
         or -- `continuous` -- for every reading: they are pooled into FINE_MS
         and COARSE_MS samples, and only a finished sample moves anything but
-        the transmitted symbol. With `now_us`, the reading's time in
-        microseconds, a continuous badge in the data phase learns the room's
-        mains flicker from each fine sample and takes it off: see
-        FlickerFilter. The app does not call this: it pools its own readings
-        and calls sample()."""
+        the transmitted symbol. The app does not call this: it pools its own
+        readings and calls sample(), the only way in that takes the room's
+        mains flicker off."""
         self.now = now
         fine, coarse = self.pool(now, light)
-        if fine and now_us is not None:
-            end = self.fine_end_us
-            self.fine_end_us = now_us
-            if end is not None:
-                # n readings a pass apart, the last now and the first a pass
-                # after the last sample's: their mean time, and the span they
-                # stand for -- no further back than a sample's length, in
-                # case of a gap.
-                n = self.fine_count
-                span = min(time.ticks_diff(now_us, end), 2 * FINE_MS * 1000)
-                self.filter_sample(
-                    time.ticks_add(now_us, -(span * (n - 1) // (2 * n))),
-                    span)
         return self.decide(now, fine, coarse)
 
     def sample(self, now, t, value, t_us=None, span_us=0):
@@ -2000,7 +1915,6 @@ class Transfer:
             n = self.fine_n
             self.fine_t = time.ticks_add(self.fine_base, self.fine_tsum // n)
             self.fine_v = self.fine_sum // n
-            self.fine_count = n
             self.fine_base = now
             self.fine_n = self.fine_sum = self.fine_tsum = 0
             fine = True
@@ -2101,21 +2015,21 @@ class Transfer:
         count = min(self.fit_n, FLICKER_BUFFER)
         if not count:
             return None
-        newest = (self.fit_n - 1) % FLICKER_BUFFER
-        last = self.fit_t[newest]
+        newest = self.fit_n - 1
+        last = self.fit_t[newest % FLICKER_BUFFER]
+        back = 0
+        while back < count and time.ticks_diff(
+                last, self.fit_t[(newest - back) % FLICKER_BUFFER]) \
+                <= window_ms * 1000:
+            back += 1
         ts = []
         vs = []
         spans = []
-        for back in range(count):
-            i = (newest - back) % FLICKER_BUFFER
-            if time.ticks_diff(last, self.fit_t[i]) > window_ms * 1000:
-                break
+        for n in range(self.fit_n - back, self.fit_n):
+            i = n % FLICKER_BUFFER
             ts.append(self.fit_t[i])
             vs.append(self.fit_v[i])
             spans.append(self.fit_s[i])
-        ts.reverse()
-        vs.reverse()
-        spans.reverse()
         return self.flicker.fit(ts, vs, spans)
 
     # -- phase: announce (Leader beacons, waits for Peer Present)
@@ -2162,7 +2076,6 @@ class Transfer:
         # about periodic swings. The opening CAL_GAP_MS of black is longer than
         # any beacon half period, so silence is the unambiguous cue.
         if self.detector.quiet_ms(now) > ANNOUNCE_HALF_MS + 30:
-            self.reader = StaircaseReader()
             self.enter(PHASE_CAL_RECV, now)
             return LOW
         return beacon_field(self.elapsed(now), PRESENT_HALF_MS, LOW)
@@ -2191,7 +2104,6 @@ class Transfer:
             count = 2 if self.offers_backlight else 1
             if elapsed >= length * count:
                 self.scheme = SCHEME_FIELDS     # until the Follower says
-                self.reader = StaircaseReader()
                 self.enter(PHASE_CAL_RECV, now)
                 return LOW
             if elapsed < length:
@@ -2214,8 +2126,11 @@ class Transfer:
 
     def step_cal_recv(self, now, light):
         self.progress = "Calibrating"
+        elapsed = self.elapsed(now)
+        # The Follower, reading the Leader's second staircase.
+        second = not self.leader and self.cal_index == 1
         if (not self.leader and self.continuous and not self.fit_tried
-                and self.elapsed(now) >= FLICKER_FOLLOWER_FIT_MS):
+                and elapsed >= FLICKER_FOLLOWER_FIT_MS):
             # Inside the Leader's dark: see FLICKER_FOLLOWER_FIT_MS.
             self.fit_flicker(FLICKER_FOLLOWER_FIT_MS)
             if self.flicker.harmonics is not None:
@@ -2226,16 +2141,15 @@ class Transfer:
                 self.replay_staircase()
                 return LOW
         ended = self.reader.feed(now, light)
-        if (ended and not self.leader and self.cal_index == 1
-                and self.elapsed(now) < staircase_ms(self.peer_reps(),
-                                                     self.plateau())
-                - CAL_GAP_MS):
-            # The Leader's second staircase cannot have ended yet: what read as
-            # its closing gap was its opening one, flickering -- a sensor that
-            # follows the PWM sees the dim low do that. Half duplex: keep
-            # listening rather than answer over it.
-            self.reader = StaircaseReader()
-            ended = False
+        if second:
+            peer_ms = staircase_ms(self.peer_reps(), self.plateau())
+            if ended and elapsed < peer_ms - CAL_GAP_MS:
+                # The Leader's second staircase cannot have ended yet: what
+                # read as its closing gap was its opening one, flickering -- a
+                # sensor that follows the PWM sees the dim low do that. Half
+                # duplex: keep listening rather than answer over it.
+                self.reader = StaircaseReader()
+                ended = False
         if ended:
             levels = self.reader.levels()
             if self.leader:
@@ -2243,12 +2157,10 @@ class Transfer:
                     self.fail(ERR_CONTRAST)
                     return LOW
                 self.levels = levels
-                self.peer_slow = staircase_slow(self.reader.values, levels)
-                self.peer_lit = staircase_lit(self.reader.values, levels)
+                order = self.read_peer_class(levels)
                 # The Follower's order is its choice -- but only a Leader that
                 # offered the backlight can be told to use it.
-                if (self.offers_backlight and
-                        staircase_order(self.reader.values, levels) == REVERSED):
+                if self.offers_backlight and order == REVERSED:
                     self.scheme = SCHEME_BACKLIGHT
                 # Both badges are calibrated now. The Follower's closing gap is
                 # the reference; the clock starts one gap after it began.
@@ -2261,12 +2173,10 @@ class Transfer:
         # was read from that -- and began within a gap of this reader
         # starting. Past both it is over whether or not it could be measured,
         # and the first one is still an answer.
-        if (not self.leader and self.cal_index == 1 and
-                self.elapsed(now) > staircase_ms(self.peer_reps(), self.plateau())
-                + CAL_GAP_MS):
+        if second and elapsed > peer_ms + CAL_GAP_MS:
             return self.follower_measured(now, None)
 
-        if self.elapsed(now) > staircase_ms(CAL_REPS_SLOW) * 3:
+        if elapsed > staircase_ms(CAL_REPS_SLOW) * 3:
             self.fail(ERR_CONTRAST)
         return LOW
 
@@ -2279,9 +2189,7 @@ class Transfer:
                 self.fail(ERR_CONTRAST)
                 return LOW
             self.measured[SCHEME_FIELDS] = levels
-            self.more_coming = staircase_order(self.reader.values, levels) == REVERSED
-            self.peer_slow = staircase_slow(self.reader.values, levels)
-            self.peer_lit = staircase_lit(self.reader.values, levels)
+            self.more_coming = self.read_peer_class(levels) == REVERSED
             # This badge's own light, from the black of the staircase it just
             # measured, fixed before its own staircase carries it.
             self.lit = self.is_lit(levels.black)
@@ -2292,7 +2200,6 @@ class Transfer:
             # Half duplex: wait the second one out even if this badge will not
             # use it, because the Leader is still transmitting.
             self.cal_index = 1
-            self.reader = StaircaseReader()
             self.enter(PHASE_CAL_RECV, now)
             return LOW
 
@@ -2300,6 +2207,14 @@ class Transfer:
         self.levels = self.measured[self.scheme]
         self.enter(PHASE_CAL_SEND, now)
         return LOW
+
+    def read_peer_class(self, levels):
+        """The peer's class, SLOW and LIT, from the staircase just read, and
+        the order it stepped in: one pass over its samples, not three."""
+        rising, falling, highs = staircase_steps(self.reader.values, levels)
+        self.peer_slow = highs >= SLOW_STEPS_MIN
+        self.peer_lit = highs <= LIT_STEPS_MAX
+        return REVERSED if falling > rising else ASCENDING
 
     # Whichever separates adjacent levels by more, among those this badge may
     # use. Ties go to SCHEME_FIELDS, the proven one. A choice made from one
@@ -2312,17 +2227,13 @@ class Transfer:
     # gap to the noise. separation() is 0 when the middle step did not hold,
     # as on a sensor that follows the PWM, so that one still falls back.
     def choose_scheme(self):
-        fields = self.measured[SCHEME_FIELDS]
         backlight = self.measured.get(SCHEME_BACKLIGHT)
         if not self.offers_backlight or backlight is None:
             return SCHEME_FIELDS
-        if self.continuous:
-            if separation(backlight) > 0:
-                return SCHEME_BACKLIGHT
-            return SCHEME_FIELDS
-        if separation(backlight) > separation(fields):
-            return SCHEME_BACKLIGHT
-        return SCHEME_FIELDS
+        rival = 0 if self.continuous else separation(
+            self.measured[SCHEME_FIELDS])
+        return SCHEME_BACKLIGHT if separation(backlight) > rival \
+            else SCHEME_FIELDS
 
     # -- phase: wait out the shared gap, then start the slot clock
 
@@ -2348,12 +2259,9 @@ class Transfer:
         if self.continuous:
             return False
         count = min(self.frame_count, FRAME_SAMPLES)
-        if count == 0:
-            frame = max(1, self.frame_ms())
-        else:
-            recent = sorted(self.frames[:count])
-            frame = max(1, recent[count // 2])
-        return rung_for_frame(frame) < FAST_INDEX
+        frame = sorted(self.frames[:count])[count // 2] if count \
+            else self.frame_ms()
+        return rung_for_frame(max(1, frame)) < FAST_INDEX
 
     def is_lit(self, black):
         """Whether a continuous badge reading `black` is in a lit room."""
@@ -2413,13 +2321,6 @@ class Transfer:
             index = min(index, SLOT_LADDER.index(BACKLIGHT_PROVEN_MS))
         return index
 
-    # Where a transfer actually starts. With OPTIMISTIC_RUNGS at zero this is
-    # simply the conservative rung; the arithmetic is kept so that promoting a
-    # measured panel is a constant change and nothing else.
-    def optimistic_index(self):
-        return min(len(SLOT_LADDER) - 1,
-                   self.conservative_index() + OPTIMISTIC_RUNGS)
-
     # There is no rate-proving phase: both badges start on the rung their
     # staircases agreed, and a test burst cannot be trusted anyway -- a rate
     # too fast for a payload still carries 48 symbols of alternation. The first block is the test. A Follower that cannot frame
@@ -2439,29 +2340,29 @@ class Transfer:
     def start_data(self, now, index=None):
         self.enter(PHASE_DATA, now)
         self.begin_slots(now, self.clock.index if index is None else index)
-        self.block_index = 0
-        self.retries = 0
-        self.received = []
-        self.blocks_accepted = 0
-        self.pending_block = False
-        self.sub = self.STEP_BLOCK
-        self.idle_slots = 0
-        self.crc_started = False
-        self.pending_slow_down = False
-        self.dark_since = None
-        self.have_prev = False
-        self.complete_tries = 0
-        self.wait_slots = 0
-        self.stall_slots = 0
-        self.attempts = 0
-        self.want_resend = False
-        self.resend_requests = 0
-        self.block_started = now
-        self.reset_block()
+        self.clear_data(now)
         self.progress = "Sending" if self.leader else "Receiving"
         gc.collect()        # deliberately, while nothing is time critical
         if self.leader:
             self.send_block()
+
+    # The data phase's state, as it starts.
+    def clear_data(self, now):
+        self.block_index = self.retries = self.blocks_accepted = 0
+        self.idle_slots = self.complete_tries = self.wait_slots = 0
+        self.stall_slots = self.attempts = self.resend_requests = 0
+        self.sub = self.STEP_BLOCK
+        self.received = []
+        # A framed block awaiting its verdict. Not `pending_tokens`, which is
+        # empty for an empty block as well as for no block at all.
+        self.pending_block = False
+        self.crc_started = self.pending_slow_down = self.want_resend = False
+        # Phase-lock tracking. Scalars, deliberately: this is touched every
+        # frame and nothing in the per-frame path may allocate.
+        self.dark_since = None
+        self.have_prev = False
+        self.block_started = now
+        self.reset_block()
 
     def send_block(self, extra_lead_in=0):
         # Sending it again cannot be the answer for ever.
@@ -2752,9 +2653,7 @@ class Transfer:
         self.break_since = now
         self.break_dark_since = None
         self.tx = []
-        self.rx = []
-        self.reset_block()
-        self.sub = self.STEP_BLOCK
+        self.await_block()
         self.breaks += 1
 
     def step_break(self, now, fine):
@@ -2820,7 +2719,7 @@ class Transfer:
                 self.sub = self.STEP_VERDICT
                 if received == self.expected_crc:
                     self.last_verdict = CRC_GOOD
-                    self.send(list(CRC_GOOD))
+                    self.send(CRC_GOOD)
                     self.block_index += 1
                     self.retries = 0
                     self.attempts = 0
@@ -2837,13 +2736,12 @@ class Transfer:
                         if self.clock.index > self.conservative_index():
                             self.pending_slow_down = True
                             self.retries = 0
-                            self.send(list(SYNC_ERROR))
-                            self.sub = self.STEP_VERDICT
+                            self.send(SYNC_ERROR)
                             return
                         self.fail(ERR_CRC)
                         return
                     self.last_verdict = CRC_BAD
-                    self.send(list(CRC_BAD))
+                    self.send(CRC_BAD)
             return
 
         if self.sub == self.STEP_VERDICT:
@@ -2879,7 +2777,7 @@ class Transfer:
         self.complete_tries += 1
         # Queued, then acknowledged. `finishing` marks the handover from
         # transmitting to waiting; it is no longer a licence to report OK.
-        self.send(list(COMPLETE))
+        self.send(COMPLETE)
         self.finishing = True
 
     # A Follower that misses a Begin Block Pattern never enters the block, so
@@ -2937,25 +2835,19 @@ class Transfer:
             if tail == CRC_GOOD_TAIL:
                 self.advance()
                 self.accept_pending()
-                self.rx = []
-                self.sub = self.STEP_BLOCK
-                self.reset_block()
+                self.await_block()
                 gc.collect()
             elif tail == CRC_BAD_TAIL:
                 self.advance()
                 self.discard_pending()
-                self.rx = []
-                self.sub = self.STEP_BLOCK
-                self.reset_block()
+                self.await_block()
             elif tail == SYNC_ERROR_TAIL:
                 self.advance()
                 # The Leader is stepping down a rung. Follow it, changing only
                 # the slot duration so the shared epoch keeps both grids aligned.
                 self.clock.slow_down()
                 self.discard_pending()
-                self.rx = []
-                self.sub = self.STEP_BLOCK
-                self.reset_block()
+                self.await_block()
             elif "".join(self.rx[-len(COMPLETE_TAIL):]) == COMPLETE_TAIL:
                 # Complete is only sent after the Leader matched the last
                 # block's CRC, so it carries the same guarantee CRC Good does.
@@ -2991,7 +2883,7 @@ class Transfer:
     # the Leader's first retry, turning one lost acknowledgement into a failure
     # on a transfer that actually worked.
     def acknowledge_complete(self):
-        self.send(list(COMPLETE_ACK))
+        self.send(COMPLETE_ACK)
         self.sub = self.STEP_FINISH
         self.wait_slots = 0
         self.idle_slots = 0
@@ -3004,6 +2896,11 @@ class Transfer:
     def finish_follower(self):
         self.result = OK if self.blocks_accepted else ERR_DECODE
         self.phase = PHASE_DONE
+
+    def await_block(self):
+        self.rx = []
+        self.reset_block()
+        self.sub = self.STEP_BLOCK
 
     def reset_block(self):
         self.tokens = []
@@ -3102,16 +2999,12 @@ class Transfer:
             return
         self.want_resend = True
         self.idle_slots = 0         # consecutive black from here, not before
-        self.rx = []
-        self.reset_block()
-        self.sub = self.STEP_BLOCK
+        self.await_block()
 
     def send_sync_error(self):
         self.pending_slow_down = True
-        self.send(list(SYNC_ERROR))
-        self.rx = []
-        self.reset_block()
-        self.sub = self.STEP_BLOCK
+        self.send(SYNC_ERROR)
+        self.await_block()
 
 
 # Splits a received token stream back into its fields. Structure only: the

@@ -273,6 +273,9 @@ def test_drift_tracks_twice_the_fitted_mains_or_else_the_spectrum():
     assert F.drift_hz(steady) == 120
     quiet = {"hz": {"100": 0.5, "120": 1.5}, "filter": {"verdict": None}}
     assert F.drift_hz(quiet) is None
+    # A tie goes to the first of DRIFT_HZ.
+    tied = {"hz": {"100": 4.0, "120": 4.0}, "filter": {"verdict": None}}
+    assert F.drift_hz(tied) == 100
 
 
 # --- MicroPython hygiene ----------------------------------------------------

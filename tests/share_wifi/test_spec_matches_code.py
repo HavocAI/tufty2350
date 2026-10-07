@@ -62,7 +62,7 @@ def test_constant_table_matches_the_module():
 DOCUMENTED_ELSEWHERE = {"HIGH", "MID", "LOW", "OK", "SEPARATOR",
                         "BEGIN_BLOCK", "END_BLOCK", "CRC_GOOD", "CRC_BAD",
                         "SYNC_ERROR", "COMPLETE", "COMPLETE_ACK",
-                        "STAIRCASE_MS", "STAIRCASE_BODY_MS",
+                        "STAIRCASE_MS",
                         "LEVEL_SCHEMES", "ASCENDING", "REVERSED"}
 
 

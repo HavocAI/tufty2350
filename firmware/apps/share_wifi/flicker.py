@@ -18,21 +18,14 @@ flicker's phase, window after window, for about 20 s.
 import math
 import time
 
-# Absolute first, as in __init__.py: the launcher puts the app folder on
-# sys.path. The sine table and its step are the filter's own, so the drift's
-# phase is reckoned exactly as the phase lock reckons it.
-try:
-    from protocol import (
-        _QUARTER, _SINE, _US_PER_STEP_HZ, FINE_MS, FLICKER_FIT_MS,
-        FLICKER_HARMONICS, FLICKER_MAINS, FLICKER_STEPS,
-        FlickerFilter,
-    )
-except ImportError:
-    from .protocol import (
-        _QUARTER, _SINE, _US_PER_STEP_HZ, FINE_MS, FLICKER_FIT_MS,
-        FLICKER_HARMONICS, FLICKER_MAINS, FLICKER_STEPS,
-        FlickerFilter,
-    )
+# Absolute, as in __init__.py: the launcher puts the app folder on sys.path.
+# The sine table and its step are the filter's own, so the drift's phase is
+# reckoned exactly as the phase lock reckons it.
+from protocol import (
+    _QUARTER, _SINE, _US_PER_STEP_HZ, FINE_MS, FLICKER_FIT_MS,
+    FLICKER_HARMONICS, FLICKER_MAINS, FLICKER_STEPS,
+    FlickerFilter,
+)
 
 TOOL_FLICKER = "room_flicker"   # its key in the measurements file
 
@@ -110,24 +103,21 @@ class Capture:
 
     def series(self):
         """Each bin's mean, an empty bin taking the one before's. None if no
-        bin was read."""
-        out = [0.0] * BINS
+        bin was read. Leading empties take the first reading."""
+        sums = self.sums
+        counts = self.counts
         last = None
         for i in range(BINS):
-            if self.counts[i]:
-                last = self.sums[i] / self.counts[i]
-            out[i] = last
+            if counts[i]:
+                last = sums[i] / counts[i]
+                break
         if last is None:
             return None
-        # Leading empties take the first reading.
-        first = None
-        for v in out:
-            if v is not None:
-                first = v
-                break
+        out = [0.0] * BINS
         for i in range(BINS):
-            if out[i] is None:
-                out[i] = first
+            if counts[i]:
+                last = sums[i] / counts[i]
+            out[i] = last
         return out
 
 
@@ -154,13 +144,8 @@ def analyse(capture):
     n = len(series)
     mean = sum(series) / n
     var = 0.0
-    lo = hi = series[0]
     for x in series:
         var += (x - mean) * (x - mean)
-        if x < lo:
-            lo = x
-        if x > hi:
-            hi = x
     peak_hz = 0
     peak = 0.0
     for hz in range(SCAN_FROM_HZ, SCAN_TO_HZ + 1, SCAN_STEP_HZ):
@@ -175,7 +160,7 @@ def analyse(capture):
             "read_us": round(capture.elapsed_us / capture.reads, 1),
             "mean": round(mean, 1),
             "sd": round(math.sqrt(var / n), 1),
-            "p2p": round(hi - lo, 1),
+            "p2p": round(max(series) - min(series), 1),
             "peak_hz": peak_hz,
             "peak_counts": round(peak, 1),
             "hz": mains,
@@ -289,11 +274,8 @@ def drift_hz(result):
     if found.get("verdict") == "flicker" and found.get("mains"):
         hz = 2 * found["mains"]
     else:
-        hz = None
-        for candidate in DRIFT_HZ:
-            if hz is None or amplitudes.get(str(candidate), 0) > \
-                    amplitudes.get(str(hz), 0):
-                hz = candidate
+        # The first of equals, as max() gives it.
+        hz = max(DRIFT_HZ, key=lambda c: amplitudes.get(str(c), 0))
     if amplitudes.get(str(hz), 0) < DRIFT_MIN_COUNTS:
         return None
     return hz
