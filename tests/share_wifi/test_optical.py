@@ -29,7 +29,12 @@ def emit(level, ambient, contrast, noise, rng, middle=0.45):
     return int(ambient + base * contrast + rng.uniform(-noise, noise))
 
 
-def run_staircase(ambient=200, contrast=9000, noise=120, frame_ms=16,
+# A staircase is read in calibration samples of CAL_SAMPLE_MS: `frame_ms`
+# below is that, unless a test says otherwise.
+SAMPLE_MS = protocol.CAL_SAMPLE_MS
+
+
+def run_staircase(ambient=200, contrast=9000, noise=120, frame_ms=SAMPLE_MS,
                   start_offset=0, seed=1, middle=0.45, settle_ms=0):
     """A staircase read through a panel that takes `settle_ms` to settle.
 
@@ -54,14 +59,16 @@ def run_staircase(ambient=200, contrast=9000, noise=120, frame_ms=16,
     return None
 
 
+# Late starts inside the opening gap: the Follower starts reading when the
+# Leader's beacon falls quiet, part way into it.
 CONDITIONS = {
     "ideal": {},
-    "started 700ms late": {"start_offset": 700},
-    "started 1500ms late": {"start_offset": 1500},
+    "started 150ms late": {"start_offset": 150},
+    "started 230ms late": {"start_offset": 230},
     "bright ambient": {"ambient": 30000},
     "noisy": {"noise": 900},
-    "slow 33ms frames": {"frame_ms": 33},
-    "fast 8ms frames": {"frame_ms": 8},
+    "8ms samples": {"frame_ms": 8},
+    "2ms samples": {"frame_ms": 2},
 }
 
 
@@ -108,9 +115,9 @@ def test_calibration_rejects_two_level_signal():
 # left a few samples there. These are the cases that used to get through.
 QUARTER_RULE_CONDITIONS = list(itertools.product(
     (0, 120, 400),          # noise
-    (0, 16, 24),            # settle_ms
-    (8, 11, 16),            # frame_ms
-    (0, 700)))              # start_offset
+    (0, 4, 8),              # settle_ms: the sensor's, up to the dark's
+    (2, 4, 8),              # frame_ms: the calibration sample
+    (0, 150)))              # start_offset
 
 
 def test_a_middle_level_near_either_end_is_rejected():
@@ -133,7 +140,7 @@ def test_a_middle_level_well_inside_the_swing_is_accepted():
     # about 50%.
     conditions = [dict(kw) for kw in CONDITIONS.values()]
     conditions += [{"settle_ms": settle, "frame_ms": frame}
-                   for settle in (16, 24) for frame in (8, 11, 16)]
+                   for settle in (4, 8) for frame in (2, 4, 8)]
     for middle in (0.30, 0.45, 0.50, 0.70):
         for kw in conditions:
             reader = run_staircase(middle=middle, **kw)
@@ -222,76 +229,63 @@ def test_slot_numbering_advances_with_time():
     assert clock.offset(1000 + duration // 2) == duration // 2
 
 
-def test_conservative_index_never_goes_below_the_settling_floor():
-    # The floor formula used to be 2x the settle time, which permitted a 32ms
-    # slot. Simulating the whole chain -- staircase through a panel lag, into
-    # the real reader, into a real transfer -- nothing below ~37ms decodes at a
-    # 16ms settle, and nothing below 45ms is reliable.
-    floor = protocol.LCD_SETTLE_MS * protocol.SETTLE_SLOTS
-    for frame in (11, 16, 20, 33):
-        transfer = protocol.Transfer(True, (b"n", b"password1"),
-                                     frame_ms=lambda f=frame: f)
-        chosen = protocol.SLOT_LADDER[transfer.conservative_index()]
-        assert chosen >= floor, \
-            "at %dms frames it picks %dms, below the %dms floor" % (frame, chosen, floor)
-        assert chosen >= frame * 2.5, \
-            "at %dms frames it picks %dms, too few frames per slot" % (frame, chosen)
-
-
-def test_conservative_rung_at_90fps_is_80ms():
-    # Three of the panel's measured 24 ms settles: 72 ms, so the 80 ms rung,
-    # whatever the frame rate. It was 50 against a 16 ms datasheet figure.
-    transfer = protocol.Transfer(True, (b"n", b"password1"), frame_ms=lambda: 11)
-    assert protocol.SLOT_LADDER[transfer.conservative_index()] == 80
-
-
-def test_transfers_start_on_proven_ground():
-    # There is no gamble rung on pixels. A transfer starts at the fastest rate
-    # the measured panel allows, which is 80ms.
-    transfer = protocol.Transfer(True, (b"n", b"password1"), frame_ms=lambda: 11)
-    assert transfer.start_index() == transfer.conservative_index()
-    assert protocol.SLOT_LADDER[transfer.start_index()] == 80
+def test_the_proven_rung_is_50ms():
+    # Below it every rung is a gamble: a bad CRC there demotes.
+    transfer = protocol.Transfer(True, (b"n", b"password1"))
+    assert protocol.SLOT_LADDER[transfer.conservative_index()] == \
+        protocol.BACKLIGHT_PROVEN_MS == 50
 
 
 def test_there_is_no_optimistic_rung():
-    # A rung above proven ground was tried and removed: its demotion is
-    # announced by a pattern the peer must read at the rate being demoted FROM,
-    # so a failed gamble could split the two badges onto different rungs rather
-    # than stepping them down together. The ladder now ends at the conservative
-    # floor, so there is nothing above it to gamble on.
+    # A rung above the start was tried and removed: its demotion is announced
+    # by a pattern the peer must read at the rate being demoted FROM, so a
+    # failed gamble could split the two badges onto different rungs rather
+    # than stepping them down together.
     assert protocol.OPTIMISTIC_RUNGS == 0
-    transfer = protocol.Transfer(True, (b"n", b"password1"), frame_ms=lambda: 11)
-    assert transfer.start_index() == transfer.conservative_index() == \
-        protocol.FAST_INDEX
-    # The ladder runs on past pixels' floor only for a continuous badge on
-    # the backlight, which starts there and counts it a gamble: its proven
-    # floor is BACKLIGHT_PROVEN_MS, so a bad CRC steps it down.
-    fast = protocol.Transfer(True, (b"n", b"password1"), frame_ms=lambda: 16,
-                             continuous=True,
-                             schemes=(protocol.SCHEME_FIELDS,
-                                      protocol.SCHEME_BACKLIGHT))
-    fast.scheme = protocol.SCHEME_BACKLIGHT
-    assert fast.start_index() == protocol.BACKLIGHT_INDEX
-    assert protocol.SLOT_LADDER[fast.start_index()] == 32
-    assert protocol.SLOT_LADDER[fast.conservative_index()] == \
-        protocol.BACKLIGHT_PROVEN_MS
+    transfer = protocol.Transfer(True, (b"n", b"password1"))
+    # With no flags read yet: a POLLED, dark pair.
+    assert transfer.start_index() == protocol.BACKLIGHT_INDEX
+    assert protocol.SLOT_LADDER[transfer.start_index()] == 32
+
+
+def test_every_rung_an_exact_pair_starts_on_has_a_window():
+    for settle, guard in ((protocol.SETTLE_LIT_US, protocol.GUARD_LIT_US),
+                          (protocol.SETTLE_DARK_US, protocol.GUARD_DARK_US)):
+        index = protocol.exact_index(settle, guard)
+        d = protocol.SLOT_LADDER[index] * 1000
+        opens, closes = protocol.exact_window(d, settle, guard)
+        assert closes - opens >= protocol.WINDOW_MIN_US
+        assert opens >= settle and d - closes >= guard
+        if index + 1 < len(protocol.SLOT_LADDER):
+            faster = protocol.SLOT_LADDER[index + 1] * 1000
+            o, c = protocol.exact_window(faster, settle, guard)
+            assert c - o < protocol.WINDOW_MIN_US
+
+
+def test_the_exact_starts_follow_the_measured_settles():
+    # Lit: 2.5 ms settle and a 1 ms guard allow 6 ms, which is not on the
+    # ladder until the hardware says so; the dark's 10 and 2 allow 16.
+    assert protocol.SLOT_LADDER[-1] == 8
+    assert protocol.SLOT_LADDER[protocol.EXACT_LIT_INDEX] == 8
+    assert protocol.SLOT_LADDER[protocol.EXACT_INDEX] == 16
 
 
 def test_start_index_cannot_run_off_the_ladder():
-    # A badge already at the fastest rung must not index past it.
-    transfer = protocol.Transfer(True, (b"n", b"password1"), frame_ms=lambda: 1)
+    transfer = protocol.Transfer(True, (b"n", b"password1"))
+    transfer.pair_exact = transfer.pair_lit = True
     assert transfer.start_index() <= len(protocol.SLOT_LADDER) - 1
 
 
 def test_demoting_from_the_starting_rung_steps_one_rung_slower():
-    # Demotion is the only rate change there is now, and it must move exactly
+    # Demotion is the only rate change there is, and it must move exactly
     # one rung: a badge that skipped one would land somewhere its peer is not.
-    transfer = protocol.Transfer(True, (b"n", b"password1"), frame_ms=lambda: 11)
+    transfer = protocol.Transfer(True, (b"n", b"password1"))
+    transfer.pair_exact = True
     transfer.clock.set_index(transfer.start_index())
-    assert protocol.SLOT_LADDER[transfer.clock.index] == 80
+    assert protocol.SLOT_LADDER[transfer.clock.index] == 16
     transfer.clock.slow_down()
     assert transfer.clock.index == transfer.start_index() - 1
-    assert protocol.SLOT_LADDER[transfer.clock.index] == 100
+    assert protocol.SLOT_LADDER[transfer.clock.index] == 20
 
 
 def test_slow_down_stops_at_the_slowest_rung():
@@ -301,6 +295,8 @@ def test_slow_down_stops_at_the_slowest_rung():
         clock.slow_down()
     assert clock.index == 0
     assert clock.duration == protocol.SLOT_LADDER[0]
+    # A transfer's clock counts microseconds.
+    assert protocol.SlotClock(1000).duration == protocol.SLOT_LADDER[0] * 1000
 
 
 # --- separability: what the badge's sensor actually gives --------------------
@@ -308,7 +304,7 @@ def test_slow_down_stops_at_the_slowest_rung():
 # floored to 16: what three mirror runs measured. The old fixed floor, six
 # times a peak-to-peak noise of 32 (192 counts), refused all of it.
 
-def badge_staircase(swing=80, sd=4.0, black=40, seed=1, frame_ms=16,
+def badge_staircase(swing=80, sd=4.0, black=40, seed=1, frame_ms=SAMPLE_MS,
                     middle=0.45):
     """A staircase read through the badge's sensor model, or None."""
     rng = random.Random(seed)

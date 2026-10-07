@@ -193,6 +193,11 @@ class Badge:
         elif getattr(self.run, "loopback_due", False):
             self.run.loopback(
                 lambda level: self.panel.set_backlight(level, clock.t))
+        elif getattr(self.run, "ring_due", False):
+            # No DMA ring under CPython: the tests say why, as the app does.
+            self.run.ring_test(None, "no ring here",
+                               lambda level: self.panel.set_backlight(
+                                   level, clock.t))
         present_us = clock.t
         self.panel.show(self.run.pixels, self.run.backlight, present_us)
         # Not clock.advance(): the other badge's frame must not start inside
@@ -320,11 +325,13 @@ def test_schedule_runs_the_tests_in_the_order_of_the_table():
     assert "symbol_errors" not in mirror
     # The two share everything up to the backlight step; the mirror then
     # loops back on itself, which needs no second badge.
-    shared = [s for s in M.MIRROR_SCHEDULE if s.test != "loopback"]
+    mirror_only = ("loopback", "backlight_step_ring", "loopback_ring")
+    shared = [s for s in M.MIRROR_SCHEDULE if s.test not in mirror_only]
     assert [s.key for s in shared] == \
         [s.key for s in M.SECOND_BADGE_SCHEDULE[:len(shared)]]
     assert mirror[len(shared):] == ["loopback"] * (
-        len(M.LOOPBACK_RUNGS) + len(M.DIM_RUNGS))
+        len(M.LOOPBACK_RUNGS) + len(M.DIM_RUNGS)) + [
+        "backlight_step_ring", "loopback_ring"]
 
 
 def test_ambient_is_black_with_the_backlight_off_and_64_reads():
@@ -669,7 +676,8 @@ def test_schedule_durations():
     assert shared == 47500
     loopback = sum(35 * rung + 200 for rung in (50, 32, 25, 20, 16))
     dim = sum(3 * 150 + 35 * rung + 200 for rung in (25, 16))
-    assert M.MIRROR_SCHEDULE_MS == shared + loopback + dim == 56240
+    assert shared + loopback + dim == 56240
+    assert M.MIRROR_SCHEDULE_MS == 56240 + M.RING_STEP_MS + M.RING_LOOP_MS
     eye_slots = (4 + 1 + 19) + (4 + 1 + 29)
     assert M.SECOND_BADGE_SCHEDULE_MS == (
         47500 + 2 * 34 * (50 + 65 + 80) + 3 * 2000
@@ -678,7 +686,7 @@ def test_schedule_durations():
 
 
 def test_test_lists_have_the_tests_of_the_table_in_order():
-    assert len(M.MIRROR_TESTS) == 13 and len(M.SECOND_BADGE_TESTS) == 14
+    assert len(M.MIRROR_TESTS) == 15 and len(M.SECOND_BADGE_TESTS) == 14
     assert M.SECOND_BADGE_TESTS[-2:] == ("averaging", "eye")
     assert "edge_latency" in M.MIRROR_TESTS and "symbol_errors" not in M.MIRROR_TESTS
     assert "symbol_errors" in M.SECOND_BADGE_TESTS and "edge_latency" not in M.SECOND_BADGE_TESTS
@@ -1146,11 +1154,14 @@ def test_flicker_verdict():
 
 def test_frame_timing_stats():
     deltas = [11, 12, 10, 11, 13, 9, 11]
-    got = M.frame_timing(deltas)
-    assert got == {"frames": 7, "mean_ms": round(statistics.mean(deltas), 1),
-                   "min_ms": 9, "max_ms": 13,
-                   "sd_ms": round(statistics.pstdev(deltas), 1)}
-    assert M.frame_timing([]) == {"error": "no frames"}
+    stats = M.FrameStats()
+    for delta in deltas:
+        stats.add(delta)
+    assert stats.result() == {
+        "frames": 7, "mean_ms": round(statistics.mean(deltas), 1),
+        "min_ms": 9, "max_ms": 13,
+        "sd_ms": round(statistics.pstdev(deltas), 1)}
+    assert M.FrameStats().result() == {"error": "no frames"}
 
 
 # --- symbol errors ----------------------------------------------------------
@@ -1254,6 +1265,10 @@ MIRROR_SHAPE = dict(SHAPE, edge_latency={"mean_ms", "min_ms", "max_ms",
                                     "fall": MIRROR_STEP_KEYS,
                                     "mid_rise": MIRROR_STEP_KEYS,
                                     "bin_us": int, "read_us": float})
+# Without a ring the two ring tests say why; with one, see the ring tests.
+NO_RING = object()
+MIRROR_SHAPE["backlight_step_ring"] = NO_RING
+MIRROR_SHAPE["loopback_ring"] = NO_RING
 # temperature_c: {"start": C, <test>: C, ..., "end": C}.
 TEMPS = object()
 SHAPE["temperature_c"] = TEMPS
@@ -1272,6 +1287,9 @@ SECOND_SHAPE = dict(SHAPE, symbol_errors={
 
 
 def assert_shape(value, shape, path="results"):
+    if shape is NO_RING:
+        assert value == {"error": "no ring here"}, (path, value)
+        return
     if shape is TEMPS:
         # Its keys are the tests the run passed through, so they are checked
         # by the temperature tests; here, only that they are degrees.
@@ -1324,6 +1342,19 @@ def test_spec_keys_are_all_produced():
     ours = keys(MIRROR_SHAPE) | keys(SECOND_SHAPE) | {
         "mirror", "second_badge", "frame_probe", "role", "dark", "lit",
         "error"}
+
+    # The ring tests are NO_RING in the harness; their keys come from a run
+    # over a simulated ring.
+    def produced(value):
+        out = set()
+        if isinstance(value, dict):
+            for k, v in value.items():
+                out.add(k)
+                out |= produced(v)
+        return out
+    for test in (M.backlight_step_ring, M.loopback_ring):
+        mirror = RingMirror(tau_us=500.0)
+        ours |= produced(test(mirror.reader(), mirror.set_backlight))
     # The example elides with "..." so it names fewer than we write; it must
     # never name one we do not.
     assert spec_keys - ours == set(), spec_keys - ours
@@ -1427,8 +1458,9 @@ def test_mirror_run_names_the_test_in_progress():
             seen.append(label)
     assert seen == [(1, "ambient"), (3, "levels"), (5, "gamma_ramp"),
                     (6, "backlight_curve"), (7, "bleed"), (8, "flicker"),
-                    (9, "settle"), (10, "backlight_step"), (11, "loopback")]
-    assert run.test_count == 13
+                    (9, "settle"), (10, "backlight_step"), (11, "loopback"),
+                    (12, "backlight_step_ring"), (13, "loopback_ring")]
+    assert run.test_count == 15
 
 
 # --- temperature ------------------------------------------------------------
@@ -1993,7 +2025,7 @@ def test_the_answer_goes_up_half_a_period_after_the_call():
             # The rise corrected by the edge lag, and the frame it lands in.
             assert abs(at - call - M.REPLY_DELAY_MS) <= frame_ms, \
                 (frame_ms, k, at)
-        # Timed from the rise less the protocol's edge lag: half a frame and
+        # Timed from the rise less Dev Mode's edge_lag(): half a frame and
         # a tenth of LCD_SETTLE_MS.
         run = script.run
         lag = frame_ms // 2 + P.LCD_SETTLE_MS // 10
@@ -2272,3 +2304,79 @@ def test_adc_step_counts_the_handshakes_reads_too():
     run_a, run_b = two_badges()
     for run in (run_a, run_b):
         assert run.results()["adc_step"] == 16
+
+
+# --- the DMA ring on the mirror (M4, M5) ---------------------------------------
+# Through the production RingReader over a ring that fills as a fake clock
+# runs, its readings the badge's own backlight seen through a first-order
+# sensor: what the badge would read off a mirror, minus the noise.
+
+READER = load_module("share_wifi", "reader")
+
+
+class RingMirror:
+    """A clock that moves 5 us a call, a backlight, and a ring of 20 us
+    readings following it with time constant `tau_us`."""
+
+    # Raw 8, 16, 28: 128, 256 and 448 counts -- a swing wide enough that
+    # whole raw steps do not hide a crossing's time.
+    LEVELS = {0.5: 8.0, 0.82: 16.0, 1.0: 28.0}
+
+    def __init__(self, tau_us=500.0):
+        self.t = 0
+        self.tau = tau_us
+        self.target = 8.0
+        self.level = 8.0
+        mirror = self
+
+        self.ring = READER.ListRing(16384, 20)
+
+    def ticks_us(self):
+        # The DMA writes as time passes, whoever is looking.
+        self.t += 5
+        ring = self.ring
+        while ring.written < self.t // 20:
+            self.level += (self.target - self.level) \
+                * (1 - math.exp(-20.0 / self.tau))
+            ring.push(int(round(self.level)))
+        return self.t
+
+    def set_backlight(self, value):
+        self.target = self.LEVELS.get(round(value, 2), 28.0 * value)
+
+    def reader(self):
+        return READER.RingReader(self.ring, self.ticks_us)
+
+
+def test_backlight_step_ring_times_each_transition_from_the_call():
+    mirror = RingMirror(tau_us=500.0)
+    out = M.backlight_step_ring(mirror.reader(), mirror.set_backlight)
+    assert out["levels"] == [128, 256, 448], out["levels"]
+    for kind, _, _ in M.RING_STEP_KINDS:
+        result = out[kind]
+        assert result["count"] == M.RING_STEP_TRANSITIONS, (kind, result)
+        # A first-order step: half way at tau ln 2, 0.35 ms, to a 100 us bin.
+        assert 0.2 <= result["t50_ms"] <= 0.5, (kind, result)
+        assert result["t10_ms"] <= result["t50_ms"] <= result["t90_ms"]
+    assert "tlow_ms" in out["rise"] and "tlow_ms" in out["mid_rise"]
+    assert out["tx_late_us"]["max"] < 100
+
+
+def test_loopback_ring_decodes_every_rung_through_the_data_phase():
+    mirror = RingMirror(tau_us=500.0)
+    out = M.loopback_ring(mirror.reader(), mirror.set_backlight)
+    assert out["levels"] == [128, 256, 448] and out["lit"] is True
+    for rung in M.RING_LOOP_RUNGS:
+        result = out[str(rung)]
+        assert result["errors"] == 0, (rung, result)
+        assert result["symbols"] == 3 * len(M.DE_BRUIJN)
+        assert result["locks"] >= 1, (rung, result)
+        assert result["lag_us"]["max"] < 2000, (rung, result)
+
+
+def test_the_ring_tests_stop_the_ring_and_leave_the_backlight_low():
+    mirror = RingMirror()
+    reader = mirror.reader()
+    M.backlight_step_ring(reader, mirror.set_backlight)
+    assert not mirror.ring.running
+    assert mirror.target == 8.0

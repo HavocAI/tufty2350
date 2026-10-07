@@ -55,7 +55,7 @@ def test_the_follower_measures_the_staircase_not_the_silence_after_it():
     # waited until the staircase had finished, and the Follower then calibrated
     # against 512 samples of ambient.
     link = run(settle_ms=8, noise=80, start_skew_ms=0)
-    reader = link.follower.transfer.reader
+    reader = link.follower.transfer.reader_cal
     span = max(reader.values) - min(reader.values)
     assert span >= protocol.MIN_SWING, \
         "follower saw a span of %d: it measured silence, not the staircase" % span

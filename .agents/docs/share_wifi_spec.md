@@ -23,22 +23,28 @@ no progress, no light reading, no `B - Cancel`; B still cancels.
 
 - `begin_transfer()` calls `begin_signalling()`: `badge.mode(LORES | VSYNC)`
   and `badge.default_clear = None`, so `run()` no longer clears the screen
-  before each frame. It fills the screen black, times the panel's refresh
-  from two presents (`measure_refresh()`, the protocol's `frame_ms`), and
-  starts a `Transfer(continuous=True)`.
-- **`do_transfer()` is a listen loop, not a frame.** Each pass reads
-  `light_level()` once and steps the protocol with it. A change of backlight
-  is set there and then, with no present. A change of pixels fills the
-  screen and returns to `run()`, whose present shows it -- the only time the
-  loop returns before the transfer ends. The buttons are polled every
-  `POLL_PASSES` (16) passes and B is checked; the case lights are updated
-  then too. `TRANSFER_PASSES` caps the readings one `update()` may take: 0 on
-  the badge, no cap; the app's tests set 1, one field a frame. See "Reading
-  continuously" in the protocol.
-- On the backlight scheme every symbol's pixels are white, so once a
-  transfer is on it nothing is presented until it ends. On pixels each
-  change of symbol is a present, which blocks reading for up to a refresh
-  and a write.
+  before each frame. It fills the screen black, presents it, takes the
+  launch's reader
+  (`transfer_reader()`: the DMA ring, made and verified on the first transfer
+  of a launch in about 0.4 s, else the polled one), collects, starts the
+  reader and starts a `Transfer(leader, payload, reader)`.
+- **`do_transfer()` is a loop, not a frame.** Each pass collects if the
+  protocol asked (`collect_due`) -- never inside its calls -- then
+  `reader.pump(transfer.due_us())`, which waits (a polled reader reading
+  `light_level()` meanwhile) until the protocol has something due, then
+  shows `field_at(now)` and only then calls `work(now)`, so a change of
+  backlight lands on time. A change of backlight is set with no present. A
+  change of pixels fills the screen and returns to `run()`, whose present
+  shows it -- the only time the loop returns before the transfer ends; a
+  ring reader goes on reading through the present. The buttons are polled
+  every `POLL_MS` (50) and B is checked; the case lights are updated then
+  too. `TRANSFER_PASSES` caps the passes one `update()` may take: 0 on the
+  badge, no cap; the app's tests set 1. See "Reading" in the protocol.
+- The beacons are black and white pixels at full backlight; from calibration
+  on, every symbol's pixels are white and only the backlight changes, so
+  nothing is presented until the transfer ends.
+- **`on_exit()`** stops the reader -- and with it the ring's DMA channel and
+  the ADC's free-running -- however the app is left, HOME included.
 - `finish_transfer()`, the single exit, calls `end_signalling()` -- `HIRES |
   VSYNC` and `default_clear` back to black -- and restores the backlight to
   230/255.
@@ -68,13 +74,10 @@ no progress, no light reading, no `B - Cancel`; B still cancels.
 
 ## Signalling
 
-- `SIGNALLING` in `__init__.py` is the tuple of light-level schemes this badge
-  offers, handed to `Transfer(schemes=...)`. The default is both,
-  `(SCHEME_FIELDS, SCHEME_BACKLIGHT)`: calibration measures both, and a
-  continuous badge takes the backlight whenever it calibrated -- see "Reading
-  continuously" and "Choosing a scheme" in the protocol. `(SCHEME_FIELDS,)`
-  alone is the original method. Either setting works against a peer on
-  either setting.
+- There is one scheme for data: the backlight. `SIGNALLING` and the choice
+  between schemes went with the fields staircase (see "Why the fields
+  staircase went" in the protocol); `transfer.scheme` is fields for the
+  beacons and backlight from a badge's staircase on.
 - Each frame is drawn in the scheme the transfer reports in `transfer.scheme`;
   `FIELD_COLOR` and `FIELD_BACKLIGHT` hold every scheme's pens and backlight
   values, built once at import so switching allocates nothing.
@@ -607,8 +610,10 @@ screen; the handshake keeps it so the user can read what is happening.
 | `bleed` | black field at backlight 1.0, then at 0.0, 1 s each, median | whether switching the backlight off deepens black |
 | `flicker` | white field at backlight 0.25, 0.5, 0.74 and 0.9, and at 1.0 for reference, 0.5 s each: 256 `light_level()` reads back to back within one frame, half way through each; min, max, standard deviation, and a verdict | whether the sensor averages the backlight's PWM or follows it |
 | `settle` | 10 black-to-white, 10 white-to-black and 10 black-to-middle transitions at backlight 1.0, 300 ms apart, reading continuously for 60 ms after each with `time.ticks_us()` timestamps; time constant fitted from the slope of `ln\|final - v\|`, median per direction, and the 90% settling time (2.3 x the slowest) | `LCD_SETTLE_MS` |
-| `backlight_step` | white pixels throughout and only the backlight moving: 10 off-to-full, 10 full-to-off and 10 off-to-middle (`MID_BACKLIGHT`, 0.82), 300 ms apart -- from off, not the scheme's dim low, so runs compare. Each captured **around the `display.backlight()` call** -- reading for 2 ms before it, then on for 60 ms -- since the PWM duty is live at once and there is no present to wait for. Per direction, the captures averaged into one curve, and its 10-90% time; on the mirror, also when it crossed 10, 50 and 90% after the call. Every direction also gives the median `swing` its captures saw and how many were `skipped`, by reason |  how fast a backlight change reaches the sensor: the floor on a slot in the backlight scheme, once the panel's settle and the present are out of the way |
-| `loopback` | **mirror only.** At each of 50, 32, 25, 20 and 16 ms (`LOOPBACK_RUNGS`), the badge sends `SYMBOL_BLOCK` -- 4 slots of black, a high sync symbol, the 29-symbol de Bruijn sequence -- on its own backlight, white pixels throughout, and decodes its reflection in the same blocking loop as a transfer's continuous receiver would: readings pooled into `FINE_MS` samples, locked on the sync symbol's edge (two lit samples, the first's `T_low` crossing, less `BACKLIGHT_EDGE_LAG_MS`), each slot decided by the protocol's `SlotReceiver` with the backlight's guard, against this run's backlight `levels`. Per rung: `symbols`, `errors`, `lag_ms` -- how long after the badge set the sync symbol's backlight it saw the edge -- and `reads_per_s`. Then at 25 and 16 ms (`DIM_RUNGS`) the same with **low off** -- backlight 0.0 (`DIM_LOW`) for black, 0.80 (`DIM_MID`) for the middle, the scheme before the dim low -- keyed `off_25` and `off_16`, each first holding its three levels for 150 ms apiece (`DIM_HOLD_MS`) to measure them, and reporting them as `levels` | whether the continuous receiver and the backlight carry symbols at the rungs a transfer now starts on, and the edge delay `BACKLIGHT_EDGE_LAG_MS` assumes |
+| `backlight_step` | white pixels throughout and only the backlight moving: 10 off-to-full, 10 full-to-off and 10 off-to-middle (`MID_BACKLIGHT`, 0.82), 300 ms apart -- from off, not the scheme's dim low, so runs compare. Each captured **around the `display.backlight()` call** -- reading for 2 ms before it, then on for 60 ms -- since the PWM duty is live at once and there is no present to wait for. Per direction, the captures averaged into one curve, and its 10-90% time; on the mirror, also when it crossed 10, 50 and 90% after the call. Every direction also gives the median `swing` its captures saw and how many were `skipped`, by reason. On 2026-10-07 the lead-in before the call was folded into the capture's own read loop, which reads the same way; re-run it on hardware before comparing it with earlier runs |  how fast a backlight change reaches the sensor: the floor on a slot in the backlight scheme, once the panel's settle and the present are out of the way |
+| `loopback` | **mirror only.** At each of 50, 32, 25, 20 and 16 ms (`LOOPBACK_RUNGS`), the badge sends `SYMBOL_BLOCK` -- 4 slots of black, a high sync symbol, the 29-symbol de Bruijn sequence -- on its own backlight, white pixels throughout, and decodes its reflection in the same blocking loop as a transfer's continuous receiver would: readings pooled into `FINE_MS` samples, locked on the sync symbol's edge (two lit samples, the first's `T_low` crossing, less `BACKLIGHT_EDGE_LAG_MS`), each slot decided by Dev Mode's `SlotReceiver` (the transfer's before the ring) with the backlight's guard, against this run's backlight `levels`. Per rung: `symbols`, `errors`, `lag_ms` -- how long after the badge set the sync symbol's backlight it saw the edge -- and `reads_per_s`. Then at 25 and 16 ms (`DIM_RUNGS`) the same with **low off** -- backlight 0.0 (`DIM_LOW`) for black, 0.80 (`DIM_MID`) for the middle, the scheme before the dim low -- keyed `off_25` and `off_16`, each first holding its three levels for 150 ms apiece (`DIM_HOLD_MS`) to measure them, and reporting them as `levels`. On 2026-10-07 the receiver's per-sample window check lost a multiply (the same arithmetic), so `reads_per_s` may read marginally higher from then; not enough to need a new baseline | whether the continuous receiver and the backlight carry symbols at the rungs a transfer now starts on, and the edge delay `BACKLIGHT_EDGE_LAG_MS` assumes |
+| `backlight_step_ring` | **mirror only. Dev Mode M4.** Through the badge's DMA ring (`fastadc.Ring`, via `reader.RingReader`): the backlight scheme's three levels held 150 ms each and measured, then 10 each (`RING_STEP_TRANSITIONS`) of every transition the scheme makes -- dim to high (`rise`), dim to middle (`mid_rise`), high to dim (`fall`), middle to dim (`mid_fall`), middle to high (`mid_high`), high to middle (`high_mid`) -- each held 120 ms first and read at 20 µs, in 100 µs bins, from 2 ms before the `display.backlight()` call to 20 ms after. Per transition the mean `t10_ms`, `t50_ms`, `t90_ms` from the call, and for rises out of the dim low `tlow_ms`, when it crossed `T_low`; `count`; `levels`; `tx_late_us`, how long the call took (mean, max). Without a ring, `{"error": <why>}` | `SETTLE_DARK_US` (whether dark pairs can start on 10 ms rather than 16), `SETTLE_LIT_US`, `GUARD_DARK_US` (a rise to the middle against one to high), `EDGE_LAG_LIT_US` and `EDGE_LAG_DARK_US`, and whether transmitting by DMA or a per-level lag is needed |
+| `loopback_ring` | **mirror only. Dev Mode M5.** The real EXACT path: a listening `Transfer`, in the data phase, reading through the ring, deciding slots from their windows and phase-locking with `reader.rise()`, while the badge sends on its own backlight at the transfer loop's timing -- `RING_BLOCK`, 4 black slots, a high sync and the 29-symbol de Bruijn sequence three times -- at 16, 13, 10, 8 and 6 ms (`RING_LOOP_RUNGS`). Per rung: `symbols`, `errors`, `locks` and `lag_us` (min, mean, max: each lock's crossing after the boundary the badge set), `tx_late_us` (the backlight call after the boundary), `parts` (a window's). Plus `levels` and `lit` | which rungs go on the ladder and where EXACT pairs start: 6 ms is on no ladder until this decodes it lit; the ring, the kernels and the lock checked end to end on hardware |
 | `frame_timing` | `badge.ticks_delta` over the whole run: frames, mean, min, max, standard deviation. A mirror run is tests from start to end, so every frame is a `LORES` signalling frame; a 2nd-badge run's also include its HIRES noise second and handshakes | the frame time the rung floor and the end-of-slot guard assume |
 | `edge_latency` | **mirror only.** For each of the 10 `settle` rises: time from the call that presents the frame to the reading crossing `T_low`; mean, min, max, how many rises, how many were only upper bounds, and how long the present call blocked | the half-frame + `LCD_SETTLE_MS / 10` phase-lock correction |
 | `symbol_errors` | **2nd badge only.** See below | whether the fast rungs carry symbols reliably |
@@ -623,8 +628,8 @@ screen; the handshake keeps it so the user can read what is happening.
   sync symbol, and a 29-symbol sequence containing every run of three symbols
   over black, middle and high (a de Bruijn sequence B(3, 3), opened out so
   every triple appears in a straight line). The receiver locks its slot grid
-  onto the sync symbol's edge, decides each slot with the protocol's own
-  `SlotReceiver` and the levels it measured earlier in the same run, and counts
+  onto the sync symbol's edge, decides each slot with Dev Mode's own
+  `SlotReceiver` (the transfer's before the ring) and the levels it measured earlier in the same run, and counts
   errors against the known sequence. Every triple covers every case a symbol is
   decided in: a panel's memory of earlier symbols is below 0.1% after two slots.
 - **Averaging.** Spreads are standard deviations of the group means, kept as
@@ -671,12 +676,17 @@ from the same list when to read.
 | `backlight_step`: 40 steps | 300 ms | 12 s |
 | `loopback`: 5 rungs, **mirror only** | 35 slots + 200 ms | 6.0 s |
 | `loopback` low off: 2 rungs, **mirror only** | 450 ms + 35 slots + 200 ms | 2.7 s |
+| `backlight_step_ring`, **mirror only** | the whole test | 9.37 s |
+| `loopback_ring`: 5 rungs, **mirror only** | 450 ms + 95 slots + 30 ms each + 400 ms | 6.04 s |
 | `symbol_errors`: 2 schemes x 3 rungs, **2nd badge only** | 34 slots | 13.26 s |
 | `averaging`: 3 levels, **2nd badge only** | 2 s | 6 s |
 | `eye`: 2 sequences x 4 rungs, **2nd badge only** | 24 or 34 slots | 17.11 s |
 
-- **Mirror schedule: 56.2 s. 2nd-badge schedule: 83.87 s.** The two share
-  everything up to the backlight step; the mirror then loops back on itself. A 2nd-badge
+- **Mirror schedule: 71.6 s. 2nd-badge schedule: 83.87 s.** The two share
+  everything up to the backlight step; the mirror then loops back on itself,
+  then through its DMA ring. Each ring test reads `temperature_c` on the frame it
+  begins, before the ring takes the ADC -- nothing else may touch the ADC while
+  it runs. A 2nd-badge
   *turn* adds its handshake (three call cycles and the go, about 1.7 s when
   the other badge is ready), the 1 s of black after the go, and 1 s of black
   that ends it: about 86.6 s, so a condition -- two turns -- is about three
@@ -841,9 +851,10 @@ from the same list when to read.
 - **Symbol blocks.** The search for the sync symbol opens half way through the
   lead-in and closes two slots after the sync was due; it takes the first read
   at or above `T_low` that follows at least a slot and a half of black. The
-  slot grid is locked to that edge, interpolated, less the protocol's own edge
-  lag -- half a frame plus `LCD_SETTLE_MS / 10`, as `Transfer.edge_lag` -- and
-  each slot is then decided by `SlotReceiver`. A slot never decided counts as
+  slot grid is locked to that edge, interpolated, less Dev Mode's `edge_lag()`
+  -- half a frame plus `LCD_SETTLE_MS / 10`, the pixel scheme's correction as
+  the protocol made it before the ring -- and each slot is then decided by
+  Dev Mode's `SlotReceiver`. A slot never decided counts as
   an error. A block still running when the next begins, or when the run ends,
   is finished there, its slot in progress decided.
 
@@ -1078,12 +1089,12 @@ clear, the poll, the screen's parts, the read loops, the collector) is passed
 in through `Hooks`.
 
 1. **Prompt:** `Probe frame timing` title; message `Times the display, each
-   part of a measuring frame and how fast the sensor reads. Takes about 25 s;
+   part of a measuring frame and how fast the sensor reads. Takes about 30 s;
    the screen flashes and goes dark.`; help `A - Start   B - Back`. B returns
    to the Dev Mode menu.
-2. **A** runs the eight steps in order, one per frame. Before each, the screen
-   shows `Probe frame timing`, then `<step> n/8` (for example
-   `Refresh rate 1/8`) and `B - Cancel`, and presents that frame itself. The
+2. **A** runs the nine steps in order, one per frame. Before each, the screen
+   shows `Probe frame timing`, then `<step> n/9` (for example
+   `Refresh rate 1/9`) and `B - Cancel`, and presents that frame itself. The
    step then blocks until it ends, so this is what stays on screen while it
    runs. After each step the backlight goes back to normal, so the next
    step's status can be read.
@@ -1096,17 +1107,24 @@ in through `Hooks`.
 | `refresh` | 60 back-to-back `display.update()`s with vsync on, after one to line up; the intervals, and `hz` = 1000 / mean | the panel's real refresh rate: 16.7 ms is 60 Hz, 11.1 ms is 90 Hz |
 | `write` | the same with `display.set_vsync(False)`, then vsync back on | what writing one frame costs on its own; about 7 ms is expected |
 | `breakdown` | 60 frames of each of two screens, drawn the way `run()` draws them: `clear` (`badge.clear()`), the screen's parts, `present`, `poll`. **`field`** is the signalling frame -- a transfer's, or a Dev Mode test's -- at LORES with `run()`'s clear off, its parts `field` (backlight and a full-screen fill) and `measure`. It fills every frame, so it is the frame that changes the field; one that does not skips `field`. **`status`** is Dev Mode's HIRES handshake screen: `bands` (black clear and two bands -- `draw_bands()`, which Dev Mode's handshake screen draws too; until 2026-10-06 it built the bands as tuples each frame, so the first hardware run after that date is the baseline for `bands` and the `status` frame), `column` (the text), `lights` (backlight and case lights), `measure`. `measure` is `MirrorRun.frame()` and the status update, from a fresh `MirrorRun` per screen. Each part's mean and max, and the frame's stats. Then 8 more frames of each, untimed, for `alloc_bytes`: the mean heap growth per frame, where `gc.mem_alloc` exists | which part of a frame costs the time, and how much it allocates |
-| `reads` | four loops run back to back with **nothing presented**, each until 5,000 passes (`READ_CALLS`) or 1 s (`READ_MS`), whichever is first, timing every pass with `time.ticks_us()`: **`loop`** does nothing, so it is the loop's own cost (the clock read and the bookkeeping) to take off the others; **`read`** is one `badge.light_level()`; **`sample`** is `sample_light()`, the median of three reads every transfer frame takes; **`listen`** is a whole pass of a listener that never presents -- `time.ticks_ms()`, `sample_light()`, a data-phase `SlotReceiver.feed()` on the 50 ms rung (levels 32/64/112, a 17 ms frame), `badge.poll()` and `badge.pressed(BUTTON_B)`; **`transfer`** is a pass of the transfer's own listen loop -- `read_sample()`, the sensor read back to back for 2 ms, its mean handed to a continuous `Transfer`'s `sample()` listening in the data phase on the backlight's 32 ms rung, the buttons every `POLL_PASSES` -- with its silence budgets reset each pass, since nobody is sending; **`transfer_timed`** is the same pass on a second such listener whose `step()` is timed, and **`detail`** -- not a loop -- is where that time went: `sample`, the protocol's call, and its parts `filter_sample`, `pool_coarse` and `step_data`, each timed; `reads_per_sample` and `read_us`, how many readings a sample held and how long each took in `read_sample()`'s loop; and the listener's mean `light`, its `phase` at the end and the `flicker` it learnt. Each loop gives `calls`, `per_s`, and the pass's `mean_us`, `max_us` and `sd_us` | how many readings a receiver could take per slot if it held its screen static instead of presenting every frame -- a present blocks reading for ~12.3 ms of each 16.7 ms frame on v2 -- and whether anything (a collection, the receiver's growing lists) stalls such a loop: its `max_us` |
+| `reads` | five loops run back to back with **nothing presented**, each until 5,000 passes (`READ_CALLS`) or 1 s (`READ_MS`), whichever is first, timing every pass with `time.ticks_us()`: **`loop`** does nothing, so it is the loop's own cost (the clock read and the bookkeeping) to take off the others; **`read`** is one `badge.light_level()`; **`sample`** is `sample_light()`, the median of three reads every Dev Mode frame takes; **`transfer`** is a pass of the transfer's own loop on the **POLLED** reader -- `reader.pump(transfer.due_us())`, which reads `badge.light_level()` into 250 µs bins until the protocol has work, then `field_at()` and `work()` for a Follower listening in the data phase on the backlight's 16 ms POLLED rung, the buttons every 16 passes -- with its silence budgets reset each pass, since nobody is sending; **`transfer_timed`** is the same pass on a second such listener whose methods are timed, and **`detail`** -- not a loop -- is where that time went: `work`, the protocol's call, and its parts `window_value`, `decide_slot` and `data_field`, each timed; `passes` and `slots`, how many passes ran and how many slots they decided; the listener's `phase` at the end, the `flicker` it learnt and `exact` (false: POLLED). Each loop gives `calls`, `per_s`, and the pass's `mean_us`, `max_us` and `sd_us` | what the POLLED reader -- the fallback on a firmware without a working ring -- gets per slot, and whether anything (a collection, the receiver's lists) stalls its loop: its `max_us` |
 | `fast_reads` | the sensor read straight from the ADC's registers, in [`fastadc.py`](../../firmware/apps/share_wifi/fastadc.py), 4,096 raw 12-bit readings (`FAST_READS`) per capture, three captures: **`viper`**, a `@micropython.viper` loop starting each conversion and waiting for it; **`dma_500k`** and **`dma_100k`**, the ADC converting free-running at 500k and 100k a second into its FIFO and a `rp2.DMA` channel moving each result to a buffer. Each first checks that the ADC's control register holds the sensor's input (3: GPIO43) and that its result register matches a `badge.light_level()` just taken, and refuses otherwise -- every address is from the Pico SDK's RP2350 headers, and a wrong one would fault. `fastadc` is imported by the first capture, so a firmware without viper fails the step, not the app; a DMA capture puts the ADC back as it found it. Each gives `reads`, `us`, `per_s`, `mean` in `light_level()` counts, and `noise`: for 1, 4, 16, 64 and 256 readings, the standard deviation of the means of that many consecutive readings, in counts | how fast the sensor can be read at all -- a `badge.light_level()` call costs ~14 µs over its loop, a conversion 2 µs -- and whether averaging many readings beats the noise: by the square root of their number if it is independent, not at all if it is in the light or the sensor. Together, how short a slot could be |
+| `ring` | **Dev Mode M3.** The real EXACT listener -- a Follower in the data phase on the lit 8 ms rung, reading through `fastadc.Ring` by `reader.RingReader` -- run as `do_transfer()` runs it for 2 s (`RING_LISTEN_MS`), twice: **`quiet`**, the screen held, and **`presenting`**, the status frame presented every pass, the worst the panel's own DMA can do to the ring's. Each: `rate_hz`, readings the ring took a second (50,000 expected); `anchor_spread_us`, the width of the anchor's bracket; `fifo_over`, `faults` and `drift`, the reader's counts of lost readings, faults and anchors that moved past `RING_DRIFT_US`; `lag_max_us`, the furthest the protocol fell behind the newest reading; `work` and `slot_work` (TimeStats: a pass's `work()`, and that over the slots it decided), `slots`, `passes` (the time between passes) and `long_passes` (over 5 ms); `rung_ms`; `kernel_us_per_1000`, one `ring.sum()` over 1,000 readings in the uncached alias; `gc_ms` and `gc_overran`, a `gc.collect()` half way through and whether the ring lost readings across it; `garbage_per_slot`, heap bytes a decided slot left, where `gc.mem_free` exists. The ring is made once a launch, verified first (`Ring.verify()`); a firmware without one gets `{"error": <why>}` under each. The ring is stopped before the next temperature reading | whether the ring works on this firmware at all; `SLOT_WORK_MS` and `PASS_WORK_MS` in the simulator; whether the lit 8 ms rung's work fits; `RING_SAFE_US` against the longest stall |
 | `alloc` | 1,000 calls each of a function returning nothing, a 2-tuple, a 4-tuple and an 8-tuple, built from the function's arguments so they really allocate; µs per call, with the bare call subtracted from the tuples | whether allocations bigger than one GC block are the slow kind |
-| `flicker_filter` | the protocol's `FlickerFilter` (handed in as `Hooks.flicker_filter`) on a synthetic room, made before anything is timed: 2 ms means every 3 ms, as a transfer keeps them, of 700 counts flickering 12 at 120 Hz and 4 at 240, with noise of about 4 from a fixed generator -- the shape of the 2026-10-06 room that flickered 12.5 counts. **`fit_first_us`**, one fit of the Leader's 200 ms window (66 samples), timed on its own because the first fit since launch also fills the protocol's gain tables; then **`fit`**, three more of it, and **`fit_follower`**, three of the Follower's 100 ms (33), each on a fresh filter; `verdict`, the first fit's. Then, on the first filter, as a transfer goes on from its fit: **`correct_first_us`**, the first correction, which builds the table for its span; **`correct`**, 500 more; **`track`**, a phase-lock point, and the updates after each 8: **`update`** for those under 0.3 s from the fit, and **`update_rate`** for those 0.7 s on, by when the rate's line spans the protocol's `FLICKER_RATE_MIN_S` and every update fits it. Each of the last five gives `calls`, `per_s`, `mean_us`, `max_us`, `sd_us`; `samples` and `follower_samples` say how many the fits had. `fit_first_us` and `correct_first_us` time the bare call, as `fit` and `correct` do; until 2026-10-06 they also timed a lambda wrapping it, so the first hardware run after that date is the baseline for every key of this step | what the filter costs on the badge: the simulator guesses the fit stalls a staircase step by 150 ms, the unix port took 3.3 ms, and badge protocol work has run up to 100 times slower |
+| `flicker_filter` | the protocol's `FlickerFilter` (handed in as `Hooks.flicker_filter`) on a synthetic room, made before anything is timed: 2 ms means every 2 ms, as a transfer pulls them from its reader (`FILTER_EVERY_US`), of 700 counts flickering 12 at 120 Hz and 4 at 240, with noise of about 4 from a fixed generator -- the shape of the 2026-10-06 room that flickered 12.5 counts. **`fit_first_us`**, one fit of the Leader's 160 ms window (80 samples, `FILTER_SAMPLES`), timed on its own because the first fit since launch also fills the protocol's gain tables; then **`fit`**, three more of it, and **`fit_follower`**, three of the Follower's 100 ms (50, `FILTER_FOLLOWER_SAMPLES`; **Dev Mode M7**), each on a fresh filter; `verdict`, the first fit's. Then, on the first filter, as a transfer goes on from its fit: **`correct_first_us`**, the first correction, which builds the table for its span; **`correct`**, 500 more; **`track`**, a phase-lock point, and the updates after each 64 (`FILTER_UPDATES`): **`update`** for those under 0.3 s from the fit, and **`update_rate`** for those 0.7 s on, by when the rate's line spans the protocol's `FLICKER_RATE_MIN_S` and every update fits it. Each of the last five gives `calls`, `per_s`, `mean_us`, `max_us`, `sd_us`; `samples` and `follower_samples` say how many the fits had. `fit_first_us` and `correct_first_us` time the bare call, as `fit` and `correct` do; until 2026-10-06 they also timed a lambda wrapping it, so the first hardware run after that date is the baseline for every key of this step. Then **`replay`** (Dev Mode M7): a POLLED Follower's late `replay_staircase()` on a full buffer (`FLICKER_BUFFER`, 640 samples) of a dark staircase flickering 12 counts at 120 Hz, fitted first -- `us`, and `samples` re-fed; the simulator charges `REPLAY_MS_PER_SAMPLE` (0.25 ms) a sample for it | what the filter costs on the badge: the simulator guesses the fit stalls a staircase step by 150 ms, the unix port took 3.3 ms, and badge protocol work has run up to 100 times slower |
 | `gc` | three timed `gc.collect()`s; heap in use and free (KiB); then 120 `status` frames with the collector on, and 120 with it off (`gc.disable()`, always followed by `gc.enable()`) | what a collection costs, and whether the long frames are collections |
 
 - **`temperature_c`** reads the chip's temperature before each step and at
   the end, as the measuring tools do (see "How each result is worked out").
 - **`firmware`** records `os.uname().version` (the build) and
   `set_framerate`, which is whether `display` has that method at all. A badge
-  that reports `false` runs its panel at the power-on 60 Hz.
+  that reports `false` runs its panel at the power-on 60 Hz. **Dev Mode M1**
+  adds what the ring needs: `rp2`, `uctypes` and `rp2_dma`, whether each
+  imports or exists; `ring`, `null` if the ring was made and verified, else
+  why not (`ring_note()`); `heap_addr`, where a fresh bytearray lands, and
+  `ring_addr`, the ring buffer's uncached alias, both in hex -- the ring
+  needs its buffer in PSRAM (0x11000000-0x117FFFFF) to use the 0x15000000
+  alias.
 - **The frame time in `breakdown` and `gc`** runs from the start of one frame
   to the start of the next, timed with `time.ticks_us()` rather than
   `ticks_delta`, so it has sub-millisecond resolution. The first frame of a
@@ -1121,7 +1139,7 @@ in through `Hooks`.
   `{"error": "no set_vsync"}` for `write`. Vsync and the collector are always
   turned back on.
 - **B** is checked after every frame of `breakdown` and `gc`, after each of
-  the `reads` loops and `fast_reads` captures, and between steps. It cancels: nothing is saved, the panel is restored, and the screen
+  the `reads` loops, `fast_reads` captures and `ring` runs, and between steps. It cancels: nothing is saved, the panel is restored, and the screen
   returns to the Dev Mode menu with this tool selected. `refresh`, `write` and
   `alloc` take about a second each and are not checked part way through.
 - **Not a measurement of the panel:** what is on screen during `refresh` and
@@ -1191,6 +1209,16 @@ decimals, rounded as under "How each result is worked out":
                  "off_25": {"symbols": 29, "errors": 0, "lag_ms": 1.6, "reads_per_s": 7700,
                             "levels": [32, 64, 112]},
                  "off_16": {...}},
+    "backlight_step_ring": {"levels": [32, 64, 112],
+                            "rise": {"count": 10, "t10_ms": 0.3, "t50_ms": 0.6, "t90_ms": 1.2, "tlow_ms": 0.4},
+                            "mid_rise": {...}, "fall": {...}, "mid_fall": {...},
+                            "mid_high": {...}, "high_mid": {...},
+                            "tx_late_us": {"mean": 35, "max": 80}},
+    "loopback_ring": {"levels": [32, 64, 112], "lit": false,
+                      "16": {"symbols": 87, "errors": 0, "locks": 4,
+                             "lag_us": {"min": 150, "mean": 260, "max": 420},
+                             "tx_late_us": {"mean": 60, "max": 140}, "parts": 5},
+                      "13": {...}, "10": {...}, "8": {...}, "6": {...}},
     "edge_latency": {"mean_ms": 7.2, "min_ms": 2.4, "max_ms": 13.1,
                      "rises": 10, "upper_bounds": 3, "blind_ms": 21.6},
     "temperature_c": {"start": 24.3, "ambient": 24.3, "levels": 24.4, ..., "end": 25.1},
@@ -1212,7 +1240,9 @@ decimals, rounded as under "How each result is worked out":
     }
 
 The values above illustrate the format only. A failed test holds
-`{"error": "..."}` instead. `loopback` and `edge_latency` appear only under `mirror`, and
+`{"error": "..."}` instead -- the ring's two tests on a badge without a ring
+say why. `loopback`, `backlight_step_ring`, `loopback_ring` and
+`edge_latency` appear only under `mirror`, and
 `symbol_errors`, `averaging` and `eye` only under `second_badge`.
 
 `<probe>` has one key per step of *probe frame timing*, plus `firmware` and
@@ -1220,7 +1250,9 @@ The values above illustrate the format only. A failed test holds
 Times are in ms to two decimals, except `reads`, `fast_reads`, `alloc` and
 `flicker_filter`, which are in µs:
 
-    "firmware": {"version": "<os.uname().version>", "set_framerate": false},
+    "firmware": {"version": "<os.uname().version>", "set_framerate": false,
+                 "rp2": true, "uctypes": true, "rp2_dma": true, "ring": null,
+                 "heap_addr": "0x11012000", "ring_addr": "0x15018000"},
     "refresh": {"frames": 60, "mean_ms": 16.67, "min_ms": 16.6, "max_ms": 16.74, "sd_ms": 0.03, "hz": 60.0},
     "write":   {"frames": 60, "mean_ms": 7.02, ...},
     "breakdown": {
@@ -1233,22 +1265,29 @@ Times are in ms to two decimals, except `reads`, `fast_reads`, `alloc` and
     },
     "reads": {"loop":   {"calls": 5000, "per_s": 52000, "mean_us": 19.2, "max_us": 61, "sd_us": 2.1},
               "read":   {...}, "sample": {...},
-              "listen": {"calls": 3100, "per_s": 3100, "mean_us": 322.5, "max_us": 9400, "sd_us": 410.0},
               "transfer": {...}, "transfer_timed": {...},
-              "detail": {"sample": {"calls": 330, "per_s": 1100, "mean_us": 905.0, "max_us": 2900, "sd_us": 310.0},
-                         "filter_sample": {...}, "pool_coarse": {...}, "step_data": {...},
-                         "reads_per_sample": 31.0, "read_us": 64.5,
-                         "light": 48, "phase": 5, "flicker": 0.0}},
+              "detail": {"work": {"calls": 330, "per_s": 1100, "mean_us": 905.0, "max_us": 2900, "sd_us": 310.0},
+                         "window_value": {...}, "decide_slot": {...}, "data_field": {...},
+                         "passes": 330, "slots": 40, "phase": 5, "flicker": 0.0,
+                         "exact": false}},
     "fast_reads": {"viper": {"reads": 4096, "us": 9830, "per_s": 416700, "mean": 52.3,
                              "noise": {"1": 9.8, "4": 5.1, "16": 2.6, "64": 1.4, "256": 0.9}},
                    "dma_500k": {...},
                    "dma_100k": {"error": "RuntimeError: DMA did not finish in 90 ms"}},
+    "ring": {"quiet": {"rate_hz": 50000, "anchor_spread_us": 22, "fifo_over": 0, "faults": 0,
+                       "drift": 0, "lag_max_us": 1800,
+                       "work": {"calls": 900, "per_s": 1400, "mean_us": 700.0, "max_us": 2300, "sd_us": 300.0},
+                       "slot_work": {...}, "slots": 250, "passes": {...}, "long_passes": 0,
+                       "rung_ms": 8, "kernel_us_per_1000": 900,
+                       "gc_ms": 44.0, "gc_overran": false, "garbage_per_slot": 140.0},
+             "presenting": {...}},
     "alloc": {"calls": 1000, "call_us": 6.1, "pair_us": 3.2, "quad_us": 31.0, "octet_us": 35.5},
-    "flicker_filter": {"samples": 66, "follower_samples": 33, "fit_first_us": 1813,
+    "flicker_filter": {"samples": 80, "follower_samples": 50, "fit_first_us": 1813,
                        "verdict": "flicker",
                        "fit": {"calls": 3, "per_s": 688, "mean_us": 1453.7, "max_us": 1478, "sd_us": 18.6},
                        "fit_follower": {...}, "correct_first_us": 327, "correct": {...},
-                       "track": {...}, "update": {...}, "update_rate": {...}},
+                       "track": {...}, "update": {...}, "update_rate": {...},
+                       "replay": {"us": 95000, "samples": 640}},
     "gc": {"collect": {"mean_ms": 95.0, "max_ms": 101.0}, "alloc_kb": 210, "free_kb": 7900,
            "screen": "status", "frames_on": {<as refresh, less hz>}, "frames_off": {...}},
     "temperature_c": {"refresh": 24.8, "write": 24.8, ..., "gc": 25.3, "end": 25.4}
@@ -1358,7 +1397,8 @@ badge, no schedule. The capture and the analysis are in
 - **The fit**: the transfer's own `FlickerFilter.fit()` on the capture, fed
   as a transfer feeds it -- the mean of each 2 ms (`FINE_MS`, four bins)
   every 3 ms (six bins), timed at its middle, span 2,000 µs -- from the
-  first 200 ms (`FLICKER_FIT_MS`, 67 samples). A window it refuses is fitted
+  first 160 ms (`FLICKER_FIT_MS`, 53 samples); the other ~90 ms, 30 samples,
+  are held out. A window it refuses is fitted
   again on its newest half, as `Transfer.fit_flicker()` does. Under `filter`:
   `verdict` (`"flicker"`, `"steady"` or `null`, refused), `reason` (why it
   refused, else `null`), `window_ms` (the window the
@@ -1368,9 +1408,13 @@ badge, no schedule. The capture and the analysis are in
   region it preferred), `noise` (counts
   left unexplained), `harmonics` (each harmonic's size in counts, keyed by
   its Hz, before the significance test) and, for `"flicker"`, `kept` (the Hz
-  taken off). Then, on the capture's last ~50 ms, which the fit never saw,
+  taken off). Then, on the capture's last ~90 ms, which the fit never saw,
   `held_out` samples' standard deviation before (`sd_before`) and after
-  (`sd_after`) `correct()`: the flicker left in a transfer's samples.
+  (`sd_after`) `correct()`: the flicker left in a transfer's samples. And
+  `window_residual` (Dev Mode M6): 3.5 ms windows every 8 ms over the same part --
+  an EXACT pair's window on the lit 8 ms rung -- their means' spread before and
+  after correction (`windows`, `sd_before`, `sd_after`): whether that rung
+  survives a flickering room.
   `FlickerFilter.fit_info` carries the noise, mains and sizes out of `fit()`
   whatever it returns; the transfer does not read it.
 - **The drift**: after the capture, 80 more windows of 250 ms
@@ -1418,8 +1462,8 @@ badge, no schedule. The capture and the analysis are in
   -- one to two seconds of Goertzel on the v2 badge [inferred-v2] -- and the
   drift: 80 x (250 ms, the window's phase, and a frame of 17-33 ms), about
   25 s. The screen says about 30.
-- **Storage**: a saved measurement is about 550 bytes of JSON, so 20 are
-  about 11 KB; with the other tools the file is about 21 KB, six of the
+- **Storage**: a saved measurement is about 650 bytes of JSON, so 20 are
+  about 13 KB; with the other tools the file is about 21 KB, six of the
   flash's ~256 4 KB blocks, written once a session.
 - **What it found** (2026-10-06): every LED light flickered at 120 Hz, by 1%
   of its light in one room, 30-47% in an open area, 0.1% in another
@@ -1438,11 +1482,13 @@ measurement, in the order taken:
             "peak_hz": 120, "peak_counts": 12.1,
             "hz": {"50": 0.3, "60": 0.0, "100": 0.1, "120": 12.1,
                    "150": 0.4, "180": 0.2, "200": 0.1, "240": 3.7},
-            "filter": {"verdict": "flicker", "reason": null, "window_ms": 200,
+            "filter": {"verdict": "flicker", "reason": null, "window_ms": 160,
                        "mains": 60, "noise": 0.9,
                        "harmonics": {"60": 0.2, "120": 12.3, "180": 0.2, "240": 3.9},
-                       "kept": [120], "held_out": 16,
-                       "sd_before": 8.3, "sd_after": 1.7},
+                       "kept": [120], "held_out": 30,
+                       "sd_before": 8.3, "sd_after": 1.7,
+                       "window_residual": {"window_ms": 3.5, "windows": 11,
+                                           "sd_before": 3.8, "sd_after": 0.6}},
             "drift": {"hz": 120, "windows": 80, "ambiguous": false, "seconds": 23.8,
                       "offset_mhz_vs_clock": 13.0, "wander_deg": 0.4},
             "temp_c": 24.6},

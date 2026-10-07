@@ -126,7 +126,7 @@ def test_the_deadline_does_not_cap_the_payload():
     # The bug this replaced: a wall clock on the whole data phase is a length
     # limit, however it is described. Counted per block it bounds the same
     # stalls and scales with the work.
-    transfer = protocol.Transfer(True, (b"A" * 4096,), frame_ms=lambda: 11)
+    transfer = protocol.Transfer(True, (b"A" * 4096,))
     transfer.levels = protocol.Levels()
     transfer.levels.fit(200, 4250, 9200)
     transfer.now = 0

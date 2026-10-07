@@ -14,6 +14,8 @@ import simulator
 from harness import load_module
 
 P = load_module("share_wifi", "protocol")
+# Dev Mode's slot receiver, the one the transfer ran until 2026-10-07.
+M = load_module("share_wifi", "measure")
 
 
 def levels():
@@ -49,7 +51,7 @@ def test_a_sample_of_the_next_symbol_at_the_very_end_of_a_slot_is_ignored():
     # higher, and the slot decodes as high.
     clock = P.SlotClock()
     clock.start(0, P.SLOT_LADDER.index(50))
-    receiver = P.SlotReceiver(clock, levels(), frame_ms=11)
+    receiver = M.SlotReceiver(clock, levels(), frame_ms=11)
     for now, value in ((4, 9200), (15, 4250), (26, 4250), (37, 4250), (47, 9200)):
         assert receiver.feed(now, value) is None
     settled = receiver.settled[:receiver.n_settled]

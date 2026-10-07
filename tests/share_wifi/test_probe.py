@@ -14,10 +14,13 @@ from harness import load_module
 
 P = load_module("share_wifi", "probe")
 PROTOCOL = load_module("share_wifi", "protocol")
+READER = load_module("share_wifi", "reader")
 PATH = os.path.join(os.path.dirname(P.__file__), "probe.py")
 
 REFRESH_US = 16667      # 60 Hz
-INFO = {"version": "test", "set_framerate": False}
+INFO = {"version": "test", "set_framerate": False, "rp2": True,
+        "uctypes": True, "rp2_dma": True, "ring": None,
+        "heap_addr": "0x11012000", "ring_addr": "0x15018000"}
 WRITE_US = 7000
 
 
@@ -36,7 +39,7 @@ class Badge:
     """The hooks, each costing a fixed time on the clock."""
 
     def __init__(self, cancel_after=None, part_us=(1000, 2000),
-                 read_us=(2, 12, 40, 150, 180, 190)):
+                 read_us=(2, 12, 40, 180, 190)):
         self.clock = Clock()
         self.temp_reads = 0
         self.presents = 0
@@ -107,6 +110,38 @@ class Badge:
     def mem_free(self):
         return 8 * 1024 * 1024 - self.allocated
 
+    def ticking(self):
+        """The clock as a reader reads it: 5 us a call, so a wait ends."""
+        self.clock.advance(5)
+        return self.clock.t
+
+    def ring(self, presenting):
+        """The ring step's hook: ring_listen() on a listener whose ring
+        fills at 50 kHz of this clock, every reading 7 raw (112 counts)."""
+        badge = self
+
+        class ClockRing(READER.ListRing):
+            def __init__(self):
+                READER.ListRing.__init__(self, 16384, 20)
+                for i in range(self.samples):
+                    self.buf[i] = 7
+                self.t0 = badge.clock.t
+
+            def position(self):
+                return (badge.clock.t - self.t0) // 20
+
+        reader = READER.RingReader(ClockRing(), self.ticking)
+        reader.start()
+        transfer = PROTOCOL.Transfer(False, reader=reader)
+        transfer.levels = PROTOCOL.Levels()
+        transfer.levels.fit(32, 64, 112)
+        transfer.start_data(0, PROTOCOL.EXACT_LIT_INDEX)
+        return P.ring_listen(transfer, self.ticking,
+                             present=self.present if presenting else None,
+                             poll=self.poll, collect=self.collect,
+                             mem_free=self.mem_free,
+                             cancelled=lambda: False, ms=60)
+
     def hooks(self, set_vsync=True):
         a, b = self.part_us
         # The app's parts, by name; lights and measure cost nothing here.
@@ -126,13 +161,14 @@ class Badge:
             mem_alloc=self.mem_alloc, mem_free=self.mem_free,
             ticks_us=self.clock, temp=self.temp,
             reads=tuple((name, self.part(us, 0)) for name, us in
-                        zip(("loop", "read", "sample", "listen",
+                        zip(("loop", "read", "sample",
                              "transfer", "transfer_timed"),
                             self.read_us)),
             fast=(("viper", self.fast_viper), ("dma_500k", self.fast_viper),
                   ("dma_100k", self.no_dma)),
             reads_detail=self.reads_detail,
-            flicker_filter=self.flicker_filter())
+            flicker_filter=self.flicker_filter(), ring=self.ring,
+            replay=lambda: {"us": 95000, "samples": 640})
 
     def flicker_filter(self):
         """The protocol's filter, each call costing time on the clock."""
@@ -168,9 +204,9 @@ class Badge:
         # The app's TimedListener.result(), in shape.
         part = {"calls": 10, "per_s": 1, "mean_us": 5.0, "max_us": 9,
                 "sd_us": 1.0}
-        out = {"light": 48, "phase": 5, "flicker": 0.0,
-               "reads_per_sample": 31.0, "read_us": 64.5}
-        for name in ("sample", "filter_sample", "pool_coarse", "step_data"):
+        out = {"passes": 330, "slots": 40, "phase": 5, "flicker": 0.0,
+               "exact": False}
+        for name in ("work", "window_value", "decide_slot", "data_field"):
             out[name] = part
         return out
 
@@ -313,9 +349,9 @@ def test_reads_loops_each_call_without_presenting():
     probe.step()
     assert badge.presents == presents, "a reads loop presented"
     reads = probe.results()["reads"]
-    assert list(reads) == ["loop", "read", "sample", "listen", "transfer",
+    assert list(reads) == ["loop", "read", "sample", "transfer",
                            "transfer_timed", "detail"]
-    assert reads["detail"]["light"] == 48
+    assert reads["detail"]["exact"] is False
     for name, us in zip(reads, badge.read_us):
         entry = reads[name]
         # Each is fast enough to make every call inside READ_MS.
@@ -334,7 +370,7 @@ def test_a_slow_loop_stops_at_read_ms():
     assert reads["read"]["calls"] == P.READ_MS
     # A pass is counted once it ends, so the last one may run past.
     assert reads["sample"]["calls"] == P.READ_MS * 1000 // 2500
-    assert reads["listen"]["calls"] == -(-P.READ_MS * 1000 // 3000)
+    assert reads["transfer"]["calls"] == -(-P.READ_MS * 1000 // 3000)
 
 
 def test_a_stall_in_a_reads_loop_shows_as_its_max():
@@ -343,14 +379,14 @@ def test_a_stall_in_a_reads_loop_shows_as_its_max():
     passes = [0]
 
     def listen():
-        # A collection every 100th pass, as the slot receiver's lists grow.
+        # A collection every 100th pass.
         passes[0] += 1
         badge.clock.advance(40000 if passes[0] % 100 == 0 else 150)
-    hooks.reads = (("listen", listen),)
+    hooks.reads = (("transfer", listen),)
     probe = P.FrameProbe(hooks)
     run_until(probe, "reads")
     probe.step()
-    listen = probe.results()["reads"]["listen"]
+    listen = probe.results()["reads"]["transfer"]
     assert listen["max_us"] == 40000
     assert listen["mean_us"] > 150 and listen["sd_us"] > 0
 
@@ -394,7 +430,7 @@ def test_fast_reads_summarise_each_capture_and_record_a_failing_one():
     assert fast["dma_500k"] == viper
     assert fast["dma_100k"] == {
         "error": "AttributeError: 'module' object has no attribute 'DMA'"}
-    assert probe.step_name == "alloc"
+    assert probe.step_name == "ring"
 
 
 def test_fast_stats_stops_averaging_where_too_few_groups_are_left():
@@ -569,7 +605,7 @@ def test_flicker_filter_times_each_part_on_a_room_it_fits():
     hooks = badge.hooks()
     out = P.filter_costs(hooks.flicker_filter, badge.clock)
     assert out["verdict"] == "flicker", out
-    assert out["samples"] == 66 and out["follower_samples"] == 33
+    assert out["samples"] == 80 and out["follower_samples"] == 50
     assert out["fit_first_us"] == 3000 and out["correct_first_us"] == 40
     assert out["fit"]["calls"] == out["fit_follower"]["calls"] == 3
     assert out["fit"]["mean_us"] == 3000.0
@@ -605,7 +641,7 @@ def test_the_synthetic_room_is_the_same_every_run():
     a = P.filter_room(1000, 20)
     b = P.filter_room(1000, 20)
     assert a == b
-    assert {a[0][k + 1] - a[0][k] for k in range(19)} == {3000}
+    assert {a[0][k + 1] - a[0][k] for k in range(19)} == {2000}
     assert set(a[2]) == {2000}
 
 
@@ -626,3 +662,17 @@ def test_probe_avoids_what_micropython_lacks():
                 "** unpacking at line %d" % node.lineno
         if isinstance(node, ast.Constant) and isinstance(node.value, str):
             assert "%r" not in node.value, "%%r at line %d" % node.lineno
+
+
+def test_the_ring_step_runs_the_exact_listener_quiet_and_presenting():
+    probe, _ = run_all(Badge())
+    ring = probe.results()["ring"]
+    for name in ("quiet", "presenting"):
+        out = ring[name]
+        assert "error" not in out, out
+        assert out["rung_ms"] == 8
+        assert out["slots"] > 0 and out["slot_work"]["calls"] > 0, out
+        assert 45000 <= out["rate_hz"] <= 55000, out
+        assert out["fifo_over"] == 0 and out["faults"] == 0
+        assert abs(out["gc_ms"] - 40.0) < 0.1 and out["gc_overran"] is False
+        assert "garbage_per_slot" in out and "kernel_us_per_1000" in out

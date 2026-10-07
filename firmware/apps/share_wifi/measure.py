@@ -12,12 +12,22 @@ frame:
     run = MirrorRun(light=badge.light_level, ticks_us=time.ticks_us)
     # or SecondBadgeRun(first, light=badge.light_level, ticks_us=time.ticks_us)
     run.begin(time.ticks_ms())
-    while not run.done:
+    while not run.done:                 # one update() of run(update)
         run.frame(time.ticks_ms(), badge.ticks_delta)   # takes this frame's reads
-        draw run.pixels in the edge bands, display.backlight(run.backlight)
-        present_us = time.ticks_us()
-        present the frame
-        run.presented(present_us)                       # the settle capture, if due
+        fill the screen with run.pixels
+        if run.change_due:              # a backlight step, set inside its capture
+            run.changed(lambda: display.backlight(run.backlight))
+        else:
+            display.backlight(run.backlight)
+            if run.loopback_due:
+                run.loopback(display.backlight)
+            elif run.ring_due:
+                run.ring_test(reader, note, display.backlight)
+            elif run.capture_due:       # present now, then read the settle
+                present_us = time.ticks_us()
+                display.update()
+                run.presented(present_us, time.ticks_us())
+        # run() presents every other frame
     condition = run.results()
 
 and when a whole run (both conditions) is over:
@@ -25,31 +35,103 @@ and when a whole run (both conditions) is over:
     file_obj = merge_results(State-loaded object, TOOL_MIRROR,
                              tool_result(dark, lit))
 
-`frame()` returns the kind of read it took (READ_NONE, READ_SAMPLE or
-READ_BURST) so the app can show the live level. `presented()` may block for up
-to CAPTURE_MS + CAPTURE_LEAD_MS reading continuously: that is the settle test,
-and it is why it is called after the present rather than inside `frame()`.
+`changed()`, `loopback()`, `ring_test()` and `presented()` each block while
+they read: that is why they are separate calls rather than inside `frame()`.
 """
 
 import math
 import time
 
-# Absolute first, as in __init__.py: the launcher puts the app folder on
-# sys.path, so the protocol is a plain top-level module there.
-try:
-    from protocol import (
-        BACKLIGHT_EDGE_LAG_MS, BACKLIGHT_GUARD_PERCENT, BACKLIGHT_TX_MS,
-        FINE_MS, HIGH, LCD_SETTLE_MS, LEVEL_SCHEMES, LOW, MID, MIN_GAP,
-        MID_FIELD_RGB, SCHEME_BACKLIGHT, SCHEME_FIELDS, SENSOR_STEP,
-        SLOT_LADDER, Levels, SlotClock, SlotReceiver,
-    )
-except ImportError:
-    from .protocol import (
-        BACKLIGHT_EDGE_LAG_MS, BACKLIGHT_GUARD_PERCENT, BACKLIGHT_TX_MS,
-        FINE_MS, HIGH, LCD_SETTLE_MS, LEVEL_SCHEMES, LOW, MID, MIN_GAP,
-        MID_FIELD_RGB, SCHEME_BACKLIGHT, SCHEME_FIELDS, SENSOR_STEP,
-        SLOT_LADDER, Levels, SlotClock, SlotReceiver,
-    )
+from protocol import (
+    BACKLIGHT_EDGE_LAG_MS, BACKLIGHT_GUARD_PERCENT, BACKLIGHT_TX_MS,
+    END_GUARD_PERCENT, FINE_MS, HIGH, LCD_SETTLE_MS, LEVEL_SCHEMES,
+    LIT_BLACK_COUNTS, LOW, MID, MID_FIELD_RGB, MIN_GAP, SCHEME_BACKLIGHT,
+    SCHEME_FIELDS, SENSOR_STEP, SLOT_LADDER, Levels, SlotClock, Transfer,
+    _insert_sorted,
+)
+
+# --- Dev Mode's slot receiver ------------------------------------------------
+# The receiver the transfer ran before 2026-10-07, kept as Dev Mode's own
+# instrument: `loopback` and the 2nd-badge `eye` decide their slots with it,
+# so their results compare with every run taken before the ring. A transfer
+# now decides slots with Transfer.window_value(); see "Reading" in the
+# protocol.
+#
+# It collects samples for the slot in progress and decides it from the back of the
+# slot, once the peer's panel has settled and the pipeline has caught up.
+#
+# Each sample goes into a preallocated buffer kept sorted as it fills, so the
+# median is an index and a continuous receiver -- dozens of samples a slot --
+# allocates nothing per sample. A slot holds at most SLOT_SAMPLES; past that
+# its samples stop counting.
+SLOT_SAMPLES = 128
+
+
+class SlotReceiver:
+    def __init__(self, clock, levels, frame_ms=0, guard_percent=0):
+        self.clock = clock
+        self.levels = levels
+        # The peer's transmit granularity: a frame for one that presents
+        # every symbol, a few ms for a continuous one on the backlight. Sizes
+        # the end-of-slot guard, which is also at least `guard_percent` of
+        # the slot.
+        self.frame_ms = frame_ms
+        self.guard_percent = guard_percent
+        self.current = -1
+        self.settled = [0] * SLOT_SAMPLES
+        self.all = [0] * SLOT_SAMPLES
+        self.n_settled = 0
+        self.n_all = 0
+
+    def clear(self):
+        self.n_settled = 0
+        self.n_all = 0
+
+    def decide(self):
+        # Prefer settled samples, but never drop a slot for want of one. At the
+        # fastest rungs a slot is barely three frames long and the window can
+        # catch none of them; dropping the symbol desynchronises every symbol
+        # after it, which is far worse than deciding from an early sample.
+        if self.n_settled:
+            return self.levels.classify(self.settled[self.n_settled // 2])
+        if self.n_all:
+            return self.levels.classify(self.all[self.n_all // 2])
+        return self.levels.last     # keep the stream aligned, let CRC judge
+
+    def feed(self, now, value):
+        number = self.clock.number(now)
+        decided = None
+        if number != self.current:
+            if self.current >= 0:
+                decided = self.decide()
+            self.current = number
+            self.clear()
+
+        if self.n_all < SLOT_SAMPLES:
+            _insert_sorted(self.all, self.n_all, value)
+            self.n_all += 1
+
+        # The second half, not the middle: everything that delays a symbol
+        # happens at the start of a slot, so the back half is the only part
+        # guaranteed to hold this symbol rather than the last one.
+        #
+        # And not the very end of it, which can hold the NEXT symbol: see
+        # END_GUARD_PERCENT. At 50ms with 11ms frames the back half holds two
+        # or three samples, the median of two is the higher, and one sample of
+        # a brighter next symbol was enough to flip a bit. The guard never
+        # leaves the window shorter than a frame, or it could catch nothing.
+        offset = self.clock.offset(now)
+        duration = self.clock.duration
+        guard = min(self.frame_ms * END_GUARD_PERCENT // 100,
+                    duration // 2 - self.frame_ms * 6 // 5)
+        guard = max(guard, duration * self.guard_percent // 100)
+        if (duration // 2 <= offset
+                < duration - max(0, guard)
+                and self.n_settled < SLOT_SAMPLES):
+            _insert_sorted(self.settled, self.n_settled, value)
+            self.n_settled += 1
+        return decided
+
 
 # The two tools, named as their keys in the measurements file.
 TOOL_MIRROR = "mirror"
@@ -60,16 +142,16 @@ TOOL_SECOND_BADGE = "second_badge"
 # up. The schedule is a plain list of them, so a transmitter can show it on a
 # fixed timeline and a receiver can know, from the same list, when to read.
 
-# A step's `read`, and -- for the first three -- what frame() reports it took.
+# A step's `read`.
 READ_NONE = 0
 READ_SAMPLES = 1    # one light_level() a frame, summarised by their median
-READ_SAMPLE = READ_SAMPLES
 READ_BURST = 2      # N light_level()s back to back within one frame
 READ_CAPTURE = 3    # read continuously, timestamped, after the transition
 READ_SYMBOLS = 4    # one a frame, decided into symbol-error slots
 READ_AVERAGE = 5    # a burst a frame, its means at each averaging depth
 READ_EYE = 6        # a burst a frame, binned by phase into an eye diagram
 READ_LOOPBACK = 7   # send a block on the backlight and read it back, blocking
+READ_RING = 8       # a test through the DMA ring, blocking: see ring_test()
 
 # Reads this close to either end of a held step are left out. The start is the
 # panel settling and, in 2nd-badge mode, the receiver's timeline being a frame
@@ -197,11 +279,11 @@ SYMBOL_BLOCK = LOW * SYNC_LEAD_SLOTS + HIGH + DE_BRUIJN
 # --- loopback: the continuous receiver, against the mirror -------------------
 # Mirror only. The badge sends SYMBOL_BLOCK on the backlight -- white pixels
 # throughout, so no present -- and reads its own reflection in the same tight
-# loop, decoding it as a transfer now does: readings pooled into FINE_MS
-# samples, locked on the sync symbol's edge less BACKLIGHT_EDGE_LAG_MS, each
-# slot decided by the protocol's SlotReceiver with the backlight's guard. It
-# is the whole continuous path on hardware with no second badge, at rungs down
-# to the backlight scheme's start and past it. And because the badge made the
+# loop, decoding it as a transfer did before the ring: readings pooled into
+# FINE_MS samples, locked on the sync symbol's edge less BACKLIGHT_EDGE_LAG_MS,
+# each slot decided by Dev Mode's SlotReceiver with the backlight's guard. It
+# is that continuous path on hardware with no second badge, at rungs down to
+# the backlight scheme's start and past it. And because the badge made the
 # change itself, it can time the edge delay the protocol has to assume.
 LOOPBACK_RUNGS = (50, 32, 25, 20, 16)
 # And with low off: the backlight scheme's low was 0.0 until the dim low
@@ -230,6 +312,14 @@ class _UsClock:
 
     def offset(self, t):
         return (t - self.epoch) % self.duration
+
+
+def _backlight_duty(low=None, mid=None):
+    """The backlight scheme's duty per symbol, `low` and `mid` in place of
+    its own if given. A new dict every call: never hoist it to a constant."""
+    scheme = LEVEL_SCHEMES[SCHEME_BACKLIGHT]
+    return {LOW: scheme[LOW][1] if low is None else low, HIGH: scheme[HIGH][1],
+            MID: scheme[MID][1] if mid is None else mid}
 
 
 def hold_levels(light, ticks_us, set_backlight, low, mid):
@@ -285,9 +375,7 @@ def loopback_block(rung_ms, levels, light, ticks_us, set_backlight,
     block = SYMBOL_BLOCK
     count = len(block)
     sync = SYNC_LEAD_SLOTS
-    scheme = LEVEL_SCHEMES[SCHEME_BACKLIGHT]
-    duty = {LOW: scheme[LOW][1] if low is None else low, HIGH: 1.0,
-            MID: scheme[MID][1] if mid is None else mid}
+    duty = _backlight_duty(low, mid)
     clock = _UsClock(rung)
     receiver = SlotReceiver(clock, levels, BACKLIGHT_TX_MS * 1000,
                             BACKLIGHT_GUARD_PERCENT)
@@ -348,7 +436,7 @@ def loopback_block(rung_ms, levels, light, ticks_us, set_backlight,
             lit_t, lit_v = ft, fv
             continue
         # A second lit sample: the edge is real. Timed at the first's
-        # crossing of T_low, as the protocol's phase lock times it.
+        # crossing of T_low, as the protocol's phase lock timed it then.
         span = lit_v - dark_v
         crossing = lit_t
         if span > 0:
@@ -369,6 +457,214 @@ def loopback_block(rung_ms, levels, light, ticks_us, set_backlight,
         out["lag_ms"] = round((crossing - sync_set) / 1000.0, 2)
     out["reads_per_s"] = round(reads * 1000000.0 / end)
     return out
+
+# --- the DMA ring on the mirror (Dev Mode M4, M5) ---------------------------
+# Both run through the badge's EXACT reader (reader.RingReader over
+# fastadc.Ring), which the app hands in started-and-stopped here: nothing
+# else may touch the ADC while it runs, so the run's temperature is read on
+# the frame the test begins, before, never during.
+#
+# backlight_step_ring (M4): every transition the backlight scheme makes,
+# from the display.backlight() call, read at the ring's 20 us: 10/50/90%
+# times and when a rise crosses T_low. Settles SETTLE_DARK_US and
+# SETTLE_LIT_US, GUARD_DARK_US (a rise to the middle against one to high),
+# and EDGE_LAG_*_US; `tx_late_us` is how long the call itself takes.
+#
+# loopback_ring (M5): a symbol block sent on the badge's own backlight at
+# the transfer loop's timing and decided by the protocol's own data phase --
+# SlotWindow, the rise lock -- at every rung in RING_LOOP_RUNGS. Settles
+# which rungs go on the ladder and where EXACT pairs start.
+RING_STEP_TRANSITIONS = 10
+RING_STEP_HOLD_MS = 120
+RING_STEP_LEAD_US = 2000
+RING_STEP_AFTER_US = 20000
+RING_STEP_BIN_US = 100
+RING_STEP_KINDS = (("rise", LOW, HIGH), ("mid_rise", LOW, MID),
+                   ("fall", HIGH, LOW), ("mid_fall", MID, LOW),
+                   ("mid_high", MID, HIGH), ("high_mid", HIGH, MID))
+RING_LOOP_RUNGS = (16, 13, 10, 8, 6)
+RING_BLOCK = LOW * SYNC_LEAD_SLOTS + HIGH + DE_BRUIJN * 3
+RING_LOOP_LEAD_MS = 30
+RING_LEVEL_MS = 150
+# The two tests' steps: long enough for the whole test, and a margin.
+RING_STEP_MS = (3 * RING_LEVEL_MS + len(RING_STEP_KINDS) * RING_STEP_TRANSITIONS
+                * (RING_STEP_HOLD_MS + RING_STEP_AFTER_US // 1000 + 2)
+                + 2 * LOOPBACK_MARGIN_MS)
+RING_LOOP_MS = (3 * RING_LEVEL_MS
+                + sum((len(RING_BLOCK) + 3) * rung + RING_LOOP_LEAD_MS
+                      for rung in RING_LOOP_RUNGS)
+                + 2 * LOOPBACK_MARGIN_MS)
+
+
+def ring_levels(reader, set_backlight, duty):
+    """The backlight scheme's three levels, through the ring: each held
+    RING_LEVEL_MS and its back half's mean taken. (low, mid, high)."""
+    out = []
+    for symbol in (LOW, MID, HIGH):
+        set_backlight(duty[symbol])
+        start = reader.now_us()
+        reader.pump(start + RING_LEVEL_MS * 1000 + 500)
+        out.append(reader.mean(start + RING_LEVEL_MS * 500,
+                               start + RING_LEVEL_MS * 1000))
+    set_backlight(duty[LOW])
+    return out[0], out[1], out[2]
+
+
+def _curve_crossing(curve, start, level, rising):
+    """The first bin from `start` at or past `level`, interpolated, in bins;
+    None if none."""
+    for b in range(max(1, start), len(curve)):
+        v = curve[b]
+        if v < 0:
+            continue
+        if (v >= level) if rising else (v <= level):
+            a = curve[b - 1]
+            if a < 0 or a == v:
+                return float(b)
+            return b - 1 + (level - a) / float(v - a)
+    return None
+
+
+def backlight_step_ring(reader, set_backlight):
+    """Dev Mode M4: see above. Blocks for ~10 s."""
+    duty = _backlight_duty()
+    bins = (RING_STEP_LEAD_US + RING_STEP_AFTER_US) // RING_STEP_BIN_US
+    lead = RING_STEP_LEAD_US // RING_STEP_BIN_US
+    curve = [0] * bins
+    part = [0] * 32
+    reader.start()
+    try:
+        low, mid, high = ring_levels(reader, set_backlight, duty)
+        if min(low, mid, high) < 0:
+            return {"error": "no readings"}
+        out = {"levels": [low, mid, high]}
+        t_low = (low + mid) // 2
+        late = []
+        for name, first, second in RING_STEP_KINDS:
+            found = {"t10_ms": [], "t50_ms": [], "t90_ms": [], "tlow_ms": []}
+            for _ in range(RING_STEP_TRANSITIONS):
+                set_backlight(duty[first])
+                reader.pump(reader.now_us() + RING_STEP_HOLD_MS * 1000)
+                call = reader.now_us()
+                set_backlight(duty[second])
+                late.append(reader.now_us() - call)
+                reader.pump(call + RING_STEP_AFTER_US + 500)
+                origin = call - RING_STEP_LEAD_US
+                for b0 in range(0, bins, 32):
+                    n = min(32, bins - b0)
+                    reader.parts(origin + b0 * RING_STEP_BIN_US,
+                                 origin + (b0 + n) * RING_STEP_BIN_US, n, part)
+                    for i in range(n):
+                        curve[b0 + i] = part[i]
+                initial = [v for v in curve[:lead] if v >= 0]
+                final = [v for v in curve[-lead:] if v >= 0]
+                if not initial or not final:
+                    continue
+                v0 = sum(initial) / len(initial)
+                v1 = sum(final) / len(final)
+                if abs(v1 - v0) < SENSOR_STEP:
+                    continue
+                rising = v1 > v0
+                targets = [("t10_ms", v0 + 0.1 * (v1 - v0)),
+                           ("t50_ms", v0 + 0.5 * (v1 - v0)),
+                           ("t90_ms", v0 + 0.9 * (v1 - v0))]
+                if rising and first == LOW:
+                    targets.append(("tlow_ms", t_low))
+                for key, level in targets:
+                    b = _curve_crossing(curve, lead, level, rising)
+                    if b is not None:
+                        found[key].append((b - lead) * RING_STEP_BIN_US
+                                          / 1000.0)
+            result = {"count": len(found["t50_ms"])}
+            for key in found:
+                if found[key]:
+                    result[key] = round(sum(found[key]) / len(found[key]), 2)
+            out[name] = result
+        if late:
+            out["tx_late_us"] = {"mean": sum(late) // len(late),
+                                 "max": max(late)}
+        return out
+    finally:
+        reader.stop()
+        set_backlight(duty[LOW])
+
+
+def _ring_loop_block(reader, set_backlight, levels, lit, rung, duty):
+    """RING_BLOCK at `rung` ms through a listening Transfer's data phase."""
+    transfer = Transfer(False, reader=reader)
+    transfer.levels = levels
+    transfer.lit = lit
+    transfer.scheme = SCHEME_BACKLIGHT
+    duration = rung * 1000
+    start = reader.now_us() + RING_LOOP_LEAD_MS * 1000
+    transfer.start_data(start // 1000, 0)
+    transfer.clock.duration = duration
+    transfer.clock.epoch = start
+    transfer.lit_end = start
+    transfer.set_window()
+    decided = []
+    lags = []
+
+    def heard():
+        decided.append(transfer.rx[-1])
+
+    def rebase(boundary, crossing):
+        sent = start + (crossing - start) // duration * duration
+        lags.append(crossing - sent)
+        Transfer.rebase(transfer, boundary, crossing)
+
+    transfer.follower_rx = heard
+    transfer.rebase = rebase
+    late = []
+    count = len(RING_BLOCK)
+    for j in range(count + 2):
+        boundary = start + j * duration
+        reader.pump(boundary)
+        symbol = RING_BLOCK[j] if j < count else LOW
+        set_backlight(duty[symbol])
+        late.append(reader.now_us() - boundary)
+        transfer.work(reader.now_us())
+        transfer.idle_slots = 0
+        transfer.stall_slots = 0
+    reader.pump(start + (count + 2) * duration + transfer.w_close)
+    transfer.work(reader.now_us())
+    try:
+        first = decided.index(HIGH)
+    except ValueError:
+        return {"error": "no sync symbol"}
+    expected = DE_BRUIJN * 3
+    out = {"symbols": len(expected),
+           "errors": count_symbol_errors(decided[first + 1:], expected),
+           "locks": len(lags),
+           "tx_late_us": {"mean": sum(late) // len(late), "max": max(late)},
+           "parts": transfer.w_parts}
+    if lags:
+        out["lag_us"] = {"min": min(lags), "mean": sum(lags) // len(lags),
+                         "max": max(lags)}
+    return out
+
+
+def loopback_ring(reader, set_backlight):
+    """Dev Mode M5: see above. Blocks for ~5 s."""
+    duty = _backlight_duty()
+    reader.start()
+    try:
+        low, mid, high = ring_levels(reader, set_backlight, duty)
+        if min(low, mid, high) < 0 or mid - low < MIN_GAP \
+                or high - mid < MIN_GAP:
+            return {"error": "levels too close", "levels": [low, mid, high]}
+        levels = Levels()
+        levels.fit(low, mid, high)
+        lit = low >= LIT_BLACK_COUNTS
+        out = {"levels": [low, mid, high], "lit": lit}
+        for rung in RING_LOOP_RUNGS:
+            out[str(rung)] = _ring_loop_block(reader, set_backlight, levels,
+                                              lit, rung, duty)
+        return out
+    finally:
+        reader.stop()
+        set_backlight(duty[LOW])
+
 
 # --- averaging: does reading more often buy resolution? ---------------------
 # Each fields level held AVERAGE_MS. Every frame inside the guard window the
@@ -461,6 +757,25 @@ def curve_key(tenths):
     return "%d.%d" % (tenths // 10, tenths % 10)
 
 
+def _hold(steps, test, key, field, ms):
+    """A field held `ms`, read once a frame."""
+    steps.append(Step(test, key, field, ms, READ_SAMPLES, MAX_STEP_SAMPLES))
+
+
+def _transitions(steps, test, off, on, mid, count):
+    """A start on `off`, `count` on/off pairs -- a rise and a fall each --
+    then `count` mids with `off` between. The `off` after a mid is a
+    transition nobody asked for, so it is not captured."""
+    steps.append(Step(test, None, off, SETTLE_GAP_MS))
+    for _ in range(count):
+        steps.append(Step(test, "rise", on, SETTLE_GAP_MS, READ_CAPTURE))
+        steps.append(Step(test, "fall", off, SETTLE_GAP_MS, READ_CAPTURE))
+    for i in range(count):
+        if i:
+            steps.append(Step(test, None, off, SETTLE_GAP_MS))
+        steps.append(Step(test, "mid_rise", mid, SETTLE_GAP_MS, READ_CAPTURE))
+
+
 def build_schedule(tool):
     """Every step of one condition, in the order of the spec's table."""
     steps = [Step("ambient", "ambient", BLACK_OFF, AMBIENT_MS, READ_SAMPLES,
@@ -470,63 +785,35 @@ def build_schedule(tool):
     # every reading and from the levels' reads respectively.
     for scheme in (SCHEME_FIELDS, SCHEME_BACKLIGHT):
         for symbol, name in LEVEL_NAMES:
-            steps.append(Step("levels", (scheme, name),
-                              LEVEL_SCHEMES[scheme][symbol], LEVEL_MS,
-                              READ_SAMPLES, MAX_STEP_SAMPLES))
+            _hold(steps, "levels", (scheme, name),
+                  LEVEL_SCHEMES[scheme][symbol], LEVEL_MS)
 
     for percent in RAMP_PERCENTS:
         value = ramp_value(percent)
-        steps.append(Step("gamma_ramp", str(percent),
-                          ((value, value, value), 1.0), RAMP_MS,
-                          READ_SAMPLES, MAX_STEP_SAMPLES))
+        _hold(steps, "gamma_ramp", str(percent), ((value, value, value), 1.0),
+              RAMP_MS)
 
     for tenths in range(CURVE_TENTHS):
-        steps.append(Step("backlight_curve", curve_key(tenths),
-                          ("white", tenths / 10), CURVE_MS,
-                          READ_SAMPLES, MAX_STEP_SAMPLES))
+        _hold(steps, "backlight_curve", curve_key(tenths),
+              ("white", tenths / 10), CURVE_MS)
 
-    steps.append(Step("bleed", "black_on", BLACK_FULL, BLEED_MS,
-                      READ_SAMPLES, MAX_STEP_SAMPLES))
-    steps.append(Step("bleed", "black_off", BLACK_OFF, BLEED_MS,
-                      READ_SAMPLES, MAX_STEP_SAMPLES))
+    _hold(steps, "bleed", "black_on", BLACK_FULL, BLEED_MS)
+    _hold(steps, "bleed", "black_off", BLACK_OFF, BLEED_MS)
 
     for key, backlight in FLICKER_BACKLIGHTS:
         steps.append(Step("flicker", key, ("white", backlight), FLICKER_MS,
                           READ_BURST, FLICKER_READS))
 
     # Settle: a black to start from (the backlight was just off, so this edge
-    # is not a white-to-black one), then ten white/black pairs -- a rise and a
-    # fall each -- then ten middles with black between. The black after a
-    # middle is a transition nobody asked for, so it is not captured.
-    mid = (MID_FIELD_RGB, 1.0)
-    steps.append(Step("settle", None, BLACK_FULL, SETTLE_GAP_MS))
-    for _ in range(SETTLE_TRANSITIONS):
-        steps.append(Step("settle", "rise", WHITE_FULL, SETTLE_GAP_MS,
-                          READ_CAPTURE))
-        steps.append(Step("settle", "fall", BLACK_FULL, SETTLE_GAP_MS,
-                          READ_CAPTURE))
-    for i in range(SETTLE_TRANSITIONS):
-        if i:
-            steps.append(Step("settle", None, BLACK_FULL, SETTLE_GAP_MS))
-        steps.append(Step("settle", "mid_rise", mid, SETTLE_GAP_MS,
-                          READ_CAPTURE))
-
+    # is not a white-to-black one), then the three transitions.
+    _transitions(steps, "settle", BLACK_FULL, WHITE_FULL,
+                 (MID_FIELD_RGB, 1.0), SETTLE_TRANSITIONS)
     # Backlight step: the same three transitions, made by the backlight alone
     # on white pixels. The first hold puts the white up with the backlight off,
     # which is the one pixel change in it.
-    bl_mid = LEVEL_SCHEMES[SCHEME_BACKLIGHT][MID]
-    steps.append(Step("backlight_step", None, WHITE_OFF, SETTLE_GAP_MS))
-    for _ in range(BACKLIGHT_STEP_TRANSITIONS):
-        steps.append(Step("backlight_step", "rise", WHITE_FULL, SETTLE_GAP_MS,
-                          READ_CAPTURE))
-        steps.append(Step("backlight_step", "fall", WHITE_OFF, SETTLE_GAP_MS,
-                          READ_CAPTURE))
-    for i in range(BACKLIGHT_STEP_TRANSITIONS):
-        if i:
-            steps.append(Step("backlight_step", None, WHITE_OFF,
-                              SETTLE_GAP_MS))
-        steps.append(Step("backlight_step", "mid_rise", bl_mid, SETTLE_GAP_MS,
-                          READ_CAPTURE))
+    _transitions(steps, "backlight_step", WHITE_OFF, WHITE_FULL,
+                 LEVEL_SCHEMES[SCHEME_BACKLIGHT][MID],
+                 BACKLIGHT_STEP_TRANSITIONS)
 
     if tool == TOOL_MIRROR:
         # White, the backlight off: the lead-in. Every step since the
@@ -541,6 +828,12 @@ def build_schedule(tool):
                               3 * DIM_HOLD_MS + (len(SYMBOL_BLOCK) + 1) * rung
                               + LOOPBACK_MARGIN_MS,
                               READ_LOOPBACK, slot_ms=rung))
+        # The DMA ring (M4, M5): each a single step that blocks for its
+        # whole test; the step's time covers it, with a margin.
+        steps.append(Step("backlight_step_ring", None, WHITE_OFF,
+                          RING_STEP_MS, READ_RING))
+        steps.append(Step("loopback_ring", None, WHITE_OFF, RING_LOOP_MS,
+                          READ_RING))
 
     if tool == TOOL_SECOND_BADGE:
         for scheme in (SCHEME_FIELDS, SCHEME_BACKLIGHT):
@@ -563,10 +856,7 @@ def build_schedule(tool):
 
 
 def schedule_ms(steps):
-    total = 0
-    for step in steps:
-        total += step.ms
-    return total
+    return sum(step.ms for step in steps)
 
 
 def step_starts(steps):
@@ -587,7 +877,8 @@ SECOND_BADGE_SCHEDULE_MS = schedule_ms(SECOND_BADGE_SCHEDULE)
 # column's "Dark 4/11" counts in these.
 MIRROR_TESTS = ("ambient", "adc_step", "levels", "noise", "gamma_ramp",
                 "backlight_curve", "bleed", "flicker", "settle",
-                "backlight_step", "loopback", "frame_timing", "edge_latency")
+                "backlight_step", "loopback", "backlight_step_ring",
+                "loopback_ring", "frame_timing", "edge_latency")
 SECOND_BADGE_TESTS = ("ambient", "adc_step", "levels", "noise", "gamma_ramp",
                       "backlight_curve", "bleed", "flicker", "settle",
                       "backlight_step", "frame_timing", "symbol_errors",
@@ -731,13 +1022,8 @@ def peak_to_peak(values, count=None):
         count = len(values)
     if count <= 0:
         return None
-    lo = hi = values[0]
-    for i in range(1, count):
-        if values[i] < lo:
-            lo = values[i]
-        elif values[i] > hi:
-            hi = values[i]
-    return hi - lo
+    window = values[:count]
+    return max(window) - min(window)
 
 
 def sd(values, count=None):
@@ -800,25 +1086,20 @@ def settle_tau(times_us, values, count, step):
     A single-pole panel approaches its final level as |final - v| = A e^(-t/tau),
     so ln|final - v| falls in a straight line of slope -1/tau whatever the
     starting point -- which is why a capture that starts late still measures
-    the right tau. The final level is the median of the capture's last quarter
-    and the starting one the median of its first few reads.
+    the right tau. Its levels and floor are step_levels()'s.
 
     Only the decay itself is fitted: the contiguous run of reads just before
     the residual first falls to the floor, back to where it last stood within
     half a floor of the whole swing. The plateau before the edge and the noise
-    after it would both flatten the slope. The floor is one ADC step, or a
-    sixteenth of the swing on a finer sensor, so the log of a residual of one or
-    two counts never dominates.
+    after it would both flatten the slope.
     """
-    if count < 8:
+    levels = step_levels(values, count, step)
+    if levels is None:
         return None
-    edge = min(CAPTURE_EDGE_SAMPLES, count // 4)
-    initial = median(values, edge)
-    final = median(values[count - count // 4:count])
+    initial, final, floor = levels
+    if not step_moved(initial, final, floor):
+        return None
     swing = abs(final - initial)
-    floor = max(step, swing // 16, 1)
-    if swing < 2 * floor:
-        return None
     upper = swing - floor // 2
 
     stop = count
@@ -896,14 +1177,18 @@ SKIP_FLAT = "flat"          # it moved less than two floors
 SKIP_NO_EDGE = "no_edge"    # it never left its starting level and crossed half way
 SKIP_GAP = "gap"            # its reads either side of half way were too far apart
 SKIP_REASONS = (SKIP_FLAT, SKIP_NO_EDGE, SKIP_GAP)
+# A captured step's direction, as settle and backlight_step key them.
+STEP_KEYS = ("rise", "fall", "mid_rise")
 
 
 def step_levels(values, count, step):
     """(initial, final, floor) of a captured step, or None if too short.
 
-    Levels as settle_tau() takes them: the median of the first reads and of
-    the last quarter. The floor is one ADC step or a sixteenth of the swing.
-    Whether it moved enough is step_moved()'s question.
+    The starting level is the median of the capture's first few reads, the
+    final one the median of its last quarter. The floor is one ADC step, or a
+    sixteenth of the swing on a finer sensor, so the log of a residual of one
+    or two counts never dominates a fit. Whether it moved enough is
+    step_moved()'s question.
     """
     if count < 8:
         return None
@@ -1036,16 +1321,11 @@ class FrameStats:
                 "sd_ms": round(math.sqrt(max(0.0, var)), 1)}
 
 
-def frame_timing(deltas):
-    stats = FrameStats()
-    for delta in deltas:
-        stats.add(delta)
-    return stats.result()
-
-
 def edge_lag(frame_ms):
-    # The protocol's own correction (Transfer.edge_lag): a symbol goes up half
-    # a frame late on average, and T_low is a tenth of the way up the settle.
+    # The pixel scheme's correction as the protocol made it before the ring,
+    # kept so Dev Mode's results compare with earlier runs: a symbol goes up
+    # half a frame late on average, and T_low is a tenth of the way up the
+    # settle.
     return max(1, frame_ms) // 2 + LCD_SETTLE_MS // 10
 
 
@@ -1152,39 +1432,29 @@ class PulseDetector:
 
 # --- symbol errors ----------------------------------------------------------
 
-class SymbolBlock:
-    """Receives one symbol-error block and counts its errors.
-
-    Searches for the sync symbol's rising edge -- the first read at or above
-    T_low after at least a slot and a half of black -- locks a SlotClock to it
-    as the protocol's phase lock does, then decides every slot with the
-    protocol's own SlotReceiver. Slot 0 is the sync; slots 1..29 are the
-    sequence.
-    """
+class _SyncBlock:
+    """What SymbolBlock and EyeBlock share: finding a block's sync edge --
+    the first read at or above T_low after at least a slot and a half of
+    black -- inside a window round where it is due, and ending the block."""
 
     SEARCH = 0
     LOCKED = 1
     DONE = 2
 
     def __init__(self):
-        self.decided = [None] * (len(DE_BRUIJN) + 1)
-        self.clock = SlotClock()
-        self.receiver = None
         self.levels = None
         self.state = self.DONE
         self.error = None
         self.key = None
 
-    def start(self, key, block_start, slot_ms, levels, frame_ms):
-        for i in range(len(self.decided)):
-            self.decided[i] = None
+    @property
+    def active(self):
+        return self.state != self.DONE
+
+    def _arm(self, key, block_start, slot_ms, levels):
         self.key = key
         self.levels = levels
         self.slot_ms = slot_ms
-        self.clock.epoch = block_start
-        self.clock.duration = slot_ms
-        self.clock.index = SLOT_LADDER.index(slot_ms)
-        self.frame_ms = frame_ms
         # Open half way through the lead-in: early enough for a receiver that
         # runs late, after the end of the previous block for one that runs early.
         self.open_at = time.ticks_add(block_start,
@@ -1193,43 +1463,19 @@ class SymbolBlock:
             SYNC_LEAD_SLOTS + 1 + SYNC_LATE_SLOTS))
         self.dark_since = None
         self.have_prev = False
-        self.receiver = None
         self.error = None
         self.state = self.SEARCH
 
-    @property
-    def active(self):
-        return self.state != self.DONE
-
-    def take(self, now, light):
-        """This frame's read, fed in: (the reading, whether the block ended)."""
-        value = light()
-        return value, self.feed(now, value)
-
-    def feed(self, now, value):
-        """One read. True once the block is finished."""
-        if self.state == self.SEARCH:
-            self._search(now, value)
-        elif self.state == self.LOCKED:
-            self._decode(now, value)
-        return self.state == self.DONE
-
-    def _search(self, now, value):
+    def _edge(self, now, value):
+        """The sync edge's T_low crossing if this read is it, else None, the
+        search going on -- or given up, past the window."""
         t_low = self.levels.t_low
         lit = value >= t_low
         if (lit and self.have_prev and self.dark_since is not None
                 and time.ticks_diff(now, self.open_at) >= 0
                 and time.ticks_diff(now, self.dark_since)
                 >= self.slot_ms * 3 // 2):
-            boundary = _crossing(self.prev_t, self.prev_v, now, value, t_low)
-            self.clock.epoch = time.ticks_add(boundary,
-                                              -edge_lag(self.frame_ms))
-            self.receiver = SlotReceiver(self.clock, self.levels,
-                                         self.frame_ms)
-            self.levels.last = HIGH     # the sync symbol is what was just seen
-            self.state = self.LOCKED
-            self._decode(now, value)
-            return
+            return _crossing(self.prev_t, self.prev_v, now, value, t_low)
         if lit:
             self.dark_since = None
         elif self.dark_since is None:
@@ -1240,6 +1486,61 @@ class SymbolBlock:
         if time.ticks_diff(now, self.close_at) > 0:
             self.error = "no sync symbol"
             self.state = self.DONE
+        return None
+
+    def finish(self):
+        """Ends the block now, deciding the slot in progress if it counts."""
+        if self.state == self.SEARCH:
+            self.error = "no sync symbol"
+        elif self.state == self.LOCKED:
+            self._last_slot()
+        self.state = self.DONE
+
+
+class SymbolBlock(_SyncBlock):
+    """Receives one symbol-error block and counts its errors.
+
+    Locks a SlotClock to the sync edge less edge_lag(), as the protocol's
+    phase lock did before the ring, then decides every slot with Dev Mode's
+    SlotReceiver. Slot 0 is the sync; slots 1..29 are the sequence.
+    """
+
+    def __init__(self):
+        _SyncBlock.__init__(self)
+        self.decided = [None] * (len(DE_BRUIJN) + 1)
+        self.clock = SlotClock()
+        self.receiver = None
+
+    def start(self, key, block_start, slot_ms, levels, frame_ms):
+        for i in range(len(self.decided)):
+            self.decided[i] = None
+        self.clock.epoch = block_start
+        self.clock.duration = slot_ms
+        self.clock.index = SLOT_LADDER.index(slot_ms)
+        self.frame_ms = frame_ms
+        self.receiver = None
+        self._arm(key, block_start, slot_ms, levels)
+
+    def take(self, now, light):
+        """This frame's read, fed in: (the reading, whether the block ended)."""
+        value = light()
+        return value, self.feed(now, value)
+
+    def feed(self, now, value):
+        """One read. True once the block is finished."""
+        if self.state == self.SEARCH:
+            edge = self._edge(now, value)
+            if edge is not None:
+                self.clock.epoch = time.ticks_add(edge,
+                                                  -edge_lag(self.frame_ms))
+                self.receiver = SlotReceiver(self.clock, self.levels,
+                                             self.frame_ms)
+                self.levels.last = HIGH     # the sync symbol was just seen
+                self.state = self.LOCKED
+                self._decode(now, value)
+        elif self.state == self.LOCKED:
+            self._decode(now, value)
+        return self.state == self.DONE
 
     def _decode(self, now, value):
         receiver = self.receiver
@@ -1250,15 +1551,10 @@ class SymbolBlock:
         if receiver.current >= len(self.decided):
             self.state = self.DONE
 
-    def finish(self):
-        """Ends the block now, deciding the slot in progress if it counts."""
-        if self.state == self.SEARCH:
-            self.error = "no sync symbol"
-        elif self.state == self.LOCKED:
-            current = self.receiver.current
-            if 0 < current < len(self.decided) and self.decided[current] is None:
-                self.decided[current] = self.receiver.decide()
-        self.state = self.DONE
+    def _last_slot(self):
+        current = self.receiver.current
+        if 0 < current < len(self.decided) and self.decided[current] is None:
+            self.decided[current] = self.receiver.decide()
 
     def result(self):
         if self.error is not None:
@@ -1267,7 +1563,7 @@ class SymbolBlock:
                 "errors": count_symbol_errors(self.decided[1:], DE_BRUIJN)}
 
 
-class EyeBlock:
+class EyeBlock(_SyncBlock):
     """Receives one eye-diagram block: its eye, and its errors at two depths.
 
     Finds the sync symbol's rising edge as SymbolBlock does, but takes that
@@ -1276,11 +1572,8 @@ class EyeBlock:
     frame: every buffer is sized for the longest sequence at start.
     """
 
-    SEARCH = 0
-    LOCKED = 1
-    DONE = 2
-
     def __init__(self):
+        _SyncBlock.__init__(self)
         longest = max(len(DE_BRUIJN), len(DE_BRUIJN_2))
         self.decided_1 = [None] * longest
         self.decided_avg = [None] * longest
@@ -1289,14 +1582,8 @@ class EyeBlock:
         self.lo = [0.0] * (3 * EYE_BINS)
         self.hi = [0.0] * (3 * EYE_BINS)
         self.seen = [0] * (3 * EYE_BINS)
-        self.state = self.DONE
-        self.error = None
-        self.key = None
 
     def start(self, key, block_start, slot_ms, levels, sequence):
-        self.key = key
-        self.levels = levels
-        self.slot_ms = slot_ms
         self.sequence = sequence
         self.alphabet = [s for s in (LOW, MID, HIGH) if s in sequence]
         for i in range(len(self.decided_1)):
@@ -1304,21 +1591,10 @@ class EyeBlock:
             self.decided_avg[i] = None
         for i in range(len(self.seen)):
             self.seen[i] = 0
-        self.open_at = time.ticks_add(block_start,
-                                      slot_ms * (SYNC_LEAD_SLOTS // 2))
-        self.close_at = time.ticks_add(block_start, slot_ms * (
-            SYNC_LEAD_SLOTS + 1 + SYNC_LATE_SLOTS))
-        self.dark_since = None
-        self.have_prev = False
         self.edge = 0
         self.slot = 0
         self.n = 0
-        self.error = None
-        self.state = self.SEARCH
-
-    @property
-    def active(self):
-        return self.state != self.DONE
+        self._arm(key, block_start, slot_ms, levels)
 
     def take(self, now, light):
         """EYE_READS readings: (the first, whether the block ended)."""
@@ -1330,34 +1606,16 @@ class EyeBlock:
 
     def feed(self, now, value, mean):
         if self.state == self.SEARCH:
-            self._search(now, value, mean)
+            edge = self._edge(now, value)
+            if edge is not None:
+                self.edge = edge
+                self.slot = 0
+                self.n = 0
+                self.state = self.LOCKED
+                self._decode(now, value, mean)
         elif self.state == self.LOCKED:
             self._decode(now, value, mean)
         return self.state == self.DONE
-
-    def _search(self, now, value, mean):
-        t_low = self.levels.t_low
-        lit = value >= t_low
-        if (lit and self.have_prev and self.dark_since is not None
-                and time.ticks_diff(now, self.open_at) >= 0
-                and time.ticks_diff(now, self.dark_since)
-                >= self.slot_ms * 3 // 2):
-            self.edge = _crossing(self.prev_t, self.prev_v, now, value, t_low)
-            self.slot = 0
-            self.n = 0
-            self.state = self.LOCKED
-            self._decode(now, value, mean)
-            return
-        if lit:
-            self.dark_since = None
-        elif self.dark_since is None:
-            self.dark_since = now
-        self.prev_t = now
-        self.prev_v = value
-        self.have_prev = True
-        if time.ticks_diff(now, self.close_at) > 0:
-            self.error = "no sync symbol"
-            self.state = self.DONE
 
     def _decode(self, now, value, mean):
         elapsed = time.ticks_diff(now, self.edge)
@@ -1403,12 +1661,7 @@ class EyeBlock:
             return MID
         return HIGH
 
-    def finish(self):
-        if self.state == self.SEARCH:
-            self.error = "no sync symbol"
-        elif self.state == self.LOCKED:
-            self._decide()
-        self.state = self.DONE
+    _last_slot = _decide
 
     def openings(self):
         """Per phase bin, the narrowest gap between adjacent levels' averaged
@@ -1456,6 +1709,26 @@ def count_symbol_errors(decided, expected):
     return errors
 
 
+def _pick(found, keys):
+    """Each of `keys`' results, or why there is none."""
+    out = {}
+    for key in keys:
+        out[key] = found.get(key, {"error": "not run"})
+    return out
+
+
+def _by_rung(found, names, rungs):
+    """Results kept by (name, rung), as {name: {rung: result}}."""
+    out = {}
+    for name in names:
+        entry = {}
+        for rung in rungs:
+            entry[str(rung)] = found.get((name, rung),
+                                         {"error": "not received"})
+        out[name] = entry
+    return out
+
+
 # --- the recorder -----------------------------------------------------------
 
 class Recorder:
@@ -1490,6 +1763,10 @@ class Recorder:
         self.avg_n = [0] * depths
         self.avg_mean = [0.0] * depths
         self.avg_m2 = [0.0] * depths
+        # backlight_step: per direction, the averaged curve's bins. Built
+        # once here; start() zeroes them.
+        self.bl_sums = {key: [0.0] * CURVE_BINS for key in STEP_KEYS}
+        self.bl_counts = {key: [0] * CURVE_BINS for key in STEP_KEYS}
         self.start(0)
 
     def start(self, epoch):
@@ -1505,32 +1782,27 @@ class Recorder:
         self.gcd = 0
         self.summary = {}       # (test, key) -> (median, p2p, sd) or None
         self.bursts = {}        # flicker key -> sorted reads or None
-        self.taus = {"rise": [], "fall": [], "mid_rise": []}
-        # backlight_step: per direction, the averaged curve's bins and how
-        # many captures went into it. Built once: the bins are reused.
-        if not hasattr(self, "bl_sums"):
-            self.bl_sums = {}
-            self.bl_counts = {}
-            for key in ("rise", "fall", "mid_rise"):
-                self.bl_sums[key] = [0.0] * CURVE_BINS
-                self.bl_counts[key] = [0] * CURVE_BINS
-        for key in ("rise", "fall", "mid_rise"):
+        # Per direction: settle's taus; backlight_step's captures averaged,
+        # each capture's swing (final - initial, counts), and how many were
+        # left out, by reason -- so a direction that found nothing still says
+        # what the sensor did.
+        self.taus, self.bl_steps, self.bl_swings, self.bl_skipped = (
+            {}, {}, {}, {})
+        for key in STEP_KEYS:
+            self.taus[key] = []
+            self.bl_steps[key] = 0
+            self.bl_swings[key] = []
+            self.bl_skipped[key] = dict.fromkeys(SKIP_REASONS, 0)
             sums = self.bl_sums[key]
             counts = self.bl_counts[key]
             for b in range(CURVE_BINS):
                 sums[b] = 0.0
                 counts[b] = 0
-        self.bl_steps = {"rise": 0, "fall": 0, "mid_rise": 0}
-        # Per direction: each capture's swing (final - initial, counts), and
-        # how many were left out, by reason -- so a direction that found
-        # nothing still says what the sensor did.
-        self.bl_swings = {"rise": [], "fall": [], "mid_rise": []}
-        self.bl_skipped = {}
-        for key in ("rise", "fall", "mid_rise"):
-            self.bl_skipped[key] = {SKIP_FLAT: 0, SKIP_NO_EDGE: 0, SKIP_GAP: 0}
         self.bl_read_us = []    # each capture's mean spacing between reads
         self.loops = {}         # loopback: rung -> result object
         self.loop_pending = None
+        self.rings = {}         # the ring's tests: test -> result object
+        self.ring_pending = None
         self.latencies = []
         self.bounded = 0        # rises already past T_low at the first read
         self.blinds = []        # how long each present call blocked, ms
@@ -1550,19 +1822,14 @@ class Recorder:
         self.gcd = gcd(self.gcd, value)
         return value
 
-    def current_step(self):
-        if self.index < len(self.steps):
-            return self.steps[self.index]
-        return None
-
     def frame(self, now, frame_ms):
-        """Advances to `now` and takes this frame's reads. Returns the kind."""
+        """Advances to `now` and takes this frame's reads."""
         self.frame_ms = frame_ms
         if self.finished:
-            return READ_NONE
+            return
         elapsed = time.ticks_diff(now, self.epoch)
         if elapsed < 0:
-            return READ_NONE
+            return
         steps = self.steps
         n = len(steps)
         while self.index < n:
@@ -1575,13 +1842,11 @@ class Recorder:
             self.index += 1
             self.begun = False
 
-        kind = READ_NONE
         value = None
         block = self.active
         if block is not None and block.active:
             value, done = block.take(now, self.light)
             self.gcd = gcd(self.gcd, value)
-            kind = READ_SAMPLE
             if done:
                 self._store(block)
 
@@ -1595,24 +1860,18 @@ class Recorder:
                         value = self._read()
                     self.samples[self.count] = value
                     self.count += 1
-                    kind = READ_SAMPLE
             elif (step.read == READ_BURST and not self.burst_taken
                   and offset >= step.ms // 2):
                 light = self.light
                 burst = self.burst
                 for i in range(step.count):
                     burst[i] = light()
-                g = self.gcd
-                for i in range(step.count):
-                    g = gcd(g, burst[i])
-                self.gcd = g
+                self.gcd = gcd(self.gcd, adc_step(burst, step.count))
                 self.burst_taken = True
                 self.blocked = True
-                kind = READ_BURST
             elif (step.read == READ_AVERAGE
                   and GUARD_MS <= offset < step.ms - GUARD_MS):
                 self._average_burst(step.count)
-                kind = READ_BURST
         elif block is None or not block.active:
             self.finished = True
 
@@ -1624,7 +1883,6 @@ class Recorder:
                - self._lead(caps[self.capture_index])):
             self.pending = caps[self.capture_index]
             self.capture_index += 1
-        return kind
 
     def _lead(self, index):
         if self.steps[index].test == "backlight_step":
@@ -1645,13 +1903,9 @@ class Recorder:
             self.blinds.append(time.ticks_diff(returned_us, present_us) / 1000.0)
         index = self.pending
         self.pending = None
-        count = self._capture(present_us, 0, self._lead(index))
+        count = self._capture(present_us, 0,
+                              (CAPTURE_MS + self._lead(index)) * 1000)
         self._fit(index, count)
-
-    @property
-    def loopback_due(self):
-        """A loopback block is waiting for loopback() on this frame."""
-        return self.loop_pending is not None
 
     def loopback(self, set_backlight):
         """Runs the loopback block due, blocking for its length."""
@@ -1668,11 +1922,20 @@ class Recorder:
                 self.ticks_us, set_backlight)
         self.blocked = True
 
-    @property
-    def change_due(self):
-        """The capture due is one made by changed(), not after a present."""
-        return (self.pending is not None
-                and self.steps[self.pending].test == "backlight_step")
+    def ring_test(self, reader, note, set_backlight):
+        """Runs the ring test due through `reader` -- the badge's EXACT
+        reader, or None and `note` saying why it has none -- blocking."""
+        if self.ring_pending is None:
+            return
+        step = self.steps[self.ring_pending]
+        self.ring_pending = None
+        if reader is None:
+            self.rings[step.test] = {"error": note or "no ring"}
+        elif step.test == "backlight_step_ring":
+            self.rings[step.test] = backlight_step_ring(reader, set_backlight)
+        else:
+            self.rings[step.test] = loopback_ring(reader, set_backlight)
+        self.blocked = True
 
     def changed(self, change):
         """Calls `change` inside the capture due this frame. Blocks while it does.
@@ -1687,20 +1950,10 @@ class Recorder:
             return
         index = self.pending
         self.pending = None
-        ticks_us = self.ticks_us
-        light = self.light
-        cap_t = self.cap_t
-        cap_v = self.cap_v
-        count = 0
-        start = ticks_us()
-        while count < CAPTURE_MAX:
-            t = time.ticks_diff(ticks_us(), start)
-            if t >= CHANGE_LEAD_US:
-                break
-            cap_t[count] = t
-            cap_v[count] = light()
-            count += 1
-        at_us = ticks_us()
+        start = self.ticks_us()
+        # - 1: _capture stops once t > window, the lead-in at t >= LEAD.
+        count = self._capture(start, 0, CHANGE_LEAD_US - 1)
+        at_us = self.ticks_us()
         change()
         # Straight back to reading: the step starts now. The lead-in is put on
         # the call's timeline afterwards. Doing it here, as the first version
@@ -1709,16 +1962,17 @@ class Recorder:
         # way -- and every capture that crossed in it was dropped as a gap:
         # 4 of 10 lit falls on 2026-10-05d, all of them on 2026-10-05c.
         lead_in = count
-        count = self._capture(at_us, count, self._lead(index))
+        count = self._capture(at_us, count,
+                              (CAPTURE_MS + self._lead(index)) * 1000)
         at = time.ticks_diff(at_us, start)
+        cap_t = self.cap_t
         for i in range(lead_in):
             cap_t[i] -= at
         self._fit(index, count)
 
-    def _capture(self, origin_us, count, lead):
-        """Reads into cap_t/cap_v from `count` on, timed from `origin_us`, to
-        the end of the window, CAPTURE_MS past `lead`. Returns the new count."""
-        window = (CAPTURE_MS + lead) * 1000
+    def _capture(self, origin_us, count, window):
+        """Reads into cap_t/cap_v from `count` on, timed from `origin_us`,
+        until `window` µs past it. Returns the new count."""
         light = self.light
         ticks_us = self.ticks_us
         cap_t = self.cap_t
@@ -1736,10 +1990,7 @@ class Recorder:
     def _fit(self, index, count):
         cap_t = self.cap_t
         cap_v = self.cap_v
-        g = self.gcd
-        for i in range(count):
-            g = gcd(g, cap_v[i])
-        self.gcd = g
+        self.gcd = gcd(self.gcd, adc_step(cap_v, count))
 
         key = self.steps[index].key
         if key is None:
@@ -1799,10 +2050,10 @@ class Recorder:
         self.burst_taken = False
         if step.read == READ_LOOPBACK:
             self.loop_pending = index
+        if step.read == READ_RING:
+            self.ring_pending = index
         if step.read == READ_SYMBOLS or step.read == READ_EYE:
-            if self.active is not None and self.active.active:
-                self.active.finish()
-                self._store(self.active)
+            self._finish_active()
             levels = self.levels(step.scheme)
             block_start = time.ticks_add(self.epoch, self.starts[index])
             if levels is None:
@@ -1826,6 +2077,12 @@ class Recorder:
     def _store(self, block):
         found = self.symbols if block is self.block else self.eyes
         found[block.key] = block.result()
+
+    def _finish_active(self):
+        """Ends the block still receiving, if any, and keeps its result."""
+        if self.active is not None and self.active.active:
+            self.active.finish()
+            self._store(self.active)
 
     def _average_burst(self, count):
         """One frame's burst, folded into every averaging depth's statistics."""
@@ -1856,12 +2113,9 @@ class Recorder:
         step = self.steps[index]
         if step.read == READ_SAMPLES:
             n = self.count
-            if n:
-                self.summary[(step.test, step.key)] = (
-                    median(self.samples, n), peak_to_peak(self.samples, n),
-                    sd(self.samples, n))
-            else:
-                self.summary[(step.test, step.key)] = None
+            self.summary[(step.test, step.key)] = (
+                median(self.samples, n), peak_to_peak(self.samples, n),
+                sd(self.samples, n)) if n else None
             self.count = 0
         elif step.read == READ_AVERAGE:
             if self.avg_frames:
@@ -1887,33 +2141,25 @@ class Recorder:
 
     def levels(self, scheme):
         """This run's measured levels for `scheme`, fitted, or None."""
-        found = []
-        for _, name in LEVEL_NAMES:
-            held = self.held("levels", (scheme, name))
-            if held is None:
-                return None
-            found.append(held[0])
-        if found[2] <= found[0]:
+        found = self._scheme_levels(scheme)
+        if found is None or found["white"][0] <= found["black"][0]:
             return None
         levels = Levels()
-        levels.fit(found[0], found[1], found[2])
+        levels.fit(found["black"][0], found["mid"][0], found["white"][0])
         return levels
 
     # --- results ---
 
     def results(self, frame_result):
         """The per-condition object, shaped as the spec's measurements file."""
-        if self.active is not None and self.active.active:
-            self.active.finish()
-            self._store(self.active)
+        self._finish_active()
         out = {}
         out["ambient"] = self._ambient()
         step = self.gcd
         out["adc_step"] = step if step else {"error": "no nonzero reading"}
         if not step:
             step = SENSOR_STEP
-        out["levels"] = self._levels_result()
-        out["noise"] = self._noise_result()
+        out["levels"], out["noise"] = self._level_results()
         out["gamma_ramp"] = self._gamma_result()
         out["backlight_curve"] = self._curve_result()
         out["bleed"] = self._bleed_result()
@@ -1922,12 +2168,18 @@ class Recorder:
         out["backlight_step"] = self._backlight_step_result()
         out["frame_timing"] = frame_result
         if self.tool == TOOL_MIRROR:
-            out["loopback"] = self._loopback_result()
+            out["loopback"] = _pick(
+                self.loops, [str(rung) for rung in LOOPBACK_RUNGS]
+                + ["off_%d" % rung for rung in DIM_RUNGS])
+            out.update(_pick(self.rings, ("backlight_step_ring",
+                                          "loopback_ring")))
             out["edge_latency"] = self._latency_result()
         else:
-            out["symbol_errors"] = self._symbols_result()
+            out["symbol_errors"] = _by_rung(
+                self.symbols, (SCHEME_FIELDS, SCHEME_BACKLIGHT), SYMBOL_RUNGS)
             out["averaging"] = self._averaging_result()
-            out["eye"] = self._eye_result()
+            out["eye"] = _by_rung(self.eyes, [name for name, _ in EYE_SEQUENCES],
+                                  EYE_RUNGS)
         return out
 
     def failed_results(self, message, frame_result):
@@ -1956,38 +2208,32 @@ class Recorder:
             found[name] = held
         return found
 
-    def _levels_result(self):
-        out = {}
+    def _level_results(self):
+        """(levels, noise): each scheme's held levels, and their noise."""
+        levels = {}
+        noise = {}
         for scheme in (SCHEME_FIELDS, SCHEME_BACKLIGHT):
             found = self._scheme_levels(scheme)
             if found is None:
-                out[scheme] = {"error": "no readings"}
-                continue
-            black = found["black"][0]
-            mid = found["mid"][0]
-            white = found["white"][0]
-            span = white - black
-            if span <= 0:
-                out[scheme] = {"error": "white not above black"}
-                continue
-            out[scheme] = {"black": black, "mid": mid, "white": white,
-                           "span": span,
-                           "mid_share": round((mid - black) / span, 3)}
-        return out
-
-    def _noise_result(self):
-        out = {}
-        for scheme in (SCHEME_FIELDS, SCHEME_BACKLIGHT):
-            found = self._scheme_levels(scheme)
-            if found is None:
-                out[scheme] = {"error": "no readings"}
+                levels[scheme] = {"error": "no readings"}
+                noise[scheme] = {"error": "no readings"}
                 continue
             entry = {}
             for _, name in LEVEL_NAMES:
                 entry[name] = {"p2p": found[name][1],
                                "sd": round(found[name][2], 1)}
-            out[scheme] = entry
-        return out
+            noise[scheme] = entry
+            black = found["black"][0]
+            mid = found["mid"][0]
+            white = found["white"][0]
+            span = white - black
+            if span <= 0:
+                levels[scheme] = {"error": "white not above black"}
+                continue
+            levels[scheme] = {"black": black, "mid": mid, "white": white,
+                              "span": span,
+                              "mid_share": round((mid - black) / span, 3)}
+        return levels, noise
 
     def _gamma_result(self):
         out = {}
@@ -2038,8 +2284,8 @@ class Recorder:
         # a fall that fitted -- it did, in the first hardware run.
         out = {}
         slowest = None
-        for key, name in (("rise", "rise_tau_ms"), ("fall", "fall_tau_ms"),
-                          ("mid_rise", "mid_rise_tau_ms")):
+        for key in STEP_KEYS:
+            name = key + "_tau_ms"
             taus = self.taus[key]
             if not taus:
                 out[name] = {"error": "no %s transition fitted"
@@ -2060,7 +2306,7 @@ class Recorder:
         # mirror tool -- can report it; a receiver's time origin is its own
         # estimate of the peer's.
         out = {}
-        for key in ("rise", "fall", "mid_rise"):
+        for key in STEP_KEYS:
             found = self.bl_steps[key]
             sums = self.bl_sums[key]
             counts = self.bl_counts[key]
@@ -2080,29 +2326,19 @@ class Recorder:
                     name, 10 if t10 is None else 90)
                 out[key] = seen
                 continue
-            entry = {"transitions": found,
-                     "t10_90_ms": round(max(0.0, t90 - t10) / 1000.0, 2),
-                     "skipped": seen["skipped"], "swing": seen["swing"]}
+            seen["transitions"] = found
+            seen["t10_90_ms"] = round(max(0.0, t90 - t10) / 1000.0, 2)
             if self.tool == TOOL_MIRROR:
                 t50 = curve_crossing(sums, counts, 0.5)
-                entry["t10_ms"] = round(t10 / 1000.0, 2)
-                entry["t50_ms"] = round(t50 / 1000.0, 2) if t50 is not None else None
-                entry["t90_ms"] = round(t90 / 1000.0, 2)
-            out[key] = entry
+                seen["t10_ms"] = round(t10 / 1000.0, 2)
+                seen["t50_ms"] = round(t50 / 1000.0, 2) if t50 is not None else None
+                seen["t90_ms"] = round(t90 / 1000.0, 2)
+            out[key] = seen
         # No single error even when nothing was found: each direction's says
         # why, which a single one would throw away.
         out["bin_us"] = CURVE_BIN_US
         if self.bl_read_us:
             out["read_us"] = round(median(self.bl_read_us), 1)
-        return out
-
-    def _loopback_result(self):
-        out = {}
-        for rung in LOOPBACK_RUNGS:
-            out[str(rung)] = self.loops.get(str(rung), {"error": "not run"})
-        for rung in DIM_RUNGS:
-            key = "off_%d" % rung
-            out[key] = self.loops.get(key, {"error": "not run"})
         return out
 
     def _latency_result(self):
@@ -2111,20 +2347,17 @@ class Recorder:
         found = self.latencies
         if not found:
             return {"error": "no rise crossed T_low"}
-        total = 0.0
-        for value in found:
-            total += value
         # A rise already past T_low at the first read gives that read's time:
         # an upper bound, not a latency. "upper_bounds" says how many were;
         # when it equals "rises", every figure here is only a bound, and
         # "blind_ms" -- how long the present call held the CPU -- is why.
-        out = {"mean_ms": round(total / len(found), 1),
+        out = {"mean_ms": round(sum(found) / len(found), 1),
                "min_ms": round(min(found), 1),
                "max_ms": round(max(found), 1),
                "rises": len(found),
                "upper_bounds": self.bounded}
         if self.blinds:
-            out["blind_ms"] = round(median(list(self.blinds)), 1)
+            out["blind_ms"] = round(median(self.blinds), 1)
         return out
 
     def _averaging_result(self):
@@ -2159,26 +2392,6 @@ class Recorder:
                         worst = ratio
                 separation[key] = None if worst is None else round(worst, 1)
             out["separation"] = separation
-        return out
-
-    def _eye_result(self):
-        out = {}
-        for name, _ in EYE_SEQUENCES:
-            entry = {}
-            for rung in EYE_RUNGS:
-                entry[str(rung)] = self.eyes.get((name, rung),
-                                                 {"error": "not received"})
-            out[name] = entry
-        return out
-
-    def _symbols_result(self):
-        out = {}
-        for scheme in (SCHEME_FIELDS, SCHEME_BACKLIGHT):
-            entry = {}
-            for rung in SYMBOL_RUNGS:
-                entry[str(rung)] = self.symbols.get(
-                    (scheme, rung), {"error": "not received"})
-            out[scheme] = entry
         return out
 
 
@@ -2232,6 +2445,15 @@ class _Run:
         self.done = False
         self.skip_frame = False
 
+    def begin(self, now):
+        """Starts a condition at `now`."""
+        self.recorder.start(now)
+        self.stats.reset()
+        self.skip_frame = False
+        self.done = False
+        self.temps = {}
+        self._note_temp("start")
+
     def _count_frame(self, frame_ms):
         # A frame that followed a capture or a burst measures the reading, not
         # the frame loop; leaving it in would make max_ms the capture length.
@@ -2273,9 +2495,7 @@ class _Run:
         """{"start": C, <test>: C, ..., "end": C}, the end read now."""
         if self.temp is None:
             return {"error": "no temperature sensor"}
-        out = {}
-        for key in self.temps:
-            out[key] = self.temps[key]
+        out = dict(self.temps)
         out["end"] = self.temp()
         return out
 
@@ -2288,17 +2508,31 @@ class _Run:
     def change_due(self):
         """The capture due is a backlight step's: make the change through
         changed(), not by presenting."""
-        return self.recorder.change_due
+        pending = self.recorder.pending
+        return (pending is not None
+                and self.steps[pending].test == "backlight_step")
 
     @property
     def loopback_due(self):
         """A loopback block is due: call loopback() this frame."""
-        return self.recorder.loopback_due
+        return self.recorder.loop_pending is not None
 
     def loopback(self, set_backlight):
         """Sends and reads back the loopback block due, blocking for it;
         `set_backlight` is display.backlight()."""
         self.recorder.loopback(set_backlight)
+        self._note_blocking()
+
+    @property
+    def ring_due(self):
+        """A ring test is due: call ring_test() this frame."""
+        return self.recorder.ring_pending is not None
+
+    def ring_test(self, reader, note, set_backlight):
+        """Runs the ring test due (M4 or M5) through the badge's EXACT
+        reader, blocking for it. The temperature was read when the test
+        began, on an earlier call -- never while the ring runs."""
+        self.recorder.ring_test(reader, note, set_backlight)
         self._note_blocking()
 
     def changed(self, change):
@@ -2322,24 +2556,18 @@ class MirrorRun(_Run):
         self.epoch = 0
 
     def begin(self, now):
+        _Run.begin(self, now)
         self.epoch = now
-        self.recorder.start(now)
-        self.stats.reset()
-        self.skip_frame = False
-        self.done = False
-        self.temps = {}
-        self._note_temp("start")
 
     def frame(self, now, frame_ms):
         self._count_frame(frame_ms)
-        kind = self.recorder.frame(now, frame_ms)
+        self.recorder.frame(now, frame_ms)
         self._note_blocking()
         elapsed = time.ticks_diff(now, self.epoch)
         self._show(self.cursor.field(elapsed))
         self._name(self.cursor.step(elapsed))
         if self.recorder.finished:
             self.done = True
-        return kind
 
     def results(self):
         out = self.recorder.results(self.stats.result())
@@ -2379,45 +2607,25 @@ class SecondBadgeRun(_Run):
         # the app to show, and so a failed handshake can be explained.
         self.pulse_noise = None
         self.pulse_threshold = PULSE_MIN_SWING
-        self.phase = PHASE_DONE
         self.no_handshake = False
         self.measured = False
         self.turn = 1
         self.begin_at = 0
-        self.handshake_at = 0
         self.epoch = 0
         self.ended_at = 0
         self.frame_ms = 0
-        # Calling.
-        self.cycle = -1
-        self.pulse_start = None
-        self.pulse_cycle = -1
-        self.prev_pulse_start = None
-        self.prev_pulse_cycle = -1
-        self.replies = 0
-        self.answered_cycle = -2
-        self.go_start = None
-        # Answering.
-        self.answer_at = None
-        self.answer_start = None
-        self.answer_shown = False
-        self.last_call = None
-        self.calls = 0          # call pulses seen a period apart, in a row
+        self._handshake(0)
+        self.phase = PHASE_DONE
 
     @property
     def sending(self):
         return self.phase == PHASE_SENDING
 
     def begin(self, now):
-        self.stats.reset()
-        self.skip_frame = False
-        self.done = False
+        _Run.begin(self, now)
         self.no_handshake = False
         self.measured = False
-        self.recorder.start(now)
         self.turn = 1
-        self.temps = {}
-        self._note_temp("start")
         # Every run opens on its noise second; see NOISE_MS.
         self.phase = PHASE_NOISE
         self.begin_at = now
@@ -2427,25 +2635,20 @@ class SecondBadgeRun(_Run):
         return self.first == (self.turn == 1)
 
     def _handshake(self, now):
+        """Starts a handshake at `now`, both roles' state reset."""
         self.detector.reset()
         self.handshake_at = now
         self.go_start = None
-        if self._calls():
-            self.phase = PHASE_CALLING
-            self.cycle = -1
-            self.pulse_start = None
-            self.pulse_cycle = -1
-            self.prev_pulse_start = None
-            self.prev_pulse_cycle = -1
-            self.replies = 0
-            self.answered_cycle = -2
-        else:
-            self.phase = PHASE_ANSWERING
-            self.answer_at = None
-            self.answer_start = None
-            self.answer_shown = False
-            self.last_call = None
-            self.calls = 0
+        # Calling.
+        self.cycle = self.pulse_cycle = self.prev_pulse_cycle = -1
+        self.pulse_start = self.prev_pulse_start = None
+        self.replies = 0
+        self.answered_cycle = -2
+        # Answering.
+        self.answer_at = self.answer_start = self.last_call = None
+        self.answer_shown = False
+        self.calls = 0          # call pulses seen a period apart, in a row
+        self.phase = PHASE_CALLING if self._calls() else PHASE_ANSWERING
 
     def _set_threshold(self):
         self.pulse_noise = noise_spread(self.noise, self.noise_count)
@@ -2527,7 +2730,7 @@ class SecondBadgeRun(_Run):
                 self.calls = 1
             self.last_call = rise
             # The rise is seen late by half a frame and the panel's settling;
-            # take that off, as the protocol's phase lock does.
+            # take that off with edge_lag().
             self.answer_at = time.ticks_add(
                 rise, REPLY_DELAY_MS - edge_lag(self.frame_ms))
             self.answer_shown = False
@@ -2562,7 +2765,6 @@ class SecondBadgeRun(_Run):
     def frame(self, now, frame_ms):
         self._count_frame(frame_ms)
         self.frame_ms = frame_ms
-        kind = READ_NONE
         phase = self.phase
 
         if self.no_handshake:
@@ -2571,10 +2773,8 @@ class SecondBadgeRun(_Run):
                 self._finish()
         elif phase == PHASE_NOISE:
             self._noise(now)
-            kind = READ_SAMPLE
         elif phase == PHASE_CALLING or phase == PHASE_ANSWERING:
             event = self.detector.push(now, self._read())
-            kind = READ_SAMPLE
             if (self.go_start is None and time.ticks_diff(
                     now, self.handshake_at) >= HANDSHAKE_TIMEOUT_MS):
                 self.no_handshake = True
@@ -2590,7 +2790,7 @@ class SecondBadgeRun(_Run):
                     # zero, as this badge drew it.
                     self._send(now)
         elif phase == PHASE_MEASURING:
-            kind = self.recorder.frame(now, frame_ms)
+            self.recorder.frame(now, frame_ms)
             self._note_blocking()
             if (time.ticks_diff(now, self.recorder.epoch)
                     >= SECOND_BADGE_SCHEDULE_MS + TURN_END_MS):
@@ -2606,7 +2806,6 @@ class SecondBadgeRun(_Run):
                 self._turn_ended(now)
 
         self._display(now)
-        return kind
 
     def _display(self, now):
         phase = self.phase
@@ -2676,10 +2875,7 @@ def tool_result(dark, lit, role=None):
 
 def merge_results(file_obj, tool, result):
     """The file with `tool`'s entry replaced and every other key kept as it was."""
-    out = {}
-    if isinstance(file_obj, dict):
-        for key in file_obj:
-            out[key] = file_obj[key]
+    out = dict(file_obj) if isinstance(file_obj, dict) else {}
     out[tool] = result
     return out
 
@@ -2702,6 +2898,9 @@ KEY_ORDER = (
     "p2p", "sd", "gamma", "black_on", "black_off", "min", "max", "verdict",
     "rise_tau_ms", "fall_tau_ms", "mid_rise_tau_ms", "settle_90_ms",
     "loopback", "lag_ms", "reads_per_s",
+    # the DMA ring on the mirror (M4, M5)
+    "backlight_step_ring", "loopback_ring", "mid_fall", "mid_high",
+    "high_mid", "tlow_ms", "count", "tx_late_us", "locks", "lag_us", "parts",
     "rise", "fall", "mid_rise", "transitions", "t10_90_ms", "t10_ms",
     "t50_ms", "t90_ms", "swing", "skipped", "flat", "no_edge", "gap",
     "bin_us", "read_us",
@@ -2717,15 +2916,21 @@ KEY_ORDER = (
     "max_us", "sd_us", "transfer_timed", "detail", "filter_sample",
     "pool_coarse", "step_data", "reads_per_sample", "light", "phase",
     "fast_reads", "viper", "dma_500k", "dma_100k", "us",
+    # the ring step (M1, M3)
+    "rp2", "uctypes", "rp2_dma", "ring", "heap_addr", "ring_addr", "quiet",
+    "presenting", "rate_hz", "anchor_spread_us", "fifo_over", "faults",
+    "lag_max_us", "work", "slot_work", "slots", "passes", "long_passes",
+    "rung_ms", "kernel_us_per_1000", "gc_ms", "gc_overran",
+    "garbage_per_slot", "window_value", "decide_slot", "data_field", "exact",
     "alloc",
     "call_us", "pair_us", "quad_us", "octet_us", "gc", "screen",
     "collect", "alloc_kb", "free_kb", "frames_on", "frames_off",
     "flicker_filter", "samples", "follower_samples", "fit_first_us", "fit",
     "fit_follower", "correct_first_us", "correct", "track", "update",
-    "update_rate",
+    "update_rate", "replay",
     # measure room flicker (flicker.py): the transfer's fit, and the drift
     "filter", "reason", "window_ms", "mains", "harmonics", "kept",
-    "held_out", "sd_before", "sd_after",
+    "held_out", "sd_before", "sd_after", "window_residual",
     "drift", "windows", "seconds", "offset_mhz_vs_clock", "wander_deg",
     "ambiguous",
     "error",

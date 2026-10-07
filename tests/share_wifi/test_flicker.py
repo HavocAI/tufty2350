@@ -137,12 +137,12 @@ def test_a_flickering_room_is_fitted_and_corrected_on_samples_it_never_saw():
     for hz, mains in ((120, 60), (100, 50)):
         found = F.analyse(captured(room(hz, 20, harmonic=5)))["filter"]
         assert found["verdict"] == "flicker", found
-        assert found["mains"] == mains and found["window_ms"] == 200, found
+        assert found["mains"] == mains and found["window_ms"] == F.FLICKER_FIT_MS == 160, found
         assert found["reason"] is None
         assert abs(found["harmonics"][str(hz)] - 20) < 2, found
         assert hz in found["kept"], found
-        # The last ~50 ms of the capture, outside the fit's 200.
-        assert 14 <= found["held_out"] <= 17, found
+        # The last ~90 ms of the capture, outside the fit's 160.
+        assert 28 <= found["held_out"] <= 31, found
         assert found["sd_after"] < found["sd_before"] / 3, found
 
 
@@ -156,7 +156,7 @@ def test_a_steady_room_is_steady_and_nothing_is_taken_off():
 def test_a_window_too_noisy_to_fit_is_refused_after_the_half_window_retry():
     found = F.analyse(captured(room(120, 0, noise=250)))["filter"]
     assert found["verdict"] is None and found["reason"] == "noise", found
-    assert found["window_ms"] == 100, "the transfer's retry, on half the window"
+    assert found["window_ms"] == 80, "the transfer's retry, on half the window"
     assert found["noise"] > 12
     assert found["sd_after"] == found["sd_before"]
 

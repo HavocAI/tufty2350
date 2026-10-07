@@ -114,19 +114,24 @@ must change:
 
 ```python
 def do_transfer(self):
-    passes = 0
     while True:
-        read_sample(SAMPLE_US, transfer.deadline(), buf)   # 2 ms of reads
-        field = transfer.sample(buf[0], buf[1], buf[2], buf[3], buf[4])
+        if transfer.collect_due:         # the protocol asks; collect here,
+            transfer.collect_due = False # never inside its calls
+            gc.collect()
         if transfer.phase == PHASE_DONE:
             return self.finish_transfer(transfer)
-        if backlight_changed:
-            display.backlight(level)     # live at once: no present needed
-        if pixels_changed:
-            fill(pen)
-            return                       # run() presents it, then polls
-        passes += 1
-        if passes % POLL_PASSES == 0:
+        reader.pump(transfer.due_us())   # wait for what is due (a polled
+        t = reader.now_us()              # reader reads meanwhile)
+        field = transfer.field_at(t)
+        if field changed:
+            if pixels unchanged:
+                display.backlight(level) # live at once: no present needed
+            else:
+                fill(pen)
+                return                   # run() presents it, then polls
+        transfer.work(t)                 # decide what the reader completed
+        if t >= self.poll_at:            # every POLL_MS
+            self.poll_at = t + POLL_MS * 1000
             badge.poll()                 # buttons and badge.ticks
             if badge.pressed(BUTTON_B):
                 transfer.fail(ERR_CANCELLED)
@@ -141,14 +146,18 @@ def do_transfer(self):
   directly -- so a loop that only changes it never returns at all.
 - **Leave a seam for tests**: a cap on passes per `update()`, 0 on the
   badge, so a test can step it one reading a frame.
-- **Keep the pass cheap: read in a loop of locals, decide once a sample.**
-  On v2 each Python operation costs microseconds -- an attribute, a call,
-  a float -- and a call into the protocol about a millisecond
-  **[measured-v2]**. Called once a reading, it was the whole pass, and a
-  shortcut for "nothing changed since the last reading" never ran, since
-  the last reading was always a ms ago. `share_wifi`'s `read_sample()`
-  reads back to back into two local sums for 2 ms, then makes one call.
+- **Keep Python off the readings.** On v2 each Python operation costs
+  microseconds -- an attribute, a call, a float -- and a call into the
+  protocol about a millisecond **[measured-v2]**. Called once a reading, it
+  was the whole pass. `share_wifi` now has the ADC free-run into a DMA ring
+  (`fastadc.Ring`, see "Reading by DMA ring" in
+  [badgeware-hardware.md](badgeware-hardware.md)), sums it with viper
+  kernels, and calls the protocol once a slot; where the ring is refused, a
+  polled reader bins `light_level()` readings with an index and two adds.
   Look up anything keyed on a value that rarely changes when it changes.
+- **A DMA channel outlives the app unless you stop it.** Stop it on every
+  exit path, and in `on_exit()` -- inside `try`, since HOME runs `on_exit()`
+  and then resets, and a raise would skip the reset **[source-v2]**.
 - **The unix port is no guide to the badge's costs.** It runs the same
   interpreter, and the change above ran six to fifteen times faster there
   while running twice as slow on the badge. Measure on the badge.

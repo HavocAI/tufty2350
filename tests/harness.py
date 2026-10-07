@@ -11,6 +11,10 @@ import builtins
 import importlib
 import os
 import sys
+
+# Whatever imports this is about to import modules from firmware/apps/,
+# and everything under firmware/ is packed onto the badge: no __pycache__.
+sys.dont_write_bytecode = True
 import time
 
 # MicroPython's tick helpers, which CPython does not have.
@@ -24,6 +28,11 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # Every app is a folder here, which is also what the firmware image packs
 # into /system/apps.
 APPS = os.path.join(REPO, "firmware", "apps")
+
+
+class Skipped(Exception):
+    """Raised by a test that cannot run here -- a tool not installed. The
+    runner counts it as skipped, with the reason, in its summary line."""
 
 
 class FrameLimit(Exception):

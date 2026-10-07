@@ -6,6 +6,23 @@ python3 tests/run_tests.py share_wifi   # one app
 python3 tests/run_tests.py -v           # list every test
 ```
 
+Two tests need tools the suite does not bring, and are **skipped** without
+them -- counted in the summary line (`560 passed, 0 failed, 2 skipped`) and
+listed under it with what to set:
+
+```
+MPY_CROSS=/path/to/mpy-cross \
+MICROPYTHON=/path/to/micropython \
+python3 tests/run_tests.py
+```
+
+`MPY_CROSS` is MicroPython's cross-compiler, which compiles `fastadc.py`'s
+viper for the badge's architecture (`-march=armv7emsp`: this mpy-cross has no
+armv8m); `MICROPYTHON` is the unix port, whose x64 viper runs the ring
+kernels for real. Either is also found on the `PATH`. A run without them has
+not checked viper at all -- say so when reporting it. A test raises
+`harness.Skipped(why)` to be counted this way.
+
 No dependencies, no test framework, and the runner is the only supported way in.
 It puts `tests/` and each `tests/<app>/` on `sys.path` itself; pytest does not,
 so `from harness import ...` fails under it.
@@ -117,7 +134,9 @@ tests/
   fontmetrics.py        real glyph widths from romfs/fonts/*.ppf, and the firmware's wrapping
   run_tests.py          discovery and runner
   share_wifi/
-    simulator.py            two badges on one timeline; not a test, a tool
+    simulator.py            two badges on one timeline, through the production readers; not a test, a tool
+    sweep.py                the simulator over 8 seeds x 6 scenarios x 3 payloads, row by row; a tool
+    fakeviper.py            stand-ins for viper's ptr16/ptr8 and machine/rp2, to load fastadc.py under CPython
     pattern_survey.py       control-pattern designs, measured; not a test, a tool
     # Optical Data Transfer Protocol (firmware/apps/share_wifi/protocol.py)
     test_crc.py             CRC-16/CCITT-FALSE, including the standard check value
@@ -130,12 +149,22 @@ tests/
     test_patterns.py        the control patterns obey the rules receivers rely on
     test_module_boundary.py protocol.py stays free of badge globals and of WiFi
     test_spec_matches_code.py  the protocol and app specs' tables agree with the code
-    test_schemes.py         choosing a light-level scheme during calibration
-    test_sampling.py        which samples decide a slot; the first-block CRC regression
+    test_schemes.py         the one data scheme: the backlight from calibration on, fields for the beacons
+    test_reader.py          reader.py: the ring reader's clock, index and queries over a list ring, and the polled one
+    test_fastadc_kernels.py the viper kernels against their pure twins; mpy-cross and the unix port's viper when found
+    test_slot_window.py     where a slot is decided, which slot is decided next, re-bases and demotions
+    test_reply_gap.py       the one silent slot before a reply, a message held up whole
+    test_calibration_exact.py  the one calibration's lengths, fit windows, and where the stalls land
+    test_tier.py            the tier and light each staircase carries, and pairs agreeing a rung
+    test_break.py           the LIT flag, breaking in
+    test_flicker_fit.py     the flicker fit, its table and its phase lock
+    test_handshake_gap.py   a POLLED Follower dropping a coarse sample its present cut short
+    test_flicker.py         Dev Mode's room-flicker tool, against a synthetic light
+    test_sampling.py        Dev Mode's SlotReceiver (measure.py): which samples decide a slot
+    test_ring_verify.py     fastadc.Ring.verify() over a model of PSRAM, its cache and the DMA
     test_text_fit.py        every draw fits its box in the badge's real font (fontmetrics.py)
     test_recovery.py        framing-failure recovery, the empty payload, the retry budget after a demotion
-    test_rate_class.py      the frame-rate class each staircase carries, and fast/slow pairs agreeing a rung
-    test_simulator_model.py the simulator's hardware model: the measured present delay, the v2 profile
+    test_simulator_model.py the simulator's hardware model: readers, work costs, stalls, the v2 profile
     # Dev Mode's measurement engine (firmware/apps/share_wifi/measure.py)
     test_measure.py         schedule, calculations, mirror and 2nd-badge runs (averaging and the eye diagram too), the measurements file and its pages
     # Dev Mode's frame timing probe (firmware/apps/share_wifi/probe.py)
@@ -147,11 +176,12 @@ tests/
 `simulator.py` is runnable on its own and prints how each scenario ends:
 
 ```
-python3 tests/share_wifi/simulator.py                   # fields scheme only, the default
-python3 tests/share_wifi/simulator.py --auto            # calibration chooses fields or backlight
-python3 tests/share_wifi/simulator.py --auto --flicker  # ... with a sensor that follows the PWM
-python3 tests/share_wifi/simulator.py --v2              # the v2 badge as measured: 60 Hz, 19 ms present delay, 24 ms panel
+python3 tests/share_wifi/simulator.py                   # EXACT pair (both on the DMA ring), v2 timing
+python3 tests/share_wifi/simulator.py --polled          # both on light_level()
+python3 tests/share_wifi/simulator.py --mixed           # an EXACT Leader with a POLLED Follower
+python3 tests/share_wifi/simulator.py --v3              # v3 timing; --slow-panel for a slow v2 panel
 python3 tests/share_wifi/simulator.py --optics=mirror   # the sensor as measured: 16-count steps, its noise, an 80-count swing
+python3 tests/share_wifi/sweep.py ring/v2/mirror polled/v2/lit47   # rows READERS/TIMING/OPTICS, 144 runs each
 python3 tests/share_wifi/optics.py                      # how much of the sensor's view a screen fills; see optical-coupling.md
 ```
 
@@ -176,7 +206,9 @@ minutes, and the suite is meant to stay fast.
 
 Only `test_app.py` is built on the stubs; `test_module_boundary.py` and
 `test_spec_matches_code.py` also load the app for a few checks of its names.
-Everything else imports `protocol.py`, `measure.py` or `probe.py` directly. The tests sit
+Everything else imports `protocol.py`, `reader.py`, `measure.py`, `probe.py` or
+`flicker.py` directly; `test_fastadc_kernels.py` loads `fastadc.py` over
+`fakeviper.py`. The tests sit
 under `tests/share_wifi/` because that is where the modules live; the protocol
 itself is not WiFi-specific.
 

@@ -92,13 +92,13 @@ def test_black_part_way_through_a_byte_is_a_framing_error():
 
 
 def assert_framing_failure(rx):
-    # Decoding stops, and the Data Sync Error is held back: the Leader is still
-    # transmitting the rest of the block and would not hear it. It goes out
-    # once the Leader falls quiet -- see test_recovery.py.
+    # Decoding stops, and the Follower breaks in: it shows high until the
+    # Leader, which reads while it transmits, stops -- and only then sends
+    # its Data Sync Error. See test_break.py and test_recovery.py.
     assert rx.sub == rx.STEP_BLOCK
     assert not rx.in_block, "it should have stopped decoding the block"
-    assert rx.want_resend, "it should be waiting to send the Data Sync Error"
-    assert not rx.tx, "nothing may go out while the Leader is mid-block"
+    assert rx.breaking, "it should be breaking in"
+    assert not rx.tx, "the Data Sync Error waits for the Leader to stop"
     assert not rx.pending_slow_down, "and it must not demote on its own"
 
 

@@ -26,12 +26,15 @@ import wifi
 # imports. Named rather than `*`, so every name the app depends on is listed.
 from protocol import (
     ERR_CANCELLED, ERR_CONTRAST, ERR_CRC, ERR_DECODE, ERR_LOST_PEER,
-    BACKLIGHT_INDEX, ERR_NO_PEER, FAST_INDEX, FINE_MS, LEVEL_SCHEMES, LOW,
+    BACKLIGHT_INDEX, ERR_NO_PEER, EXACT_LIT_INDEX, LEVEL_SCHEMES, LOW,
     OK,
     PHASE_ANNOUNCE, PHASE_DONE, PHASE_PRESENT,
-    SCHEME_BACKLIGHT, SCHEME_FIELDS, FlickerFilter, Levels, SlotClock,
-    SlotReceiver, Transfer, parse_payload,
+    SCHEME_BACKLIGHT, SCHEME_FIELDS, FlickerFilter, Levels,
+    Transfer, parse_payload,
 )
+
+# How a transfer reads the sensor: pure, like the protocol.
+import reader as readers
 
 # Dev Mode's measurement engine: pure, like the protocol, and imported the same
 # way. Its PHASE_DONE is not imported -- the protocol's has the same name.
@@ -44,7 +47,7 @@ from measure import (
 # Dev Mode's frame timing probe: pure too, with the badge handed in as hooks.
 from probe import (
     FAST_READS, STEP_TITLES, STEPS, TOOL_PROBE, FrameProbe, Hooks,
-    TimeStats,
+    TimeStats, ring_listen,
 )
 
 # Dev Mode's room-flicker tool: pure, the sensor and clock handed in.
@@ -424,44 +427,68 @@ def dark_mirror_levels():
     return levels
 
 
-def probe_receiver():
-    # The probe's listener: a data-phase slot receiver on the 50 ms rung, with
-    # the dark mirror run's levels and a v2 frame. What it decides is thrown
-    # away; only what a pass of it costs is kept.
-    clock = SlotClock()
-    clock.start(time.ticks_ms(), FAST_INDEX)
-    return SlotReceiver(clock, dark_mirror_levels(), 17)
+def probe_replay():
+    """Dev Mode M7: a POLLED Follower's late replay of the staircase it read
+    -- every kept sample corrected and pooled again -- timed on a full
+    buffer of a dark staircase in a room flickering 12 counts at 120 Hz,
+    after a fit of it. The simulator charges REPLAY_MS_PER_SAMPLE for it."""
+    import math
+    transfer = Transfer(False)
+    transfer.phase_started = 0
+    level = (32, 64, 112)
+    n = len(transfer.fit_t)
+    for i in range(n):
+        us = i * 2000
+        step = (us // 40000) % 3 if 400000 <= us < 760000 else 0
+        transfer.fit_t[i] = us + 1000
+        transfer.fit_v[i] = level[step] + int(
+            12 * math.sin(2 * math.pi * 120 * us / 1000000.0))
+        transfer.fit_s[i] = 2000
+        transfer.fit_ms[i] = us // 1000
+    transfer.fit_n = n
+    transfer.fit_flicker(100, 300000)
+    gc.collect()
+    t = time.ticks_us()
+    transfer.replay_staircase()
+    return {"us": time.ticks_diff(time.ticks_us(), t),
+            "samples": transfer.replayed}
 
 
-def probe_listener():
-    # The probe's transfer: a continuous Follower in the data phase on the
-    # backlight's starting rung, listening for a block, with the dark mirror
-    # run's levels. Built before the step that times it.
-    transfer = Transfer(False, frame_ms=lambda: 17,
-                        schemes=(SCHEME_FIELDS, SCHEME_BACKLIGHT),
-                        continuous=True)
+def probe_listener(reader, index=BACKLIGHT_INDEX):
+    """A Follower in the data phase on rung `index`, listening for a block
+    through `reader` -- started here -- with the dark mirror run's levels.
+    What it hears is thrown away: callers reset its budgets each pass."""
+    reader.start()
+    transfer = Transfer(False, reader=reader)
     transfer.levels = dark_mirror_levels()
     transfer.scheme = SCHEME_BACKLIGHT
-    now = time.ticks_ms()
-    transfer.now = now
-    transfer.start_data(now, BACKLIGHT_INDEX)
+    transfer.start_data(0, index)
     return transfer
 
 
+def listen_pass(transfer):
+    """One pass of the transfer loop, listening: wait for what is due, then
+    the protocol's work, with nobody sending -- so its budgets are reset."""
+    reader = transfer.reader
+    reader.pump(transfer.due_us())
+    t = reader.now_us()
+    transfer.field_at(t)
+    transfer.work(t)
+    transfer.idle_slots = 0
+    transfer.stall_slots = 0
+
+
 class TimedListener:
-    """A probe listener driven as the listen loop drives a transfer, with
-    the protocol's call and its parts timed by timing the listener's own
-    methods, and the readings each sample held counted."""
+    """A probe listener driven as the transfer loop drives it, with the
+    protocol's work and its parts timed by timing the listener's own
+    methods."""
 
     def __init__(self, transfer):
         self.transfer = transfer
-        self.buf = [0, 0, 0, 0, 0, 0]
         self.parts = {}
-        self.samples = 0
-        self.reads = 0
-        self.read_us = 0
-        self.light_sum = 0
-        for name in ("sample", "filter_sample", "pool_coarse", "step_data"):
+        self.passes = 0
+        self.slots = 0
+        for name in ("work", "window_value", "decide_slot", "data_field"):
             self.parts[name] = TimeStats()
             # An instance attribute is found before the class's method.
             setattr(transfer, name, self.timed(getattr(transfer, name),
@@ -477,41 +504,85 @@ class TimedListener:
         return call
 
     def step(self):
-        transfer = self.transfer
-        buf = self.buf
-        read_sample(SAMPLE_US, transfer.deadline(), buf)
-        transfer.sample(buf[0], buf[1], buf[2], buf[3], buf[4])
-        self.samples += 1
-        self.reads += buf[5]
-        self.read_us += buf[4]
-        self.light_sum += buf[2]
-        transfer.idle_slots = 0
-        transfer.stall_slots = 0
+        listen_pass(self.transfer)
+        self.passes += 1
+        self.slots += self.transfer.work_slots
 
     def result(self):
         transfer = self.transfer
         out = {}
         for name in self.parts:
             out[name] = self.parts[name].rate()
-        n = self.samples
-        out["reads_per_sample"] = round(self.reads / n, 1) if n else 0
-        out["read_us"] = round(self.read_us / self.reads, 1) \
-            if self.reads else 0
-        out["light"] = self.light_sum // n if n else 0
+        out["passes"] = self.passes
+        out["slots"] = self.slots
         out["phase"] = transfer.phase
         out["flicker"] = round(transfer.flicker.size(), 1)
+        out["exact"] = transfer.exact
         return out
 
 
-# --- drawing ----------------------------------------------------------------
+# --- the readers --------------------------------------------------------------
+# A transfer reads the sensor through a reader (reader.py): the DMA ring
+# (fastadc.Ring) where this firmware has one that works, else light_level()
+# polled. Both made once per launch, the ring on the first transfer -- its
+# verify() takes ~0.4 s -- and the reason it was refused kept.
 
-# The light-level schemes this badge may transmit with; see LEVEL_SCHEMES in
-# protocol.py. Both: calibration measures both, and a continuous badge takes
-# the backlight whenever it calibrated -- 32 ms slots against pixels' 80 --
-# falling back to fields when its middle step does not hold, as it would on
-# a sensor that follows the backlight's PWM. Fields alone is
-# (SCHEME_FIELDS,), and works against a peer on either setting.
-SIGNALLING = (SCHEME_FIELDS, SCHEME_BACKLIGHT)
+RING_ENABLED = True
+_READERS = {}
+
+
+def ring_reader():
+    """The EXACT reader, or None; `ring_note()` says why not. Tried once."""
+    if "ring" not in _READERS:
+        _READERS["ring"] = None
+        _READERS["note"] = None
+        if not RING_ENABLED:
+            _READERS["note"] = "disabled"
+        else:
+            try:
+                import fastadc
+                problem = fastadc.check(badge.light_level)
+                ring = None
+                if problem is None:
+                    ring = fastadc.Ring()
+                    problem = ring.verify(readers)
+                if problem is None:
+                    _READERS["ring"] = readers.RingReader(ring)
+                else:
+                    _READERS["note"] = problem
+            except Exception as error:     # noqa: BLE001 - every refusal is POLLED
+                _READERS["note"] = "%s: %s" % (type(error).__name__, error)
+    return _READERS["ring"]
+
+
+def ring_note():
+    ring_reader()
+    return _READERS["note"]
+
+
+def polled_reader():
+    """The POLLED reader: light_level() into bins. Made once per launch."""
+    if "polled" not in _READERS:
+        _READERS["polled"] = readers.PolledReader(badge.light_level)
+    return _READERS["polled"]
+
+
+def transfer_reader():
+    return ring_reader() or polled_reader()
+
+
+def on_exit():
+    """HOME: the launcher calls this, then resets the badge. A raise here
+    would skip the reset and leave HOME dead, so nothing escapes."""
+    try:
+        ring = _READERS.get("ring")
+        if ring is not None:
+            ring.stop()
+    except Exception:   # noqa: BLE001 - HOME must still reset
+        pass
+
+
+# --- drawing ----------------------------------------------------------------
 
 FIELD_COLOR = {}        # scheme -> {symbol: pen}
 FIELD_BACKLIGHT = {}    # scheme -> {symbol: display.backlight() value}
@@ -645,19 +716,6 @@ def end_signalling():
     badge.default_clear = color.black
     _SHOWN[0] = None
     _SHOWN[1] = None
-
-
-def measure_refresh():
-    """The panel's refresh period, in whole ms, from presents with vsync on.
-
-    Two back to back, timed after one to line up: 17 on the badge's v2, 11 on
-    v3. The protocol's pixel timing is in refreshes now that the transfer
-    loop no longer presents once a frame."""
-    display.update()
-    start = time.ticks_us()
-    display.update()
-    display.update()
-    return max(1, (time.ticks_diff(time.ticks_us(), start) + 1000) // 2000)
 
 
 def show_full(pen, backlight):
@@ -959,59 +1017,12 @@ def move_cursor(cursor, count):
 
 # Progress goes to the rear LEDs, because during a transfer both screens face
 # away from their users.
-# Samples one update() may take while a transfer runs; 0 is no limit. The
-# listen loop otherwise returns to run() only to present a change of pixels
-# or when the transfer ends. A test stepping one field a frame sets 1.
+# Passes one update() may make while a transfer runs; 0 is no limit. The
+# transfer loop otherwise returns to run() only to present a change of
+# pixels or when the transfer ends. A test stepping one field a frame sets 1.
 TRANSFER_PASSES = 0
-# Samples between button polls in it: about 50 ms on the badge.
-POLL_PASSES = 16
-
-# How long the listen loop reads before handing the protocol one sample: its
-# fine sample. The protocol call that follows is ~1 ms on the badge
-# [measured-v2], and nothing is read during it.
-SAMPLE_US = FINE_MS * 1000
-
-# read_sample()'s result, reused so a sample allocates nothing: the ms now,
-# the readings' mean time in ms, their mean, their mean time in us, how long
-# they were read for in us, and how many there were.
-_SAMPLE = [0, 0, 0, 0, 0, 0]
-
-
-def read_sample(limit_us, deadline, out):
-    """Reads the sensor back to back for `limit_us`, or until `deadline`
-    -- a ticks_ms, or None -- if that comes first, into `out` (see
-    _SAMPLE). The tight loop is the point: locals only, no protocol, so a
-    sample is as many readings as the badge can take."""
-    light_level = badge.light_level
-    ticks_us = time.ticks_us
-    ticks_diff = time.ticks_diff
-    total = 0
-    n = 0
-    start = ticks_us()
-    if deadline is None:
-        while True:
-            total += light_level()
-            n += 1
-            if ticks_diff(ticks_us(), start) >= limit_us:
-                break
-    else:
-        # Transmitting: the symbol changes at the deadline, so stop there.
-        ticks_ms = time.ticks_ms
-        while True:
-            total += light_level()
-            n += 1
-            if (ticks_diff(ticks_us(), start) >= limit_us
-                    or ticks_diff(ticks_ms(), deadline) >= 0):
-                break
-    span = ticks_diff(ticks_us(), start)
-    now = time.ticks_ms()
-    half = span // 2
-    out[0] = now
-    out[1] = time.ticks_add(now, -((half + 500) // 1000))
-    out[2] = total // n
-    out[3] = time.ticks_add(start, half)
-    out[4] = span
-    out[5] = n
+# How often the loop polls the buttons, which also keeps badge.ticks moving.
+POLL_MS = 50
 
 
 def transfer_lights(transfer):
@@ -1275,6 +1286,24 @@ def firmware_info():
     except Exception:   # noqa: BLE001 - informational only
         pass
     info["set_framerate"] = getattr(display, "set_framerate", None) is not None
+    # Dev Mode M1: whether this firmware has what the DMA ring needs, and
+    # whether the ring worked -- None -- or why not.
+    for name in ("rp2", "uctypes"):
+        try:
+            __import__(name)
+            info[name] = True
+        except ImportError:
+            info[name] = False
+    try:
+        import rp2
+        info["rp2_dma"] = hasattr(rp2, "DMA")
+    except ImportError:
+        info["rp2_dma"] = False
+    info["ring"] = ring_note()
+    ring = ring_reader()
+    if ring is not None:
+        info["heap_addr"] = "0x%08x" % ring.ring.cached
+        info["ring_addr"] = "0x%08x" % ring.ring.addr
     return info
 
 
@@ -1291,6 +1320,7 @@ class App:
         self.names = sorted(self.networks)
         self.relabel()
         self.transfer = None
+        self.poll_at = 0
         self.error = None
         self.message = ""
         self.connect_name = None        # as stored and shown: escaped
@@ -1329,11 +1359,11 @@ class App:
         self.drift = None
         self.drift_result = None
         # probe frame timing: the probe, the run its frames measure with, and
-        # the slot receiver its reads step times.
+        # the listeners its reads step times.
         self.probe = None
         self.probe_run = None
-        self.probe_receiver = None
         self.probe_listener = None
+        self.probe_timed = None
         # display measurements: (title, label, label width, lines) per page.
         self.pages = []
         self.page = 0
@@ -1433,51 +1463,51 @@ class App:
 
     def begin_transfer(self, leader, payload=None):
         begin_signalling()
-        # Black, then the refresh timed against it, so nothing stale flashes.
+        # Black, then the reader: the ring is made and checked on the first
+        # transfer of a launch, which blocks for about 0.4 s.
         fill(FIELD_COLOR[SCHEME_FIELDS][LOW])
-        refresh = measure_refresh()
-        self.transfer = Transfer(leader, payload, frame_ms=lambda: refresh,
-                                 schemes=SIGNALLING, continuous=True)
-        self.transfer.started = time.ticks_ms()
-        self.transfer.phase_started = self.transfer.started
-        self.retry_target = (leader, payload)
+        display.update()
+        reader = transfer_reader()
         gc.collect()        # now, rather than part way through a symbol
+        reader.start()
+        self.transfer = Transfer(leader, payload, reader)
+        self.retry_target = (leader, payload)
+        self.poll_at = 0
         self.screen = TRANSFER
 
     def do_transfer(self):
-        """The transfer's listen loop: a sample every pass, nothing presented.
+        """The transfer loop: wait for what is due, show the field, work.
 
-        Each pass reads the sensor for a sample -- read_sample(): FINE_MS of
-        readings, or up to the next symbol boundary while transmitting --
-        and hands their mean to the protocol. A change of backlight is made
-        at once -- it needs no present. Only a change of pixels returns to run(), whose present shows
-        it; that blocks reading for up to a refresh and a write, so the
-        backlight scheme, whose pixels never change, is never blind. The
-        buttons are polled every POLL_PASSES, which also keeps badge.ticks
-        moving. See "Reading continuously" in the protocol.
+        Each pass waits -- reading, if the reader polls -- until the protocol
+        has something to do: a slot boundary while transmitting, a window or
+        a sample to decide. It then shows the field for now first, so a
+        change of backlight lands on time, and only then does the work. Only a
+        change of pixels returns to run(), whose present shows it; an EXACT
+        reader goes on reading through it. Collections happen here, when the
+        protocol asks, never inside its calls. The buttons are polled every
+        POLL_MS. See "Reading" in the protocol.
         """
         transfer = self.transfer
+        reader = transfer.reader
         # B cancels, checked on entry -- run() has just polled -- and in the
         # loop.
         if badge.pressed(BUTTON_B):
             transfer.fail(ERR_CANCELLED)
-        sample = transfer.sample
-        buf = _SAMPLE
         limit = TRANSFER_PASSES
         passes = 0
         # What the screen was last set for: a pass only looks up the
-        # backlight and pen when the field or the scheme has changed. Most
-        # passes change neither, and the fewer things a pass does, the more
-        # readings a slot gets.
+        # backlight and pen when the field or the scheme has changed.
         shown_field = shown_scheme = None
         while True:
-            read_sample(SAMPLE_US, transfer.deadline(), buf)
-            # The microseconds let the protocol take the room's mains
-            # flicker off the sample.
-            field = sample(buf[0], buf[1], buf[2], buf[3], buf[4])
+            if transfer.collect_due:
+                transfer.collect_due = False
+                gc.collect()
             if transfer.phase == PHASE_DONE:
                 self.finish_transfer(transfer)
                 return
+            reader.pump(transfer.due_us())
+            t = reader.now_us()
+            field = transfer.field_at(t)
             scheme = transfer.scheme
             if field != shown_field or scheme != shown_scheme:
                 shown_field = field
@@ -1485,11 +1515,13 @@ class App:
                 if show_full(FIELD_COLOR[scheme].get(field, color.black),
                              FIELD_BACKLIGHT[scheme].get(field, 1.0)):
                     # The whole screen is the field and nothing else is
-                    # drawn; run() presents it.
+                    # drawn; run() presents it. The work waits a pass.
                     transfer_lights(transfer)
                     return
+            transfer.work(t)
             passes += 1
-            if passes % POLL_PASSES == 0 or passes == limit:
+            if t >= self.poll_at or passes == limit:
+                self.poll_at = t + POLL_MS * 1000
                 badge.poll()
                 if badge.pressed(BUTTON_B):
                     transfer.fail(ERR_CANCELLED)
@@ -1499,7 +1531,8 @@ class App:
 
     def finish_transfer(self, transfer):
         # The single exit from the transfer screen, so the only place the
-        # backlight has to go back down and HIRES come back.
+        # reader stops, the backlight goes back down and HIRES comes back.
+        transfer.reader.stop()
         restore_panel()
         if transfer.result != OK:
             self.error = transfer.result
@@ -1822,6 +1855,11 @@ class App:
             # its reflection, as a transfer's listen loop would: blocks for
             # the block. The pixels are white already.
             run.loopback(show_backlight)
+        elif run.ring_due:
+            # The same through the DMA ring (Dev Mode M4, M5): blocks for the
+            # test. The run read the temperature as the test began, before
+            # the ring took the ADC.
+            run.ring_test(ring_reader(), ring_note(), show_backlight)
         elif run.capture_due:
             present_us = time.ticks_us()
             display.update()
@@ -2004,10 +2042,13 @@ class App:
                   ("column", self.draw_measure_column),
                   ("lights", self.probe_lights),
                   ("measure", self.probe_measure))
-        self.probe_receiver = probe_receiver()
-        self.probe_listener = probe_listener()
+        # The POLLED listener the reads step times. Its reader is the
+        # launch's own: started here, stopped when the probe ends.
+        self.probe_listener = probe_listener(polled_reader())
         self.probe_passes = 0
-        self.probe_timed = TimedListener(probe_listener())
+        # Its own reader, so its timing is not shared with the other's.
+        self.probe_timed = TimedListener(probe_listener(
+            readers.PolledReader(badge.light_level)))
         hooks = Hooks(
             present=display.update,
             set_vsync=getattr(display, "set_vsync", None),
@@ -2020,12 +2061,13 @@ class App:
             mem_free=getattr(gc, "mem_free", None),
             ticks_us=time.ticks_us,
             reads=(("loop", self.probe_idle), ("read", badge.light_level),
-                   ("sample", sample_light), ("listen", self.probe_listen),
+                   ("sample", sample_light),
                    ("transfer", self.probe_transfer),
                    ("transfer_timed", self.probe_transfer_timed)),
             reads_detail=self.probe_timed.result,
             temp=core_temp_reader(), fast=fast_reads(),
-            flicker_filter=FlickerFilter)
+            flicker_filter=FlickerFilter, ring=self.probe_ring,
+            replay=probe_replay)
         self.probe = FrameProbe(hooks, firmware_info())
         self.screen = DEV_PROBE
 
@@ -2058,39 +2100,43 @@ class App:
     def probe_idle(self):
         pass
 
-    def probe_listen(self):
-        # One pass of a listener that never presents: the clock, a sample,
-        # the protocol's slot receiver, and the poll and B check that keep
-        # the buttons alive without run().
-        self.probe_receiver.feed(time.ticks_ms(), sample_light())
-        badge.poll()
-        badge.pressed(BUTTON_B)
-
     def probe_transfer_timed(self):
-        # The same pass, on a second listener whose step and parts are
-        # timed: where `transfer`'s time goes.
+        # The same pass, on the timed listener: where `transfer`'s time goes.
         self.probe_timed.step()
         self.probe_passes += 1
-        if self.probe_passes % POLL_PASSES == 0:
+        if self.probe_passes % 16 == 0:
             badge.poll()
             badge.pressed(BUTTON_B)
 
     def probe_transfer(self):
-        # One pass of the transfer's own listen loop, as do_transfer() runs
-        # it: a sample into a continuous Transfer listening in the data phase
-        # on the backlight, and the buttons every POLL_PASSES. What it hears
-        # is thrown away, and so are the budgets that would end it -- nobody
-        # is transmitting.
-        listener = self.probe_listener
-        buf = _SAMPLE
-        read_sample(SAMPLE_US, listener.deadline(), buf)
-        listener.sample(buf[0], buf[1], buf[2], buf[3], buf[4])
-        listener.idle_slots = 0
-        listener.stall_slots = 0
+        # One pass of the transfer loop, POLLED, as do_transfer() runs it,
+        # and the buttons every 16 passes. What it hears is thrown away, and
+        # so are the budgets that would end it -- nobody is transmitting.
+        listen_pass(self.probe_listener)
         self.probe_passes += 1
-        if self.probe_passes % POLL_PASSES == 0:
+        if self.probe_passes % 16 == 0:
             badge.poll()
             badge.pressed(BUTTON_B)
+
+    def probe_ring(self, presenting):
+        """Dev Mode M3: the EXACT listener on the 8 ms rung, through the
+        ring, for RING_LISTEN_MS; with `presenting`, the probe's status
+        frame presented every pass, the worst the panel's DMA can do to the
+        ring's. The ring is stopped before the probe reads the temperature
+        again."""
+        reader = ring_reader()
+        if reader is None:
+            return {"error": ring_note()}
+        listener = probe_listener(reader, EXACT_LIT_INDEX)
+        try:
+            return ring_listen(
+                listener, time.ticks_us,
+                present=display.update if presenting else None,
+                poll=badge.poll, collect=gc.collect,
+                mem_free=getattr(gc, "mem_free", None),
+                cancelled=lambda: badge.pressed(BUTTON_B))
+        finally:
+            reader.stop()
 
     def probe_measure(self):
         run = self.probe_run
@@ -2215,9 +2261,12 @@ class App:
         self.save_measurements(TOOL_PROBE, results)
 
     def end_probe(self):
+        for listener in (self.probe_listener,
+                         self.probe_timed and self.probe_timed.transfer):
+            if listener is not None:
+                listener.reader.stop()
         self.probe = None
         self.probe_run = None
-        self.probe_receiver = None
         self.probe_listener = None
         self.probe_timed = None
         restore_panel()

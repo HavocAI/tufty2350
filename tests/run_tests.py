@@ -69,6 +69,7 @@ def main(argv):
 
     passed = []
     failed = []
+    skipped = []
     for app, path in discover(only):
         module = os.path.basename(path)[:-3]
         try:
@@ -86,11 +87,19 @@ def main(argv):
                 passed.append(label)
                 if verbose:
                     print("  pass  %s" % label)
-            except Exception:
+            except Exception as error:
+                # harness.Skipped, by name: each test file loads its own
+                # copy of the harness.
+                if type(error).__name__ == "Skipped":
+                    skipped.append((label, str(error)))
+                    continue
                 failed.append((label, traceback.format_exc()))
                 print("  FAIL  %s" % label)
 
-    print("\n%d passed, %d failed" % (len(passed), len(failed)))
+    print("\n%d passed, %d failed, %d skipped" % (len(passed), len(failed),
+                                                  len(skipped)))
+    for label, why in skipped:
+        print("  SKIPPED  %s: %s" % (label, why))
     for label, tb in failed:
         print("\n" + "=" * 70 + "\n%s\n%s" % (label, tb.rstrip()))
     return 1 if failed else 0

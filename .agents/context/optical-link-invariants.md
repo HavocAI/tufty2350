@@ -24,8 +24,10 @@ a rate change is propagating. A permanent split has happened before: a Leader on
 reporting `ERR_LOST_PEER`. Another starts one: two badges whose frame times
 differ -- v2 firmware against v3, or a frame slipped to two refreshes -- used
 to start on different rungs. The rung a transfer starts on is now agreed in
-calibration from both badges' frame-rate classes ("Agreeing a rung" in the
-protocol); `tests/share_wifi/test_rate_class.py` runs such pairs.
+calibration -- the Follower decides the pair's tier and light and the Leader
+adopts them ("Agreeing a rung" in the protocol); `tests/share_wifi/test_tier.py`
+runs such pairs. One split is still open: F-B1, a Leader-started demotion the
+Follower in `STEP_VERDICT` does not hear ("Reading" in the protocol).
 
 **I2 — the slot grids agree.**
 The epochs may differ, but not by enough to matter:
@@ -33,19 +35,16 @@ The epochs may differ, but not by enough to matter:
 of a slot of zero. Half a slot is fatal, because the receiver samples the back
 half and lands on the transmitter's transition.
 
-With a present delay (`simulator.py --v2`, or `present_ms=`), I2 trips in
-almost every run: the receiver's grid lands later than the transmitter's by
-the part of the delay `edge_lag` does not correct, which phase locking does
-on purpose. Under that model I2 measures the offset, not a broken link, and
-delivery is the figure to read. A check that compares each receiver's read
-window with the transmitter's visible symbols would hold under both.
+Epochs are in µs since each badge's transfer began, so the simulator puts
+both on one timeline (each badge's start, and its crystal's error) before
+comparing them.
 
-Continuous badges (`simulator.py --loop`) mostly hold it -- their edge delay
-is corrected -- but a sensor slower than the one measured leaves a few ms
-between the delay assumed and the one seen, which on a 32 ms slot can pass a
-quarter of it without a symbol going wrong: at twice the measured sensor
-time constant, I2 tripped in 59 of 144 runs that all delivered. Read it as a
-diagnostic there too.
+Two badges' grids sit apart by the difference between the edge delay
+assumed (`EDGE_LAG_*_US`) and the one seen. On the measured sensor that is
+tens of µs; on one slower than measured it is a few ms, which on an 8 or 16
+ms slot can pass a quarter of it without a symbol going wrong: at three times
+the measured sensor time constant, I2 tripped in 24 of 144 runs that all
+delivered. Read it as a diagnostic, and delivery as the figure.
 
 **I3 — a rate change never moves the epoch.**
 Only `duration` changes. Re-basing the clock on a badge's own idea of "now"

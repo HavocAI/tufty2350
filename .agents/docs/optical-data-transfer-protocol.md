@@ -1,8 +1,10 @@
 # Optical Data Transfer Protocol
 
 Sends data between two badges using nothing but the screen and the light sensor. One
-badge displays flat fields at three light levels and the other reads them back with
-`badge.light_level()`.
+badge displays flat fields at three light levels and the other reads them back
+through its **reader** ([reader.py](../../firmware/apps/share_wifi/reader.py)): the
+ADC written by DMA into a ring where the badge can (EXACT), `badge.light_level()`
+polled where it cannot (POLLED). See "Reading".
 
 Implemented in [firmware/apps/share_wifi/protocol.py](../../firmware/apps/share_wifi/protocol.py) — pure Python,
 no badge globals. Its first and only user is the `share_wifi` app, specified in
@@ -38,15 +40,20 @@ Names match [firmware/apps/share_wifi/protocol.py](../../firmware/apps/share_wif
 | `GAP_SIGMAS` | 4 | each gap must be at least this many standard deviations of the noisier level beside it, so a threshold sits two from each. Chosen in simulation -- see "Separability" **[inferred-all]** |
 | `QUANTISATION_SD` | 4.62 | `SENSOR_STEP / sqrt(12)`: the floor on a level's noise, since readings that all land on one ADC code still carry up to half a step of error |
 | `MIN_HELD_SAMPLES` | 8 | settled samples a level needs before its noise is trusted |
-| `LCD_SETTLE_MS` | 24 | the panel's settling budget for one pixel transition: the slowest 90% of nine fits across five mirror runs, 16.1-24.1 ms **[measured-all]**. Was 16, from the datasheet |
-| `BACKLIGHT_SETTLE_MS` | 10 | the same for a symbol the backlight carries alone, which only a continuous badge can use: the sensor's, 1.0-1.3 ms to 90% lit and up to 7.8 ms in the dark **[measured-all]**, with margin -- see "Reading continuously" |
-| `BACKLIGHT_LIT_SETTLE_MS` | 5 | the backlight's settle when both badges are LIT: 1.0-1.3 ms to 90% in a lit room **[measured-all]**, with margin |
-| `LIT_BLACK_COUNTS` | 64 | a continuous badge is LIT when the black it reads is at least this, four ADC steps: 32 in the dark, 80-96 lit on the mirror **[measured-all]** |
-| `BACKLIGHT_PROVEN_MS` | 50 | the rung a continuous backlight badge treats as proven; faster ones are a gamble, and a bad CRC there demotes |
-| `FINE_MS` | 2 | a continuous badge pools its readings into samples this long for the data phase |
-| `COARSE_MS` | 8 | ... and this long for discovery and calibration. A once-a-frame caller gets one of each per call |
-| `HANDSHAKE_GAP_MS` | 7 | a continuous Follower in Peer Present drops the coarse sample in progress when its readings stop this long -- a present's 7.8 ms or more, not a call's ~1 **[measured-v2]** -- but never twice running. See "Peer present" |
-| `BACKLIGHT_EDGE_LAG_MS` | 1 | how late a continuous receiver sees a backlight edge: up to a PWM period, then the sensor's climb to `T_low` -- 0.3 ms dark and about 0 lit from the dim low **[measured-all]** |
+| `LCD_SETTLE_MS` | 24 | the panel's settle, 16.1-24.1 ms to 90% [measured-all]: beacons and Dev Mode |
+| `BACKLIGHT_SETTLE_MS` | 10 | a POLLED pair's backlight settle, dark: 7.8 ms worst [measured-all], with margin |
+| `BACKLIGHT_LIT_SETTLE_MS` | 5 | ... and LIT |
+| `LIT_BLACK_COUNTS` | 64 | a badge is LIT when the black it reads is at least this, four ADC steps: 32 in the dark, 80-96 lit on the mirror [measured-all] |
+| `BACKLIGHT_PROVEN_MS` | 50 | the rung below which every rung is a gamble: a bad CRC there demotes |
+| `FINE_MS` | 2 | a fine sample: the reader's mean over this long, pulled back to back before the data phase -- the flicker fit's input, pooled into coarse samples |
+| `FINE_US` | 2000 | `FINE_MS` in µs |
+| `COARSE_MS` | 8 | a coarse sample in discovery: the beacon detector's, sized for about one sample a frame |
+| `DUE_MARGIN_US` | 100 | a loop waiting for a window or a sample pumps this far past it, so the readings it waits for are complete |
+| `CAL_SAMPLE_MS` | 4 | a coarse sample in calibration: ten a 40 ms step, `STEP_SAMPLES` of them 12 ms held |
+| `HANDSHAKE_GAP_MS` | 7 | a Follower in Peer Present drops the coarse sample in progress once its fine samples have been empty -- no readings: a POLLED badge presenting -- longer than this, unless that sample already follows a drop. See "Peer present" |
+| `BACKLIGHT_EDGE_LAG_MS` | 1 | the same edge delay in ms, for Dev Mode's polled `loopback` |
+| `EDGE_LAG_LIT_US` | 100 | the rise lock takes this off a crossing, LIT: from the backlight call to `T_low`, ~0 at 2 ms resolution [measured-all; **unmeasured** sub-ms: M4, M5] |
+| `EDGE_LAG_DARK_US` | 300 | ... and dark, from the dim low: 0.3 ms [measured-all, 10-06 loopback; **unmeasured** sub-ms: M4, M5] |
 | `FLICKER_HZ` | 100, 120 | the mains flicker frequencies a continuous badge estimates and takes off its readings |
 | `FLICKER_TAU_MS` | 250 | how much dark time the flicker estimate averages over |
 | `FLICKER_MIN_COUNTS` | 4 | flicker smaller than this, a quarter of an ADC step, is left alone |
@@ -56,53 +63,64 @@ Names match [firmware/apps/share_wifi/protocol.py](../../firmware/apps/share_wif
 | `FLICKER_SPAN_US` | 250 | a sample's span is rounded to this for the table of sin(x)/x |
 | `FLICKER_MAINS` | 50, 60 | the mains a fit tries: the better explains the window |
 | `FLICKER_HARMONICS` | 4 | harmonics of the mains fitted: 50-200 or 60-240 Hz |
-| `FLICKER_FIT_MS` | 200 | the Leader's fit window, from its own staircase, which the Follower watches dark |
-| `FLICKER_FIT_LEAD_MS` | 175 | how far past its opening gap the Leader's window starts: its fit then falls mid-step |
-| `FLICKER_FOLLOWER_FIT_MS` | 100 | the Follower fits this long after seeing the Leader quiet, from this long of samples: inside the Leader's 450 ms of dark with 50 to spare |
+| `FLICKER_FIT_MS` | 160 | the Leader's fit window: the last this long of its staircase's body, fitted as its closing gap begins |
+| `FLICKER_FOLLOWER_FIT_START_MS` | 160 | the Follower's fit window starts this long after the Leader's last beacon crossing |
+| `FLICKER_FOLLOWER_FIT_MS` | 100 | ... and is this long, fitted at its end: inside the Leader's dark with 17 ms to spare at the start and 30 at the end |
 | `FLICKER_FIT_MAX_NOISE` | 12 | counts a fit may leave unexplained: more, and the window was not steady -- the filter learns as before |
 | `FLICKER_FIT_SIGMAS` | 4 | a fitted harmonic counts only this many standard errors clear of the fit's noise |
 | `FLICKER_FIT_PASSES` | 2 | refinements of the fit's projections, each on what the others leave |
 | `FLICKER_MIN_SEEN` | 0.30 | a harmonic is fitted only if the window's samples keep this much of it through their averaging |
-| `FLICKER_BUFFER` | 96 | samples kept for the fit, ~290 ms |
+| `FLICKER_BUFFER` | 640 | fine samples kept for the fit and the Follower's replay: 1.28 s of them |
 | `FLICKER_TRACK_POINTS` | 8 | samples a phase-lock update while a badge sends its staircase or waits out the gap |
 | `FLICKER_TRACK_GAIN` | 0.25 | the share of an update's timing error that moves the table |
 | `FLICKER_TRACK_MAX_STEPS` | 16 | an update's error is clipped to this many steps |
 | `FLICKER_RATE_MEMORY` | 0.99 | the drift's line keeps this much of its past an update |
 | `FLICKER_RATE_MIN_S` | 0.30 | the line's points must span this long before its slope is the rate |
+| `FLICKER_RATE_MIN_UPDATES` | 10 | ... and carry this much weight of updates; until then the rate is 0 |
 | `FLICKER_MAX_RATE` | 32 | steps a second the rate is bounded to: 0.1 Hz of mains drift |
-| `PIXEL_EDGE_MS` | 13 | how long after a pixel write begins a rise crosses `T_low`: 8.5-18.5 ms across runs **[measured-v2]**. A continuous receiver adds half a refresh for its peer's wait for vertical blank |
-| `BACKLIGHT_TX_MS` | 3 | how coarsely a continuous transmitter places a backlight symbol, for the end-of-slot guard |
-| `PIXEL_WINDOW_PERCENT` | 60 | where a continuous pixel receiver's read window opens, as a share of the slot |
-| `BACKLIGHT_GUARD_PERCENT` | 15 | the backlight's end-of-slot guard, at least, as a share of the slot |
-| `SLOT_SAMPLES` | 128 | samples a slot keeps, in a buffer allocated once |
-| `SETTLE_SLOTS` | 3 | a slot must be worth this many settle times |
-| `END_GUARD_PERCENT` | 65 | how far short of a slot's end its samples stop counting, as a percentage of a frame, capped to leave a window of at least 1.2 frames |
-| `SLOT_LADDER` | 250, 200, 160, 130, 100, 80, 65, 50, 40, 32, 25, 20, 16 | slot durations in ms, slowest first. Below 80 only for a continuous badge on the backlight; 20 and 16 only in a lit room |
+| `BACKLIGHT_TX_MS` | 3 | how coarsely a POLLED reader takes a transmitter to place a symbol, for its end guard |
+| `BACKLIGHT_GUARD_PERCENT` | 15 | the end-of-slot guard, at least, as a share of the slot: both tiers |
+| `SETTLE_SLOTS` | 3 | a POLLED rung must be worth this many settle times |
+| `END_GUARD_PERCENT` | 65 | a POLLED window's end guard, as a percentage of `BACKLIGHT_TX_MS`, capped -- the read loop's rule, which the POLLED rungs were found with |
+| `SLOT_LADDER` | 250, 200, 160, 130, 100, 80, 65, 50, 40, 32, 25, 20, 16, 13, 10, 8 | slot durations in ms, slowest first. 13, 10 and 8 for EXACT pairs |
+| `SETTLE_LIT_US` | 2500 | an EXACT reader's window opens no sooner than this into a slot, LIT: the sensor's 90% in 1.0-1.5 ms from the call [measured-all], x ~2 [**gated**: M4] |
+| `SETTLE_DARK_US` | 10000 | ... and dark: 7.75 ms worst, off to middle [measured-all]; the dim low only faster [inferred-all; **unmeasured** at sub-ms: M4]. 5000 would start dark pairs on 10 ms |
+| `GUARD_LIT_US` | 1000 | an EXACT reader's window closes at least this short of the next boundary, LIT |
+| `GUARD_DARK_US` | 2000 | ... and dark: a rise to the middle crosses `T_low` later than one to high, ~3 ms from off [measured-all], less from the dim low [**unmeasured**: M4] |
+| `OPEN_PERCENT` | 40 | an EXACT window opens no sooner than this share of the slot |
+| `WINDOW_MIN_US` | 2000 | an EXACT window at least this long, or the rung is not one a pair starts on: 100 readings |
+| `SLOT_MIN_MS` | 6 | no slot shorter: twice the worst per-slot work assumed on v2 [**unmeasured**: M3 `slot_work`] |
+| `PART_MAX_US` | 4000 | a window is decided from the median of parts of it, each at most this long -- inside the flicker table's spans |
+| `PARTS_MIN` | 5 | ... and at least this many parts |
+| `PARTS_MAX` | 32 | ... and at most this many |
+| `POLL_PART_READINGS` | 2 | a POLLED window's parts are merged until each holds this many readings |
 | `OPTIMISTIC_RUNGS` | 0 | rungs past the proven floor a transfer will gamble on |
-| `ANNOUNCE_HALF_MS` | 250 | Leader beacon half period |
-| `PRESENT_HALF_MS` | 400 | Follower beacon half period |
+| `ANNOUNCE_HALF_MS` | 100 | Leader beacon half period. 250 until 2026-10: every reader now reads continuously |
+| `PRESENT_HALF_MS` | 160 | Follower beacon half period. 400 until 2026-10 |
 | `BEACON_TOLERANCE` | 0.20 | how far a measured half period may sit from nominal |
-| `PLATEAU_MS` | 200 | one calibration step, for a badge sampling once a frame |
-| `PLATEAU_CONTINUOUS_MS` | 150 | one calibration step for a continuous badge, which samples every `COARSE_MS`: eighteen samples |
-| `CAL_REPS` | 3 | staircase repetitions from a FAST badge |
-| `CAL_REPS_SLOW` | 5 | staircase repetitions from a SLOW badge: the frame-rate class, carried by the count |
-| `SLOW_STEPS_MIN` | 4 | high steps a reader must count to take its peer for SLOW |
-| `CAL_REPS_LIT` | 2 | staircase repetitions from a LIT badge: a continuous badge in a lit room |
-| `LIT_STEPS_MAX` | 2 | high steps at most for a reader to take its peer for LIT |
-| `FRAME_SAMPLES` | 31 | recent frame times a badge takes the median of to decide its class |
-| `SLOW_RUNG_MS` | 100 | the rung a SLOW class stands for: 2.5 frames of up to 40 ms |
-| `FAST_INDEX` | 5 | derived: the index of the fastest rung the panel's settle floor allows (80 ms), which a FAST class stands for on pixels |
-| `BACKLIGHT_LIT_INDEX` | 12 | derived: where two LIT badges on the backlight start (16 ms): three `BACKLIGHT_LIT_SETTLE_MS` |
-| `BACKLIGHT_INDEX` | 9 | derived: the fastest rung a continuous badge on the backlight can start on (32 ms): 2.5 `FINE_MS` samples and three `BACKLIGHT_SETTLE_MS` |
-| `SLOW_INDEX` | 4 | derived: `SLOT_LADDER.index(SLOW_RUNG_MS)`, the 100 ms rung |
-| `CAL_GAP_MS` | 300 | black gap bracketing a staircase |
+| `PLATEAU_MS` | 40 | one calibration step, both tiers [**gated** on the POLLED sweep: 40, 60, 80 tried, 60 and 80 no better] |
+| `CAL_REPS` | 3 | staircase repetitions for DARK |
+| `CAL_OPEN_LEADER_MS` | 400 | the Leader's opening gap: long enough that the Follower's flicker fit, run inside it, ends there too |
+| `CAL_OPEN_MS` | 250 | the Follower's opening gap |
+| `CAL_CLOSE_MS` | 250 | closing gaps: found `CAL_CLOSE_MS - 60` in, and longer than a beacon's quiet |
+| `CAL_RESTARTS` | 1 | times a staircase that does not separate is read afresh before `ERR_CONTRAST` |
+| `FLICKER_FOLLOWER_LATE_FIT_MS` | 880 | a POLLED Follower fits by this long after the quiet, when the Leader's staircase has ended |
+| `CAL_REPS_LIT` | 2 | staircase repetitions for LIT. The Leader's staircase carries its own light; the Follower's the pair's |
+| `LIT_STEPS_MAX` | 2 | high steps at most for a reader to take a staircase for LIT |
+| `BACKLIGHT_LIT_INDEX` | 12 | derived: where a POLLED pair starts LIT (16 ms): three `BACKLIGHT_LIT_SETTLE_MS` |
+| `BACKLIGHT_INDEX` | 9 | derived: where a POLLED pair starts in the dark (32 ms): 2.5 `FINE_MS` samples and three `BACKLIGHT_SETTLE_MS` |
+| `EXACT_INDEX` | 12 | derived: where an EXACT pair starts in the dark (16 ms): the fastest rung whose window, by `SETTLE_DARK_US` and `GUARD_DARK_US`, is `WINDOW_MIN_US` |
+| `EXACT_LIT_INDEX` | 15 | derived: where an EXACT pair starts LIT (8 ms): the same by `SETTLE_LIT_US` and `GUARD_LIT_US`; the rule allows 6, which is not on the ladder [**gated**: Dev Mode M5] |
+| `PROVEN_INDEX` | 7 | derived: `BACKLIGHT_PROVEN_MS`'s rung. CRC failures faster than it demote |
+| `CAL_GAP_MS` | 250 | the shared gap after calibration, before the slot clock starts: `CAL_CLOSE_MS` |
 | `ANNOUNCE_TIMEOUT_MS` | 60000 | how long either badge looks for a peer |
+| `TRANSFER_MAX_US` | 1006632960 | a transfer this long ends `ERR_LOST_PEER`: its relative µs stay a small int |
 | `BLOCK_TIMEOUT_MS` | 300000 | outer deadline on a single block |
 | `LOST_PEER_SLOTS` | 16 | more than this many consecutive black slots end a transfer |
 | `STALL_SLOTS` | 64 | more than this many slots spent listening without the transfer advancing end it, or prompt a Follower's resend request |
 | `RESEND_QUIET_SLOTS` | 3 | consecutive black slots a Follower waits for before asking for a block again -- after a stall or a framing failure -- so the Leader has finished transmitting |
 | `MAX_BLOCK_RETRIES` | 2 | CRC failures tolerated per block |
-| `MAX_BLOCK_ATTEMPTS` | 39 | absolute ceiling on transmissions of one block: `(MAX_BLOCK_RETRIES + 1)` per rung |
+| `MAX_BLOCK_ATTEMPTS` | 48 | absolute ceiling on transmissions of one block: `(MAX_BLOCK_RETRIES + 1)` per rung |
 | `BLOCK_BYTES` | 64 | payload bytes per block |
 | `RESYNC_LEAD_IN` | 4 | black slots before every block |
 | `MAX_PATTERN` | 16 | longest symbol run any match looks back over |
@@ -199,7 +217,8 @@ with the sensor's noise to land within a sixth of the true value
 **[inferred-all]**. `SETTLE_SLOTS` x 16-24 ms is 49-72 ms, so the fastest safe
 rung would be 65 or 80 ms rather than 50. The simulator's `slow panel` and
 `cold panel` scenarios are 16 and 24 ms. **Acted on**: `LCD_SETTLE_MS` is 24,
-so pixels start on the 80 ms rung -- see "Reading continuously".
+so pixels started on the 80 ms rung, until the data phase left pixels
+altogether -- see "Why the fields staircase went".
 
 **The hold costs a step; the whole screen and full-range colours together
 gain a step at most.** Held flat, 10-03 (bands, tinted colours) and 10-05
@@ -315,8 +334,8 @@ frame leaves about one, because the present blocks reading for 12.4 ms of each
 16.7. The listening badge's screen never changes while it listens, so nothing
 requires it to present; edges would be timed to half a millisecond rather
 than somewhere in a 12.3 ms blind stretch. **Acted on**: the app's transfer
-now runs exactly that loop -- see "Reading continuously". See "Reading
-without presenting" in [badgeware-hardware.md](badgeware-hardware.md).
+ran exactly that loop, and now reads through a DMA ring -- see "Reading".
+See "Reading without presenting" in [badgeware-hardware.md](badgeware-hardware.md).
 
 **The backlight scheme skips the panel as well as the present.**
 `display.backlight()` writes the PWM duty directly **[source-v2]**, so a
@@ -366,8 +385,8 @@ takes effect at the next wrap, one ~263 µs period at most **[inferred-v2]**.
   be the fastest the scheme can go.
 - **Now used.** The transfer loop places each backlight symbol within a
   reading of its boundary and reads continuously, the simulator models the
-  backlight and the sensor apart from the pixels, and a continuous badge on
-  the backlight starts on 32 ms -- see "Reading continuously". The 2nd-badge
+  backlight and the sensor apart from the pixels, and a pair on the
+  backlight starts on 8-32 ms by its readers and light -- see "Reading". The 2nd-badge
   `eye` run that would show a peer's swing at speed has still not happened.
 - **The middle level was two ADC steps.** Every capture's swing, off to
   0.74, was 32 counts against 80-96 for off to full -- the 0.33-0.4 share
@@ -431,51 +450,177 @@ it falls off a cliff, and the measured figure is well below the bottom of it.
 
 ---
 
-## Reading continuously
+## Reading
 
-**A transfer reads the sensor on every pass of a loop that never presents,
-and presents only to change pixels.** Before 2026-10-05 the app stepped the
-protocol once a frame under `run()`, which presents every frame, and the
-present blocks reading for 12.3 ms of each 16.7 **[measured-v2]**: a 50 ms
-slot held about one usable reading. Everything here follows from five
-measurements -- the listener's read rate, the backlight being live at once,
-the sensor's speed, the panel's settle, and when a pixel change reaches the
-panel (see "What the measurement found").
+**A transfer reads the sensor through a reader for its whole length, and the
+protocol is called once a slot.** Two readers, in
+[`reader.py`](../../firmware/apps/share_wifi/reader.py), which is pure:
 
-**The loop.** `do_transfer()` in the app reads a sample a pass:
-`read_sample()` reads `light_level()` back to back for `FINE_MS` (2 ms),
-or up to the next symbol boundary while transmitting (`deadline()`), with
-nothing but locals in the loop, and hands their mean, mean time and span to
-`Transfer.sample()`. A change of backlight is a `display.backlight()` call,
-made in the loop. Only a change of pixels returns to `run()`, whose present
-shows it -- blocking reading for up to a refresh and a 7.8 ms write. The
-buttons are polled every `POLL_PASSES` (16) samples, about 50 ms, which also
-keeps `badge.ticks` moving. HOME is a pin interrupt on v2 and needs no
-polling **[source-v2]**. The backlight scheme's pixels are white for every
-symbol, so once a transfer is on it, nothing is presented until it ends:
-neither badge is ever presenting. It is blind only for the protocol's call
-between samples.
+- **EXACT**, `RingReader` over `fastadc.Ring`: the ADC converting
+  free-running at `RING_RATE_HZ` (50 kHz) and one DMA channel writing every
+  reading into a 32 KB ring -- 16,384 readings, 327.7 ms -- with no CPU at
+  all. A reading's time is its index: `anchor + 20 µs x index`. A protocol
+  call, a present, a collection or a fit no longer blinds the receiver; it
+  only delays when the readings are looked at.
+- **POLLED**, `PolledReader`: `light_level()` read in a loop whenever the
+  protocol has nothing due, into `POLL_BINS` (1,024) bins of `POLL_BIN_US`
+  (250 µs), 256 ms. Blind while the badge does anything else. The fallback
+  where the ring is refused.
 
-**The protocol takes a sample at a time.** Two streams:
+Both answer the same queries -- `parts(t0, t1, n, out)`, the means of n equal
+parts of a span; `mean()`; `rise()`, the first crossing of a threshold -- in
+`light_level()` counts, with -1 for a part that has no readings or has left
+the history. The tier is carried in the staircase's order (see "The flags");
+it sets only the start rung and where this badge puts its own window.
 
-- **`FINE_MS` (2 ms) samples** for the data phase: a slot's window and an
-  edge's time are decided from them. `sample()` hands one in whole;
-  `step()`, for a caller that reads one at a time -- once a frame, or the
-  tests -- pools readings into them.
-- **`COARSE_MS` (8 ms) samples** for discovery and calibration, whose
-  detectors and buffers were sized for about one sample a frame:
-  `BeaconDetector`'s 128-sample window, `StaircaseReader`'s 512,
-  `STEP_SAMPLES`. Pooled from fine samples, or from readings.
-- **A once-a-frame caller is unchanged**: each `step()` is one sample of
-  each, at its own time.
-- **The transmitted symbol changes at the boundary**: a sample being read
-  while transmitting ends at `deadline()`, the next slot boundary, so the
-  call that changes the symbol comes within a reading and the call's own
-  time of it.
+Before 2026-10-07 the app read `light_level()` back to back for 2 ms
+samples and called the protocol once a sample -- "reading continuously". The
+history of that, and why each reading's cost mattered, is under "What a
+reading costs" below; the loop is gone.
 
-**What a reading costs.** On the badge, each Python operation costs
-microseconds, and a protocol call costs about a ms. The probe's
-`reads.transfer`, one protocol call per reading, ran:
+### The ring
+
+Made once a launch, on the first transfer, by `transfer_reader()`; the
+reason it was refused, if it was, is `ring_note()`, and Dev Mode records it.
+
+- **The buffer** is a 64 KB `bytearray`, allocated once, whose address must
+  lie in PSRAM behind the XIP cache, 0x11000000-0x117FFFFF **[source-v3:
+  `mpconfigboard.cmake`]**. The ring is its 32 KB-aligned half, used only
+  through the **uncached alias**, 0x15000000 + (address - 0x11000000) --
+  `XIP_NOCACHE_NOALLOC_BASE` 0x14000000 plus chip select 1's 16 MB **[Pico
+  SDK `addressmap.h`; `st7789.hpp`'s `XIP_PSRAM_NOCACHE`]**. The DMA writes
+  there and every read is there, so no cache line holds a stale or dirty copy.
+  Before first use the cached alias's lines are cleaned and invalidated by
+  byte writes to `0x18000000 + (address - 0x10000000) + 3`, one per 8-byte
+  line **[Pico SDK `xip_cache.c`, `cache_op_t`]**, so the allocator's
+  zero-fill cannot be written back over DMA data later.
+- **Hardware**: `ADC.DIV` = 959 (960 cycles of the 48 MHz clock, 50 kHz
+  exactly), `FCS` = `EN | DREQ_EN | THRESH(1)`, a channel paced by `DREQ_ADC`
+  (48) with `pack_ctrl(size=1, inc_write=True, ring_size=15, ring_sel=True,
+  high_pri=True)` and a count of `COUNT0` (0x0FFFFFFF: `TRANS_COUNT` is 28
+  bits on RP2350, 5,369 s at 50 kHz), then `CS` = `AINSEL(3) | EN |
+  START_MANY`. `high_pri` lets the ring win arbitration over the panel's DMA
+  during a present. The ring fields and `high_pri` have never run on the
+  badge **[unverified]**.
+- **Position** is `COUNT0 - dma.count`: the next index to be written. The
+  newest reading trusted is two short of it, since the write may be in
+  flight.
+- **Health**, checked before every block: the ADC still converting input 3
+  many; `FCS.OVER` (bit 11) and `FCS.UNDER` (bit 10), write-1-to-clear
+  **[Pico SDK `adc.h`, RP2350]**, cleared by writing the ring's own `FCS`
+  value with them set, never a read-modify-write; the channel still busy. A
+  lost reading re-anchors and carries on. Anything else ends the transfer
+  `ERR_LOST_PEER`: there is no switch to POLLED mid-transfer.
+- **The anchor**, the time of index 0, is the best of `ANCHOR_TRIES` (4)
+  brackets of `ticks_us()` around a position read. At every block a fresh one
+  is compared, not adopted -- one crystal clocks both -- and a difference past
+  `RING_DRIFT_US` (100, five readings) is counted as lost readings and
+  adopted.
+- **The history** a query may use is the ring less `RING_SAFE_US` (10 ms)
+  kept clear of the write pointer: 317.7 ms.
+- **`verify()`**, once a launch, about 0.4 s: checks the cache clean wrote
+  back the marker `Ring()` dirtied the cached alias with; fills the ring
+  with 0xFFFF, which no 12-bit reading is; checks after 2 ms that the DMA
+  has written what it should and not past it, and again after a wrap; then
+  churns 256 KB of heap and checks at once that no cached line -- the
+  marker -- landed over the readings; and runs each viper kernel
+  against its pure twin on 1,024 readings. Any failure stops the ring and leaves the
+  launch on POLLED. This is where the uncached alias, the cache maintenance
+  and the ring fields are established on a given firmware -- Dev Mode M1 and
+  M3 record the outcome.
+- **Stopping**: `finish_transfer()` stops the reader, and the app's
+  `on_exit()` stops it too, inside `try`, however the app is left: HOME runs
+  `on_exit()` and then resets **[source-v2]**, and a raise there would skip
+  the reset. Nothing else may touch the ADC while the ring runs -- not
+  `light_level()`, not the temperature; Dev Mode reads `temperature_c` before
+  the ring starts and after it stops.
+
+**The kernels** -- `ring_sum`, `ring_parts`, `ring_rise`, `ring_fill`,
+`ring_count` -- are `@micropython.viper`, read with `ptr16` through the
+alias, index `& mask`, and allocate nothing. Each has a pure twin in
+`reader.py`; `tests/share_wifi/test_fastadc_kernels.py` checks kernel against
+twin under CPython, compiles `fastadc.py` with `mpy-cross` and runs the
+kernels under the unix port's real viper when those are found. A kernel's
+cost over the uncached alias is **[unmeasured -- M3
+`kernel_us_per_1000`]**.
+
+### The loop
+
+```
+while True:                               # do_transfer()
+    if transfer.collect_due: gc.collect()  # asked for, never inside a call
+    reader.pump(transfer.due_us())         # wait; POLLED reads meanwhile
+    t = reader.now_us()
+    show transfer.field_at(t)              # backlight now; pixels -> run()
+    transfer.work(t)                       # everything complete by t
+    every POLL_MS (50 ms): poll, B, case lights
+```
+
+`due_us()` is the next slot boundary while transmitting, the close of the
+next undecided slot's window while listening, the end of the next 2 ms
+sample before the data phase, and now when a collection is due. So a
+transmitter sets its backlight one pass of the spin after the boundary, then
+works. Only a change of pixels -- the beacons -- returns to `run()` to be
+presented; the ring reads through it.
+
+**Time is µs since the transfer began**, accumulated from `ticks_us()` so it
+never wraps; `TRANSFER_MAX_US` (2^30 - 2^26) ends a transfer `ERR_LOST_PEER`
+long before it would leave a small int. The phases before the data phase
+keep their ms logic, fed `t // 1000`.
+
+**Before the data phase** the protocol pulls the 2 ms means since its last
+call from the reader and pools them: `COARSE_MS` (8) in discovery,
+`CAL_SAMPLE_MS` (4) in calibration.
+
+**In the data phase** it decides each slot once the slot's window has closed
+-- see "Slots and sampling" -- from the median of 5-32 (`PARTS_MIN`,
+`PARTS_MAX`) flicker-corrected parts of at most `PART_MAX_US` (4 ms); an
+even count's median is the mean of the middle two. A POLLED window's parts
+are merged in order until each holds `POLL_PART_READINGS` (2) readings
+(`merge_parts()`), each then flicker-corrected over the span it covers
+(`part_span`) -- at the nominal span a 6 ms merged part had 2.5 times too
+much 120 Hz taken off: at a reading every 2 ms a part held one or none, and the
+median of two parts -- the upper one, before the even-count rule -- read a
+dark slot after a lit one inside the hysteresis band. Slots
+are decided in order; after a stall the protocol catches up, losing time but
+no readings while the stall is shorter than the ring's history. Slots this
+badge transmits in, or breaks in on, are never decided. A re-base makes slot
+0 of the new grid the next decided; a demotion skips only the slot it
+straddles.
+
+### Rungs
+
+`exact_index()` is the fastest rung whose window -- from `max(settle, 40%)`
+to `max(guard, 15%)` short of the end -- is at least `WINDOW_MIN_US` (2 ms,
+100 readings), and at least `SLOT_MIN_MS` (6):
+
+| Pair | settle / guard | starts on | proven |
+|---|---|---|---|
+| EXACT, both LIT | `SETTLE_LIT_US` 2.5 ms / `GUARD_LIT_US` 1 ms | **8 ms** | 50 ms |
+| EXACT, dark | `SETTLE_DARK_US` 10 ms / `GUARD_DARK_US` 2 ms | **16 ms** | 50 ms |
+| POLLED, both LIT | the old rule | 16 ms | 50 ms |
+| POLLED, dark | the old rule | 32 ms | 50 ms |
+
+A pair is EXACT only if both are, and LIT only if both are: the Follower
+decides and the Leader adopts (see "The flags"). The ladder gained 13, 10 and
+8 ms. Settle and guard are the sensor's measured speed -- 1.0-1.3 ms to 90%
+lit, up to 7.8 ms from off in the dark -- with margin, measured from off and
+at 2 ms resolution; from the dim low it is only faster
+**[inferred-all; unmeasured -- M4 `backlight_step_ring`]**. Whether a dark
+pair can start on 10 ms, and a lit one on 6, waits on M4 and M5.
+
+**Edges.** A crossing is found in the reader's history (see "Phase
+locking") and the boundary put `EDGE_LAG_LIT_US` (100) or
+`EDGE_LAG_DARK_US` (300) before it: the PWM wrap, up to ~263 µs
+**[source-v2]**, and the sensor's climb to `T_low`, 0.3 ms in the dark from
+the dim low on the 10-06 loopback at 2 ms resolution **[measured-all;
+unmeasured at sub-ms -- M4, M5 `lag_us`]**.
+
+### What a reading costs
+
+On the badge each Python operation costs microseconds and a protocol call
+about a millisecond **[measured-v2]**. Called once a reading, the old loop's
+`reads.transfer` ran:
 
 | Run | Pass | |
 |---|---|---|
@@ -483,94 +628,19 @@ microseconds, and a protocol call costs about a ms. The probe's
 | 2026-10-06a | 705 µs | `step()` per reading, with a cheap path for a second reading in the same ms |
 | 2026-10-06b | 1,073 µs | the same, in a run 1.5 times slower throughout |
 
-**[measured-v2]** The cheap path never ran: `reads.detail` on 06b counted
-545 first readings of a ms and no others. A first reading cost ~1.6 ms --
-`step_data` 422 µs, the flicker's correction 310, its learning 223, the
-pooling 154 -- so the next reading was always in a new ms. Under
-MicroPython's unix port the same code ran six to fifteen times faster than
-the old: the port is no guide to the badge's cost, only to its shape.
+The cheap path never ran: a first reading cost ~1.6 ms, so the next was always
+in a new ms. Under MicroPython's unix port the same code ran six to fifteen
+times faster: the port is no guide to the badge's cost, only to its shape.
+That led to reading 2 ms samples in a tight loop and calling once a sample;
+the ring takes the readings off the CPU altogether, and the protocol is now
+called once a slot. What a decided slot costs on the badge is
+**[unmeasured -- M3 `slot_work`]**; the simulator charges `SLOT_WORK_MS`
+(1.2 ms) a slot and `PASS_WORK_MS` (0.15) a pass, and `work3` triples both.
 
-So the app now reads in a tight loop of its own and calls the protocol once
-a sample: per reading only `light_level()`, two adds and a clock read; per
-sample the ~1 ms call, reading nothing. The simulator models that,
-`LOOP_CALL_MS` (1.0 ms, x0.7-1.5) after every sample. The probe's
-`reads.transfer` is now a pass of that loop, `reads.detail` the call's
-parts and the readings a sample held. The app's loop also looks up a
-backlight and a pen only when the field or scheme changes.
+### Breaking in
 
-In simulation, sampling holds or improves everything in the dark -- 144 of
-144 under every stress, including all of them at once, where reading per
-reading gave 143 -- and ends the calibration failures in bright
-flicker. In a flickering lit room it settles a rung lower: 20 ms rather
-than 16 at 47%, 143 of 144 at a median 14.2 s against 141 at 13.4.
-
-**Rungs are per scheme.** `rung_for(sample, settle)` is the fastest rung with
-2.5 samples a slot and `SETTLE_SLOTS` settle times:
-
-| | settle | starts on | proven |
-|---|---|---|---|
-| pixels, either way of reading | `LCD_SETTLE_MS` 24 ms | 80 ms | 80 ms |
-| backlight, once a frame | `LCD_SETTLE_MS` 24 ms | 80 ms | 80 ms |
-| backlight, continuous | `BACKLIGHT_SETTLE_MS` 10 ms | **32 ms** | 50 ms |
-| backlight, continuous, both badges LIT | `BACKLIGHT_LIT_SETTLE_MS` 5 ms | **16 ms** | 50 ms |
-
-The backlight's 10 ms is the sensor's measured worst, 7.8 ms to 90% from off
-to the middle level in the dark, with margin; 8 would start on 25 ms. Below
-50 ms is a gamble -- the sensor's speed rests on one mirror's measurements
-and slows with less light -- so a bad CRC there demotes rather than ends the
-transfer.
-
-**A continuous badge prefers the backlight.** It is three times faster, so
-`choose_scheme()` takes it whenever it calibrated at all: calibration has
-already held each gap to its noise, and `separation()` is 0 when the middle
-step does not hold, as on a sensor that follows the PWM. A once-a-frame badge
-keeps the old rule, the better separation.
-
-**Edges.** A continuous receiver believes an edge out of black on its second
-lit sample and times it from the first: one reading's noise can reach `T_low`
-on its own at 2 ms samples. It then subtracts the delay a continuous
-transmitter's edge arrives with:
-
-- **Backlight**, `BACKLIGHT_EDGE_LAG_MS` (2): up to a PWM period for the duty
-  to take effect, then the sensor's climb to `T_low`, 0.3-0.6 ms lit and 2-3
-  ms in the dark.
-- **Pixels**, half a refresh plus `PIXEL_EDGE_MS` (13): the transmitter
-  presents at a random point in the refresh, then the write and the liquid
-  crystal -- 8.5-18.5 ms from the write to `T_low` across runs.
-
-**Windows.** The backlight's guard at the end of a slot is at least
-`BACKLIGHT_GUARD_PERCENT` (15%) of it: its transmitter is precise but the
-sensor is not, and a rise to the dim middle level crosses `T_low` about 3 ms
-later than one to high in the dark, so a grid locked on one sits that far
-from the other. A continuous pixel receiver opens its window at
-`PIXEL_WINDOW_PERCENT` (60%), not half way: a pixel symbol arrives anything
-from 7 to 33 ms after its boundary on a slow panel, depending on where in the
-refresh the transmitter's present fell, and then settles.
-
-**A lit room starts on 16 ms.** The sensor is fastest with light on it --
-1.0-1.3 ms to 90% in a lit room, up to 7.8 ms in the dark **[measured-all]**
--- so a continuous badge reading at least `LIT_BLACK_COUNTS` (64, four ADC
-steps) of black calls itself LIT and says so in its staircase: two
-repetitions rather than three (see "Agreeing a rung"). Two LIT badges on the
-backlight budget 5 ms of settle and start on 16 ms. Below 16 the limit in
-simulation was not the light but the protocol's own resolution -- whole-ms
-slots and 2 ms samples, a 12 ms slot leaving two or three samples in its
-window -- and lit and dark failed alike: 12 ms delivered 18-20 of 24, 10 ms
-and below about a third. Mains flicker from room lights, at 100 or 120 Hz,
-would be noise inside those slots, and is not modelled: Dev Mode's *measure
-room flicker* measures it.
-
-**Calibration is shorter.** A continuous badge's staircase steps are 150 ms
-(`PLATEAU_CONTINUOUS_MS`), not 200: it samples every `COARSE_MS` whatever its
-frames, so eighteen samples a step. The step length follows how the *reader*
-samples and a Leader sends before it has read its peer, so it is set by the
-sender's own way of reading, which both badges share. 100 ms cost 20 of 144
-deliveries against everything worse than measured at once; 150 cost 4, for
-about a second more a transfer than 100. A once-a-frame badge keeps 200 ms.
-
-**Breaking in.** A continuous Leader reads while it transmits, so a Follower
-that has lost the block need not wait for it to end -- up to ~520 slots, 17 s
-at 32 ms, of a 64-byte block:
+A Leader reads while it transmits, so a Follower that has lost the block need
+not wait for it to end -- up to ~520 slots of a 64-byte block:
 
 - The Follower shows high and holds it: when it loses framing (`frame_error`),
   and when it has read more than `VERDICT_LOST_SYMBOLS` (12) lit symbols
@@ -578,268 +648,221 @@ at 32 ms, of a 64-byte block:
   Leader has moved on.
 - The Leader, sending a block, takes `BREAK_DETECT_SLOTS` (2) of high -- above
   `T_high`, so neither its own light nor a middle level does it -- as a break.
-  It stops and listens, exactly as if the block had ended.
+  It reads them with `parts()` on the slots it is sending in, and stops and
+  listens, exactly as if the block had ended.
 - The Follower takes `BREAK_ACK_SLOTS` (2) of dark as the Leader stopped, and
   sends the Data Sync Error it always would have. Both demote on that,
-  through the path they already had, so a break cannot split the rungs; and
-  a Leader that never heard the break, finishing the block, lands on the same
-  path. A break unanswered for `BREAK_MAX_SLOTS` (24) is dropped and the
-  block waited out, as before.
-- **The resend repeats the last verdict.** A continuous Leader resending after
-  a Data Sync Error sends its last verdict first, then the lead-in. A
-  Follower that holds a block it never heard the verdict on settles it from
-  that -- accepts on CRC Good, discards on CRC Bad -- and one that holds none
-  ignores it. A Follower holding an unsettled block will not take a new one:
-  it breaks in again rather than overwrite it.
+  through the path they already had; and a Leader that never heard the break,
+  finishing the block, lands on the same path. A break unanswered for
+  `BREAK_MAX_SLOTS` (24) is dropped and the block waited out.
+- **The resend repeats the last verdict.** A Leader resending after a Data
+  Sync Error sends its last verdict first, then the lead-in. A Follower that
+  holds a block it never heard the verdict on settles it from that, and one
+  that holds none ignores it. A Follower holding an unsettled block will not
+  take a new one: it breaks in again rather than overwrite it.
 
-**Low is dim, not off.** Black at backlight 0.5 -- 14% duty on v2, just
-above the driver's ~11% threshold -- keeps the sensor faintly lit, so a rise
-starts from a little current rather than none. On the badge (2026-10-06) it
-cut the dark room's edge delay from 1.2-1.9 ms to 0.3, read under one ADC
-step above off, and carried the loopback block at 25 and 16 ms with no
-errors **[measured-all]**. The middle moved to 0.82 to keep the gaps even.
-Simulation first counted against it, taking light as PWM duty: that put the
-dim low 11 counts up and narrowed the gaps. Taking light as duty *past the
-driver's threshold* instead fits the mirror's `backlight_curve` to an ADC
-step at every value measured, and puts the dim low under a step, as the
-badge read it; with that, against everything worse at once it delivered 144
-against 98 with low off. The mirror `loopback` keeps an `off_25` and `off_16`
-block, low off, for comparison.
+### Low is dim, not off
 
-**Mains flicker is fitted before calibration, then tracked.** Every LED
-light measured flickered at 120 Hz, some by 30-47% of their light
-(`room_flicker`, 2026-10-06), and not as a sine: the brightest rooms'
-spread implies harmonics at about half the 120 Hz component's size. At the
-lit mirror hold's 48 counts of room light, 47% is ±22 counts -- more than an
-ADC step, against gaps of 32-48.
-
-*The simulator's lights* (`FLICKER_LIGHTS`, `build_loop(light=...,
-mains_drift_hz=...)`): "led60"/"led50" flicker at twice the mains with a 30%
-fourth harmonic, as measured; "half60"/"half50" once a cycle, with second and
-third harmonics, as no light measured did; any of them on a mains off
-nominal. Grids hold within about 0.02 Hz, which moves 120 Hz flicker 14
-degrees a second **[unmeasured here]**.
-
-*What the drift showed.* The filter that learnt flicker only from dark data
-slots, as a sine at 100 and 120 Hz, delivered 143 of 144 at 47% while the
-mains was exact -- and **77** with it 0.02 Hz off, 88 with the measured
-shape added, 0 with a once-a-cycle light, whose 50 or 60 Hz calibration's
-8 ms samples do not average away. A real room likely drifts.
-
-So each badge fits the room's flicker once, early, from a window in which
-its peer is known dark, and keeps the fit in step with the mains:
-
-- **The windows need no new step.** The Follower sees the Leader's opening
-  gap as quiet 30-300 ms into it, and the Leader stays dark through the gap
-  and its staircase's first step, low: 450 ms. So the Follower fits
-  `FLICKER_FOLLOWER_FIT_MS` (100) after seeing the quiet, from that long of
-  samples -- 150 ran into the step's end when the quiet was seen late. The
-  Leader fits from its own staircase, which the Follower watches dark,
-  `FLICKER_FIT_MS` (200) of it starting `FLICKER_FIT_LEAD_MS` (175) past the
-  gap, so the fit falls mid-step. Calibration's timing is unchanged, so a
-  badge with the fit pairs with one without.
-- **The fit.** A straight line -- a sensor still settling, which harmonics
-  would take for 50 Hz -- then each of `FLICKER_HARMONICS` (4) harmonics of
-  each mains in `FLICKER_MAINS` (50, 60), projected in whole numbers from the
-  sine table and refined `FLICKER_FIT_PASSES` (2) times; the mains that
-  explains more is the region. A full least squares took up to 21 ms under
-  the unix port; this takes 3.3. The simulator charges the badge 150 ms
-  for it, pessimistically, and nothing failed for it. On the badge it is
-  **[unmeasured-v2]**: Dev Mode's *probe frame timing* now times it, a
-  correction, a phase-lock point and both kinds of update under
-  `frame_probe.flicker_filter`, and *measure room flicker* runs the fit on
-  every capture -- replace the 150 ms with what they find.
-- **What it refuses.** A window it cannot explain to `FLICKER_FIT_MAX_NOISE`
-  (12 counts) was not dark and steady -- the Follower's 200 ms window once
-  held the end of the beacon -- and is tried again at half the length,
-  then left to the old filter. A harmonic its samples barely saw, kept
-  under `FLICKER_MIN_SEEN` (0.3) by their averaging, is not fitted: 240 Hz
-  in 4 ms samples is 4% visible, and dividing by that made 8-10 counts of
-  flicker from noise in a dark room. A harmonic under `FLICKER_FIT_SIGMAS`
-  (4) of its standard error, or `FLICKER_MIN_COUNTS`, is dropped; with
-  none left the room is steady and nothing is taken off or learnt.
-- **Correcting** is one look-up a sample: a table per span step of the
-  fitted flicker as a sample that long sees it, built once from a base
-  table per harmonic. Every sample is corrected from the fit on,
-  calibration's included -- and the Follower, which fits after its reader
-  has begun, reads what it had so far again, corrected, from the samples
-  it keeps. Uncorrected, the black at the staircase's start failed
-  calibration under once-a-cycle lights in 15 of 144.
-- **Tracking** is a phase lock on the table's offset. Each update is the
-  timing error that best explains a few samples the peer was dark for --
-  `FLICKER_TRACK_POINTS` (8) while this badge sends its staircase or waits
-  out the gap, the back half of a slot decided dark -- and moves the offset
-  by `FLICKER_TRACK_GAIN` (0.25) of it. The rate is the slope of a line
-  through the measured timings, forgetting `FLICKER_RATE_MEMORY` (0.99) an
-  update, used once its points span `FLICKER_RATE_MIN_S` (0.3 s); it
-  carries the timing through stretches with nothing dark to see, such as
-  reading the peer's staircase. A rate stepped by each error over the time
-  since the last was noise, 30 times the drift's, since updates can come
-  24 ms apart. The badges learn 6.2-7.3 steps a second of a true 6.4.
-- **The fallback** is the earlier filter: sines at `FLICKER_HZ` (100, 120),
-  learnt from the back half of slots decided dark, in proportion to the
-  time their samples cover, from as few as `FLICKER_MIN_POINTS` (2),
-  settling over `FLICKER_TAU_MS` (250) of dark. Its lessons stand: learnt
-  from every slot it picked up 15% of the swing as flicker; learnt shrunk
-  by a sample's averaging, the estimate ran 10-20% low.
-- Everything per sample is whole numbers from tables (`FLICKER_STEPS`,
-  `FLICKER_ONE`, `FLICKER_SPAN_US`); a time's place in a cycle is its
-  microseconds into the second. Floats only in the fit, and once a slot.
-
-In simulation, 144 transfers each, the fit's stall included:
-
-| Room | Before | Fitted |
-|---|---|---|
-| LED shape, mains 0.02 Hz off (60 / 50 Hz) | 88 / 86 | **144 / 144**, 10.6 s, 16 ms |
-| Pure 120 Hz, mains exact | 143, 14.2 s, mostly 20 ms | **144**, 10.6 s, 16 ms |
-| Pure 120 Hz, mains 0.02 Hz off | 77 | **144** |
-| Once a cycle, 60 / 50 Hz | 0 / 0 | **144 / 144** |
-| Once a cycle at 30% | 69 | **144** |
-| 47% at three times the light | 8-16 | 114; **144** with the handshake's gap drop |
-| the same at 100 Hz / LED shape at 50 Hz, 0.02 Hz off | -- | 138 / 86; **144 / 129** with the drop |
-| LED shape, mains 0.05 Hz off | 74 | 112 |
-| Dark, every stress, and lit without flicker | 143-144 | 144 each |
-
-Three times the light failed in the handshake, not the fit: 30 of 144, the
-Follower taking a missed beacon edge for quiet -- see "Peer present". Dropping
-a coarse sample cut short by a present brings it to 144, and the same room at
-100 Hz from 138 to 144, on v3 timing from 124 to 144, the pixels scheme from
-101 to 143, and a v3 Leader with a v2 Follower from 117 to 144 (a v2 Leader
-with a v3 Follower, 140 to 141, and 412 to 429 of 432 over seeds 9-32). Still failing: the LED shape at 50 Hz there
-(129, `ERR_LOST_PEER` in the data phase), and a mains 0.05 Hz off, 2.5 times
-what grids allow, where the lock falls behind. **None of this has
-run on the badge**: the drift and the harmonics are the simulator's
-assumptions, and no light has yet been measured flickering once a cycle.
-
-**A beacon must be two-sided.** A quiet window holding one outlier has the
-swing of a beacon, and its few crossings once averaged to a beacon's half
-period: a Leader "found" a Follower that had not started. A beacon now needs
-at least a quarter of the window's readings on each side of its middle.
-
-**A Follower waits out the Leader's second staircase** however early its
-reader thinks it ended: a flickering opening gap can read as a closing one,
-and answering then talks over the Leader.
+Black at backlight 0.5 -- 14% duty on v2, just above the driver's ~11%
+threshold -- keeps the sensor faintly lit, so a rise starts from a little
+current rather than none. On the badge (2026-10-06) it cut the dark room's
+edge delay from 1.2-1.9 ms to 0.3, read under one ADC step above off, and
+carried the loopback block at 25 and 16 ms with no errors
+**[measured-all]**. The middle moved to 0.82 to keep the gaps even. The
+simulator takes light as PWM duty past the driver's threshold, which fits the
+mirror's `backlight_curve` to an ADC step at every value measured. The mirror
+`loopback` keeps an `off_25` and `off_16` block, low off, for comparison.
 
 **`MID_BACKLIGHT` is 0.82.** At 0.74 -- 43% duty on v2 -- mirror runs read the
 middle at 0.25-0.5 of the swing, 0.4 typically: two ADC steps, on the
 32-count `MIN_GAP`.
 
-**What simulation says.** `simulator.py --loop` models the badge as measured:
-a reading every 0.43 ms, none during its own presents; a present that waits
-for vertical blank and writes for 7.8 ms; the liquid crystal starting 7 ms
-after the blank on a fast panel and 16 on a slow one; the backlight at the
-next PWM wrap; and, with `--optics`, the sensor following the light at a
-speed the light sets -- ds/dt = (I - s) * s / K, one constant fitted to
-`backlight_step` on 2026-10-05e **[inferred-all]**. 8 seeds x 6 scenarios x
-3 payloads each, continuous badges offered both schemes (`--auto`) unless
-"pixels":
+### Mains flicker is fitted before calibration, then tracked
 
-| | delivered | median | ended on |
+Every LED light measured flickered at 120 Hz, some by 30-47% of their light
+(`room_flicker`, 2026-10-06), and not as a sine: the brightest rooms' spread
+implies harmonics at about half the 120 Hz component's size. At the lit
+mirror hold's 48 counts of room light, 47% is ±22 counts -- more than an ADC
+step, against gaps of 32-48. On the lit 8 ms rung, a window is 3.6 ms: under
+half a cycle at 120 Hz, so uncorrected flicker moves a window's median by
+most of its amplitude.
+
+*The simulator's lights* (`FLICKER_LIGHTS`): "led60"/"led50" flicker at twice
+the mains with a 30% fourth harmonic, as measured; "half60"/"half50" once a
+cycle, as no light measured did; any of them on a mains off nominal. Grids
+hold within about 0.02 Hz, which moves 120 Hz flicker 14 degrees a second
+**[unmeasured here]**. A filter that learnt flicker only from dark data
+slots delivered 77 of 144 with the mains 0.02 Hz off, and 0 under a
+once-a-cycle light.
+
+So each badge fits the room's flicker once, early, from a window in which its
+peer is known dark, and keeps the fit in step with the mains:
+
+- **The windows** are in calibration, where each badge's stall falls while it
+  only holds LOW or only reads dark (see "Calibration"). The Follower fits
+  `FLICKER_FOLLOWER_FIT_MS` (100) of 2 ms samples starting
+  `FLICKER_FOLLOWER_FIT_START_MS` (160) after it saw the Leader's beacon go
+  quiet, inside the Leader's long opening gap (`CAL_OPEN_LEADER_MS`, 400) --
+  an EXACT one. A POLLED Follower is blind for the stall, and one longer
+  than about 180 ms ran into the Leader's first steps (simulation: 57 of 144
+  at a 300 ms stall, 126 at three times the work): it fits the same window
+  from its kept samples (`FLICKER_BUFFER`, 1.28 s) once its reader ends or by
+  `FLICKER_FOLLOWER_LATE_FIT_MS` at the latest, reads the staircase again
+  corrected, and decides on its next call, after the stall. The replay
+  re-feeds up to 640 samples: the simulator charges `REPLAY_MS_PER_SAMPLE`
+  (0.25 ms) each, about 160 ms in all, on top of the fit **[unmeasured --
+  M7 `flicker_filter.replay`]**.
+  The Leader fits the last `FLICKER_FIT_MS` (160) of its own staircase's
+  body, which the Follower watches dark, as its closing gap begins.
+- **The fit.** A straight line -- a sensor still settling -- then each of
+  `FLICKER_HARMONICS` (4) harmonics of each mains in `FLICKER_MAINS` (50,
+  60), projected in whole numbers from the sine table and refined
+  `FLICKER_FIT_PASSES` (2) times; the mains that explains more is the region.
+  It takes 3.3 ms under the unix port; on the badge it is
+  **[unmeasured-v2 -- M7 `flicker_filter`]**, and the simulator charges a
+  pessimistic 150 ms stall for it (`fit300` doubles that).
+- **What it refuses.** A window it cannot explain to `FLICKER_FIT_MAX_NOISE`
+  (12 counts) was not dark and steady, and is tried again at half the length,
+  then left to the old filter. A harmonic its samples barely saw
+  (`FLICKER_MIN_SEEN`, 0.3) is not fitted. A harmonic under
+  `FLICKER_FIT_SIGMAS` (4) of its standard error, or `FLICKER_MIN_COUNTS`, is
+  dropped; with none left the room is steady and nothing is taken off.
+- **Correcting** is one look-up a part: a table per span step of the fitted
+  flicker as a part that long sees it. The table for a rung's part span is
+  built when the rung is set, not on the first slot. Every sample is
+  corrected from the fit on, calibration's included; the Follower, which fits
+  after its staircase reader has begun, reads what it had again, corrected.
+  The phase-lock scan's thresholds are `T_low` plus the fitted flicker, one
+  per step of bins.
+- **Tracking** is a phase lock on the table's offset, from
+  `FLICKER_TRACK_POINTS` (8) parts the peer was dark for at a time, moving
+  the offset by `FLICKER_TRACK_GAIN` (0.25) of the error; the rate is the
+  slope of a line through the measured timings, used once its points span
+  `FLICKER_RATE_MIN_S` (0.3 s) **and** carry `FLICKER_RATE_MIN_UPDATES` (10)
+  updates of weight. A Leader also tracks **while it sends a block**, from
+  the Follower's dark slots it reads to watch for a break: a block is its
+  longest dark stretch. That assumes its own screen barely reaches its own
+  sensor, off the Follower's glass **[unmeasured]**; the simulator's
+  `self_coupling` puts 5% of it there (`self5` row), and if that costs
+  deliveries the Leader should learn only from slots it sent at one level. Without both, a POLLED Leader -- its fit stall
+  blinding most of its closing gap, its only tracking window before the
+  block -- learnt -9.8 steps a second from 5.85 updates in a room with no
+  drift, extrapolated it through an 8.6 s block, and misread the CRC reply:
+  132 of 144 at 47% flicker, now 144.
+  `test_a_polled_leaders_flicker_stays_fitted_through_a_block` holds it.
+- **The fallback** is the earlier filter: sines at `FLICKER_HZ` (100, 120),
+  learnt from the parts of slots decided dark.
+- Everything per part is whole numbers from tables. Floats only in the fit.
+
+Whether 8 ms survives a flickering room is **[unmeasured -- M6
+`window_residual`]**: the room-flicker tool now reports how much flicker the
+fit leaves in a 3.5 ms window every 8 ms.
+
+### What simulation says
+
+`simulator.py --loop` (and `tests/share_wifi/sweep.py`, which sweeps it)
+runs both badges through the production readers: a ring of entries each
+summing five readings at 20 µs (`RING_ENTRY_US` 100) with `RING_SD` 8.5 of
+noise a reading, or a polled reader reading every 0.43 ms whenever the badge
+is not busy. Each pass costs `PASS_WORK_MS`, each decided slot
+`SLOT_WORK_MS`; collections stall a badge 20-46 ms (`GC_MS`), the flicker fit
+150 ms. The present waits for vertical blank and writes for 7.8 ms; the
+liquid crystal starts 7 ms after the blank on a fast panel and 16 on a slow
+one; the backlight changes at the next PWM wrap; and, with `--optics`, the
+sensor follows the light at a speed the light sets -- ds/dt = (I - s) * s /
+K, fitted to `backlight_step` on 2026-10-05e **[inferred-all]**. 8 seeds x 6
+scenarios x 3 payloads a row (`sweep.py`; 2026-10-07). The median is from
+the first beacon and includes the 1.5 s the simulator starts the badges
+apart in four of its six scenarios; "skew-free" takes it off. Typical
+skew-free phases, EXACT: discovery 0.7 s, calibration 1.6 s lit and 1.8
+dark, data 1.7 s lit and 3.5 dark.
+
+| Row | EXACT (ring) | POLLED | HEAD (2 ms loop) |
 |---|---|---|---|
-| backlight, lit room (`room_light` 48), or the idealised sensor | **144** each | **10.5 s** | 16 ms |
-| backlight, lit, 30% flicker at 120 Hz | 144 | 12.1 s | 16-20 ms |
-| backlight, lit, 47% flicker | 141 | 13.4 s | 16-20 ms |
-| backlight, 47% flicker at three times the light (150 counts) | 144 | 10.6 s | 16 ms |
-| backlight, dark: mirror; peer aligned; peer overlapping; v3; slow panel | **144** each | 15.3 s | 32 ms |
-| backlight, dark, sensor 1.5x or 2x slower, or noise sd 9 | **144** each | 15.3 s | 32 ms |
-| backlight, dark, reads 4x slower (one every 2 ms) | 139 | 24.2 s | 32-80 ms |
-| backlight, slow panel + reads 2x slower + sensor 2x slower + noise sd 8 | **144** | 15.3 s | 32-40 ms |
-| pixels: mirror | 144 | 23.6 s | 80 ms |
-| pixels, slow panel | 142 | 23.7 s | 80-100 ms |
-| pixels, everything worse at once | 82 | 23.8 s | 80-100 ms |
+| dark: mirror, peer aligned, overlapping; v3; slow panel; sensor 1.5-3x slower; noise; reads 2x slower; everything worse at once | **144** each, 7.5 s (6.0 skew-free), 16 ms | **144** each, 11.1 s (9.6), 32 ms | 144 each, 15.3 s, 32-50 ms |
+| dark, reads 4x slower (one every 2 ms) | 144, 7.5 s | 144, 11.1 s, 32-50 ms | 144, 15.3 s, 32-40 ms |
+| lit 47%, reads 4x slower (`lit47slow`) | 144, 5.5 s, 8 ms | **126**, 10.3 s, 16-250 ms | 121, 13.7 s |
+| lit 47%, 5% of a badge's own light on its own sensor (`self5`) | 144, 5.5 s | 144, 7.3 s | -- (not modelled) |
+| dark, work 3x the assumed cost; fit stall 300 ms | 144 each, 7.5 s | 144 each, 11.1 / 11.2 s | 144 each, 15.4 / 19.0 s |
+| dark, crystals ±60 ppm | 144, 7.5 s | 144, 11.1 s | -- (not modelled) |
+| lit (`room_light` 48): no flicker, 30%, 47% at 120 Hz | **144** each, 5.5 s (4.0), 8 ms | **144** each, 7.3 s (5.8), 16 ms | 144 each, 10.6 s, 16 ms |
+| lit, LED shape 60 / 50 Hz, mains 0.02 Hz off | 144 / 144, 5.5 s, 8 ms | 144 / 144, 7.3 s, 16-20 ms | 144 / 144, 10.6 s |
+| lit, once a cycle at 60 Hz, 0.02 Hz off | 144, 5.5 s, 8-10 ms | **138**, 7.3 s, 16-32 ms | 142, 10.6 s |
+| 47% at three times the light (150 counts) | **144**, 5.5 s, 8 ms | **144**, 7.5 s, 16 ms | 144, 10.6 s |
+| mixed pairs, either way round: dark, lit, lit 47%, LED 60 Hz, reads 4x slower, fit stall 300 ms, three times the light, 5% self-coupling | -- | 144 each, 10.9-11.2 s dark, 7.2-7.4 s lit | -- |
 
-The backlight rows are with the dim low and the flicker filter, against a
-simulator that takes light as PWM duty past the driver's threshold. At the
-time the flicker filter worked in the data phase only, so bright flickering
-light failed calibration: at three times the lit mirror hold's light, 16 of
-144. Fitted before calibration it delivers 114, and 144 with the handshake's
-gap drop (see "Mains flicker is fitted" and "Peer present"). Whether a hold ever lets in that much is not known -- the flicker
-tool, held facing the room, read 240-385, against 48 at the mirror hold.
+"HEAD" is the code as of 2026-10-06 (`ef7ce12`) run in its own simulator
+over the same 8 seeds, scenarios and payloads, its levels patched to the
+dim low and 0.82 middle as shipped: it models no crystal error and no
+ring noise, and charges no collection, nor a staircase replay. **Every row
+is at least HEAD's but one**: POLLED under a once-a-cycle 60 Hz light,
+138 against 142. Its six losses are the 63-byte payload on seeds 6 and 7:
+framing failures in the data phase, each answered with a Data Sync Error
+both badges act on, until `ERR_DECODE` -- not F-B1. The row moves with the
+staircase replay's charge, which is unmeasured (M7): 144 with none, 140 at
+0.1 or 0.4 ms a sample, 138 at the 0.25 charged -- not monotonic, so seed
+sensitivity rather than a cliff, but a loss all the same. F-B1 costs no
+run in these sweeps; in round 2 it cost two of the dark POLLED slow-read
+row (2 of 576 POLLED runs where HEAD showed none), which the 2-reading
+parts (`POLL_PART_READINGS`) took back. It stays the first open item.
 
-With calibration in 200 ms steps, no breaking in and low off, before this
-section's last changes, the dark backlight rows took 16.6 s,
-everything-worse delivered 134, and reads 4x slower 140.
+The first round of this change delivered less -- POLLED 132 at 47%
+flicker, 122 at three times the light, 136 with slow reads, 127 for a
+POLLED Leader -- and blamed F-B1 for it, against a stale baseline. Those
+losses were a flicker rate learnt from too little, POLLED windows decided
+from single readings, a phase-lock gap rule that refused every rise at slow
+reads and a closing-gap line too near flickering black; each is fixed
+above. Sweep outputs: `sweep_r2.out`, `baseline_head.out`.
 
-Against these, the once-a-frame loop under v2's measured timing delivered 99
-of 144 on the old 50 ms start with ideal optics, and about three in four with
-the mirror's sensor. On the new floors the once-a-frame sweep delivers 144 of
-144 at ideal timing; under v2's timing it failed the closing handshake on 7
-of 8 seeds on 80 ms, because its edge correction leaves out the present
-delay -- one reason the once-a-frame path is no longer what the app runs.
+**Not verified on hardware.** Every figure above is the simulator's. Each
+assumption below has its Dev Mode measurement (see "Dev Mode" in
+[share_wifi_spec.md](share_wifi_spec.md)):
 
-- **Where it fails.** The sensor-speed stress was 2 of 144 on a 25 ms start
-  and an 8 ms budget, and 109 on 32 ms, before the backlight guard and the
-  brighter middle -- which, the sensor being faster with more light, also
-  speeds the middle step. What remains on the backlight are mostly rung
-  splits: a CRC failure on a gamble rung is announced with the Data Sync
-  Error, three middle levels rising out of black -- the slowest thing a slow
-  sensor sees -- and a Follower that misses it stays a rung faster. On
-  pixels, the closing handshake: the Leader gives up after the Follower has
-  the payload (`ERR_LOST_PEER` / `OK`), which breaking in does not reach.
-- **Demotion out of 80 ms barely exists.** A pixel panel slower than about
-  56 ms to 90% fails 80 ms, and from 60 ms on the Data Sync Error announcing
-  the demotion is unreadable at the rate it is sent at -- exactly as the
-  protocol before this change behaved from 80 ms. Panels measured 16-24 ms.
-- **I2 flags offsets that are not failures.** Two continuous grids sit apart
-  by the difference between the edge delay assumed and the one seen; on a
-  slow sensor that passes a quarter of a 32 ms slot without a symbol going
-  wrong. I2 is a diagnostic here, as it already was with a present delay.
+| Assumption | Value assumed | Measured by |
+|---|---|---|
+| the ring works on this firmware: `rp2`, `uctypes`, `rp2.DMA`, the ring fields of `pack_ctrl`, `high_pri`, a heap in PSRAM | yes | M1, probe `firmware`; M3, probe `ring` |
+| the ring keeps 50 kHz with no lost readings, quiet and presenting | yes | M3 `rate_hz`, `fifo_over`, `faults` |
+| a kernel's cost over the uncached alias | ≤ 1 µs a reading | M3 `kernel_us_per_1000` |
+| a decided slot's work, a pass's | 1.2 ms, 0.15 ms | M3 `slot_work`, `work`, `lag_max_us` |
+| a collection's stall, and the ring surviving it | 20-46 ms, no loss | M3 `gc_ms`, `gc_overran` |
+| garbage a slot leaves | small | M3 `garbage_per_slot` |
+| the sensor's settle from the dim low, and a rise to the middle against one to high | ≤ 2.5 ms lit, ≤ 10 dark; guard 1 / 2 ms | M4 `backlight_step_ring` |
+| the edge lag, lit and dark | 100 µs, 300 µs | M4 `tlow_ms`, M5 `lag_us` |
+| the backlight call's lateness | well under the guard | M4, M5 `tx_late_us` |
+| the EXACT path end to end on the badge, and which rungs decode | 8 lit, 16 dark; 6 never | M5 `loopback_ring` |
+| flicker left in an 8 ms rung's window after the fit | small | M6 `window_residual` |
+| the fit's stall, on the Follower's 50 samples | 150 ms | M7 `flicker_filter` |
+| a POLLED Follower's staircase replay | 0.25 ms a sample, ~160 ms | M7 `flicker_filter.replay` |
+| a badge's own screen on its own sensor, off the peer's glass | none (5% in the `self5` row) | the 2nd-badge tool |
+| HOME mid-transfer stops the ring and resets | yes | M8, by hand |
+| a peer badge's swing and speed | the mirror's | the 2nd-badge tool |
 
-**Not verified on hardware.** Every figure above is the simulator's:
+**Open issues:**
 
-- the read rate of the real loop -- the probe's `reads.transfer` times a pass
-  of it; the simulator assumes 0.43 ms;
-- the sensor model, fitted to one mirror's backlight steps;
-- a peer badge's swing and speed, which only the 2nd-badge tool measures;
-- whether a collection, 16-64 ms, ever lands inside a transfer's data phase.
-  `gc.collect()` runs at the start of a transfer and between blocks, never
-  in the loop;
-- that a present on v3 leaves more than `HANDSHAKE_GAP_MS` (7 ms) of dead
-  time, as the handshake's gap drop assumes: the simulator's `PRESENT_MS_V3`
-  (11) is **[inferred-v3]**, not measured.
-
-**Open issues**, found while fixing the bright room's handshake and left
-for their own change:
-
-- **A collection during calibration.** `gc.collect()` costs 16-64 ms on v2
-  **[measured-v2]**; one inside a staircase stretches a step, or stalls the
-  Follower's fit window. The simulator has no model of it.
-- **The Follower's fit stall can swallow a step.** On the pixels scheme in
-  the lit room at 47% flicker, 32 seeds: 574 of 576 before the gap drop,
-  562 with the drop as first tried, in calibration as well; 425 of 432
-  over seeds 9-32 with it as shipped, against 430. The traces put the
-  Follower's 150 ms fit stall (`LOOP_FIT_MS`, pessimistic) on its first
-  middle step.
-- **`quiet_ms()` takes its midpoint from the window's min and max**, so one
-  outlier moves it. The gap drop removes the outliers a present makes, not
-  the fragility; a robust midpoint (the k-th extreme) was erratic in
-  simulation -- 144, 132 and 123 of 144 for k of 2, 3 and 5.
-- **Six times the light (300 counts) delivers 0 of 144**, before and after:
-  `ERR_NO_PEER` on the Leader in all, the handshake never completing.
-- **Calls that outlast `HANDSHAKE_GAP_MS`.** With every call 7-15 ms --
-  ten times the measured cost -- the dark mirror delivers 269 of 432
-  against 268, but 15 of its failures move into the handshake
-  (`ERR_NO_PEER` / `ERR_CONTRAST`). At 3.5-7.5 ms (`call_ms` 5), over 32
-  seeds, it is 534 of 576 with the drop against 545 without; the extra
-  failures are data-phase `ERR_LOST_PEER`, and a sign test gives p ~ 0.12,
-  so the difference is not shown to be real.
-- **A once-a-cycle light at 60 Hz** (`half60`, dark backlight scheme)
-  delivered 142 of 144 with the drop against 144, and 427 of 432 against
-  430 over seeds 9-32: within seed noise, but in the wrong direction.
-
-Dev Mode's mirror `loopback` test is the first check: one badge sends a
-symbol block on its own backlight and decodes its reflection with this
-receiver, at 50 down to 16 ms.
-
+- **F-B1: a Follower in `STEP_VERDICT` cannot match the Leader's Data Sync
+  Error.** Its tail is shorter than the pattern the Follower looks for, so a
+  demotion the *Leader* starts leaves the Follower a rung faster. Not fixed
+  in this change. It cost 2 of 576 POLLED runs in round 2's sweep (144 with
+  it fixed in simulation) and none in the final one, and it is what turns a
+  rung too fast for a slow sensor into a split rather than a demotion. Fix
+  it next.
+- **POLLED under a once-a-cycle light** delivers 138 against HEAD's 142,
+  and POLLED reading every 2 ms in 47% flicker 126 (HEAD 121): the POLLED
+  tier's weakest rows, both sensitive to the unmeasured replay stall.
+- **The slow-sensor cliff moved.** Starting on 8/16 ms rather than 16/32
+  leaves less settle margin: a sensor three times slower than measured
+  (`k3.0`) delivers 144, though I2 flags the grids apart in some runs; four
+  times did not in round 1's experiments, where the old 32 ms start
+  survived four. M4 says how much margin there is.
 ---
 
 ## Light levels and symbols
 
 Three levels. Only two carry data. Two **schemes** produce them, listed in
 `LEVEL_SCHEMES`, which maps each scheme's three symbols to the pixels and the
-`display.backlight()` value that produce them; a badge always has `SCHEME_FIELDS` and may also offer
-`SCHEME_BACKLIGHT`, and calibration settles which one a transfer uses -- see
-"Choosing a scheme". Beacons always use `SCHEME_FIELDS`.
+`display.backlight()` value that produce them. Beacons use `SCHEME_FIELDS`;
+calibration and the data phase use `SCHEME_BACKLIGHT`, always -- see "Why
+the fields staircase went".
 
 | Symbol | Level | `fields` (the default) | `backlight` | Meaning |
 |---|---|---|---|---|
@@ -890,7 +913,7 @@ level**, low included.
 
 - **Low is the backlight dim, on white pixels.** It was black pixels with
   the backlight off until 2026-10-05, then white with it off, and since
-  2026-10-06 white at 0.5, dim -- see "Reading continuously". The pixels are
+  2026-10-06 white at 0.5, dim -- see "Low is dim, not off". The pixels are
   white at every level, so **the scheme never changes a pixel**. Every symbol is then a `display.backlight()`
   call alone: a PWM duty, live within one ~263 µs PWM period **[source-v2]**,
   with no present delay and no liquid-crystal settle. `backlight(0)` is fully
@@ -1007,66 +1030,54 @@ nothing else drawn, for the whole of a transfer.
 
 ## Slots and sampling
 
-- After calibration, time is divided into slots of the current rung's duration.
+- After calibration, time is divided into slots of the current rung's duration,
+  counted in µs from the transfer's start (see "Reading").
 - The protocol is strictly half duplex: exactly one badge transmits at a time and the
   other holds solid black.
 
 > Holding black rather than interleaving doubles the payload rate, and gives the
 > transmitter a continuous black reference to re-check `L_black` against.
 
-- The transmitting badge holds one colour for a whole slot. A symbol goes up on the
-  first frame after its slot boundary, because a frame is the only moment the screen
-  changes, so on screen each symbol lasts a whole number of frames -- 39 to 62 ms on
-  the 50 ms rung -- while the boundaries themselves stay on the clock.
-- A queued pattern starts on the next slot boundary after it is queued, and each
-  symbol is indexed by **slot number**.
+- The transmitting badge changes its backlight one pass of its loop after each slot
+  boundary -- the loop waits for the boundary, sets the field, and only then works.
+- Each symbol is indexed by **slot number**, never by how many times the transmit
+  function has been called.
 
-> Never by how many times the transmit function has been called. It is called once a
-> frame and a slot is several frames long, so advancing per call fires an entire
-> pattern off inside one slot. That defect made the app unable to complete a single
-> transfer, and the codec tests could not see it because they never ran the frame loop.
+> That defect once made the app unable to complete a single transfer: called once a
+> frame with a slot several frames long, advancing per call fired an entire pattern
+> off inside one slot, and the codec tests could not see it because they never ran
+> the frame loop.
 
-- The listening badge samples `badge.light_level()` every frame and decides a slot
-  from the median of the samples falling in its **second half**.
+- **A queued message's first slot is fixed when it is first shown**: the slot after
+  the one after the slot whose decision queued it -- one silent slot, as a reply has
+  always had -- or the next boundary, if this badge was held up past that. A message
+  queued by no decision starts on the next boundary. See "Reading".
+- The listening badge decides slot k once its readings are in, from the median of the
+  parts of a **window** in it, each flicker-corrected:
 
-> The second half, not the middle. Every source of delay — panel settling, the frame
-> the peer needed to put the field on screen, the frame we needed to read it — lands
-> at the start of a slot, so only the back half is guaranteed to hold this symbol
-> rather than the last one. Sampling the middle worked at slow rungs and failed
-> outright at 50 ms, where one frame of latency is a third of a slot.
+  | Reader | Window opens | Window closes |
+  |---|---|---|
+  | EXACT | `max(settle, OPEN_PERCENT of the slot)` | `slot - max(guard, BACKLIGHT_GUARD_PERCENT of it)` |
+  | POLLED | half way | the read loop's guard: `END_GUARD_PERCENT` of `BACKLIGHT_TX_MS`, at least `BACKLIGHT_GUARD_PERCENT` |
 
-- **But not the last `END_GUARD_PERCENT` of a frame** before the slot ends --
-  7 ms at 11 ms frames -- capped so the window is never shorter than 1.2 frames:
-  the guard is at most `duration // 2 - frame * 6 // 5`, and never negative.
+  `settle` and `guard` are `SETTLE_LIT_US`/`GUARD_LIT_US` or the `_DARK_` pair, by this
+  badge's own light. A window too short for this rung -- a misread flag, a demotion
+  still to come -- keeps a quarter of the slot, settled or not: a badge that cannot
+  decide cannot ask to slow down either.
 
-> The end of a slot can already hold the *next* symbol. The receiver's grid is
-> set from one edge per message, so it can sit several ms late of the sender's
-> -- up to about a quarter of a 50 ms slot either way in simulation -- and the
-> sender shows each symbol on the first frame after its slot begins, so
-> sometimes almost at once. At 50 ms with 11 ms frames the second half holds
-> two or three samples; the median of two is the higher, so one sample of a
-> brighter next symbol flipped a bit. That was the first block failing its CRC
-> on timing alone: in 384 simulated runs the guard took CRC Bad verdicts from
-> 73 to 9, and the ideal scenario from 12 resends in 16 start skews to none.
->
-> Not the obvious alternatives. Taking the lower middle sample instead moved
-> the error onto falling edges and made it worse (87). Starting the window
-> later than half way delivered slightly more in the scenario sweep and broke
-> the 32 ms panel's closing handshake: a slow fall to black needs the late
-> samples, and only the guard's few ms can be spared.
+> Not the middle: every delay lands at the start of a slot. Not the very end either:
+> the receiver's grid is set from one edge per message, so the end of a slot can
+> already hold the next symbol. With exact timing on both ends the window can open
+> as soon as the sensor has settled, rather than half way -- see "Reading".
 
-- A slot with no settled sample is decided from whatever samples it has, and
+- A slot with no reading in its window is decided from the whole slot's mean, and
   failing that repeats the last level. A slot is never skipped.
 
 > Dropping a symbol shifts every symbol after it. One wrong bit is caught by the CRC;
 > a shifted stream is not.
 
-- Slot timing is measured with `time.ticks_us()` / `time.ticks_ms()`, never
-  `badge.ticks`. Subtract with `time.ticks_diff()`.
-
-> `badge.ticks` is a per-frame snapshot that does not move between `update()` calls,
-> so it cannot resolve anything shorter than a frame — and a slot is only a few frames.
-
+- Slot timing is the reader's clock, never `badge.ticks`, which only moves when the
+  buttons are polled.
 - A badge that reads black for more than `LOST_PEER_SLOTS` consecutive slots in
   the data phase exits with `ERR_LOST_PEER`, except in `STEP_FINISH` -- see
   "Giving up".
@@ -1136,13 +1147,16 @@ One slot per symbol. Nine symbols each, except Complete (six) and Complete Ack
 ## Announce
 
 - Displayed by the Leader from the moment the transfer starts.
-- Alternating middle and high, changing every `ANNOUNCE_HALF_MS`.
+- Alternating black and high, changing every `ANNOUNCE_HALF_MS`, in the fields scheme.
+  It was middle and high until both readers averaged many readings a sample: the
+  measured middle sits 0.4 of the way up, so the beacon's swing, 0.6 of the panel's,
+  read 44-48 counts on the mirror -- at or under `MIN_SWING`.
 - It is a beacon, not a state machine step: the Leader keeps displaying it until it
   detects the Peer Present Pattern.
 - Nothing seen within `ANNOUNCE_TIMEOUT_MS` exits with `ERR_NO_PEER`.
 - That timeout is measured from `transfer.started`, and a beacon's phase from
-  `transfer.phase_started`. Both are 0 when a `Transfer` is built, so the
-  caller must set both to `time.ticks_ms()` before the first `step()`.
+  `transfer.phase_started`. Both are 0 when a `Transfer` is built, which is
+  when the reader's clock starts.
 
 ## Peer present
 
@@ -1155,10 +1169,11 @@ One slot per symbol. Nine symbols each, except Complete (six) and Complete Ack
 - It then beacons alternating black and high every `PRESENT_HALF_MS` until the
   Announce Pattern stops: no crossing of the window's midpoint for more than
   `ANNOUNCE_HALF_MS + 30` ms. It then starts measuring the staircase.
-- A continuous Follower drops the coarse sample it is pooling whenever its
-  readings stop for more than `HANDSHAKE_GAP_MS` (7) -- dead time, from the
-  end of one fine sample to the start of the next, in `ticks_us` -- unless
-  the sample in progress already follows a drop.
+- A Follower drops the coarse sample it is pooling once its fine samples have
+  been empty -- no readings in them -- for more than `HANDSHAKE_GAP_MS` (7),
+  unless the sample in progress already follows a drop. Only a POLLED reader,
+  blinded by its own present, ever has such a gap; an EXACT one only if its
+  ring overran.
 
 > Its own presents stop its readings for 8-25 ms, and the coarse sample one
 > interrupts then closes on a few ms of readings, which average little of
@@ -1185,7 +1200,7 @@ One slot per symbol. Nine symbols each, except Complete (six) and Complete Ack
 Before calibration a badge has no thresholds, so the two beacons cannot be classified
 by level.
 
-- Keep a sliding one-second window of timestamped `badge.light_level()` samples.
+- Keep a sliding one-second window of timestamped coarse samples.
 - A beacon is present when `max - min` across the window is at least
   `MIN_SWING`, the window holds at least 8 samples, and they cross the
   midpoint between `min` and `max` at least twice. The half period is the mean
@@ -1202,151 +1217,98 @@ by level.
 ## Calibration
 
 Every threshold in the protocol comes from here, and so does the shared time reference
-the slot clock starts from.
+the slot clock starts from. **One calibration, for every pair**: one staircase each
+way, in the backlight scheme.
 
 - Begins when the Leader detects the Peer Present Pattern.
-- The **staircase** is: `CAL_GAP_MS` black, then `CAL_REPS` repetitions of
-  `PLATEAU_MS` each of low, middle and high, then `CAL_GAP_MS` black:
-  `STAIRCASE_MS`, 2400 ms in total. A SLOW badge sends `CAL_REPS_SLOW`
-  repetitions instead, 3600 ms -- see "Agreeing a rung".
-- The Leader transmits a staircase while the Follower measures it. The two then swap,
-  so the Leader learns its own levels from the Follower's screen. A Leader that
-  offers the backlight scheme sends two; see "Choosing a scheme".
+- The **staircase** is: an opening gap of black, then `CAL_REPS` repetitions of
+  `PLATEAU_MS` each of low, middle and high -- `CAL_REPS_LIT` when the light flag
+  says LIT -- then `CAL_CLOSE_MS` black. The Leader's opening gap is
+  `CAL_OPEN_LEADER_MS`, the Follower's `CAL_OPEN_MS`: 1010 and 860 ms DARK, 890 and
+  740 LIT. Read in coarse samples of `CAL_SAMPLE_MS`.
+- The Leader transmits its staircase while the Follower measures it. The two then
+  swap, so the Leader learns its own levels from the Follower's screen.
 
 > Both directions are required: the Leader has to read acknowledgements and sync
 > errors, so it needs thresholds of its own.
 
 - The staircase is self-identifying without thresholds: it is the only signal that
   steps monotonically through three levels, bracketed by longer black.
+- The reader takes each sample as the median of itself and its neighbours, one
+  sample late and timed by the middle one, and a single sample over the closing
+  gap's line does not end the gap: one outlier otherwise moved `min()` below the
+  darkest level, or broke the run, and the gap was never found (POLLED badges
+  under stress, in simulation). Its levels come from the staircase's body --
+  `LEAD_KEEP` (12) dark samples before its first rise, to its closing gap -- since
+  the long gaps would put the held high under the 0.90 quantile.
+- The closing gap is samples within **a third** of the swing of its darkest,
+  held `CAL_CLOSE_MS - 60`. It was a quarter: at three times the lit room's
+  light, flickering 47%, the corrected dark sat at the line, its noise broke
+  every run, and a POLLED Follower read on for two seconds and failed
+  `ERR_CONTRAST`. A middle step is 0.4 of the swing and 40 ms long, so it
+  cannot hold a run.
+- A reader whose staircase does not separate starts afresh once
+  (`CAL_RESTARTS`) before `ERR_CONTRAST`: what ended may have been the end of
+  the peer's beacon, taken for quiet, and its opening gap, with the real
+  staircase still to come.
 
-### Choosing a scheme
+### Why the fields staircase went
 
-Only a receiver can judge a scheme, and calibration is the one moment both
-badges are measuring, so the choice is made there -- with no message of its
-own. **The order of a staircase's steps carries one flag**: `ASCENDING` is
-low, middle, high; `REVERSED` is low, high, middle. Levels are read from the
-distribution of samples, which order does not change, and once they are known
-`staircase_order()` reads the order back out of the same samples: it counts
-middle-to-high steps against high-to-middle ones, ignoring any level held for
-fewer than `STEP_SAMPLES` samples as a transition passing through. A tie,
-including no steps at all, reads `ASCENDING`.
+There were two staircases from a Leader that offered the backlight: fields, then
+backlight, the Follower keeping whichever separated the levels better. A badge
+reading continuously (2026-10-05 to 10-07) already took the backlight whenever it calibrated; fields only
+won on a sensor that follows the backlight's PWM, which this one does not
+[measured-all]; and its 80 ms floor made a transfer five to ten times slower. So the
+fields scheme now draws the beacons only, and calibration and data are the
+backlight's. A pair whose backlight staircase fails ends `ERR_CONTRAST`.
 
-1. **The Leader offers.** Offering only fields, it sends one `ASCENDING`
-   staircase, as it always did. Offering the backlight, it sends its fields
-   staircase `REVERSED` -- *a second follows* -- and then one more in
-   `SCHEME_BACKLIGHT`, `ASCENDING`, back to back: 4800 ms instead of 2400.
-2. **The Follower measures and chooses.** The first staircase must calibrate
-   (`ERR_CONTRAST` otherwise, as before), since without its levels the flag
-   cannot be read. A Follower told a second follows waits it out even if it
-   will not use it -- the Leader is still transmitting -- and stops waiting
-   one Leader staircase plus `CAL_GAP_MS` after it began listening, whether or
-   not the second could be measured. The Leader's staircase length comes from
-   the class read off its first. It then keeps the backlight scheme only if it
-   offers it too and its staircase separated the levels by more:
-   `separation()`, the narrower of the two gaps between adjacent levels. Ties
-   go to fields.
-3. **The Follower answers.** Its own staircase is sent in the chosen scheme,
-   `REVERSED` if that is the backlight. A Leader that offered the backlight
-   reads the flag and switches; one that did not ignores it.
+### The flags
 
-From then on both transmit in the chosen scheme, and each uses the levels it
-measured from the matching staircase.
+**The order of a staircase's steps carries the reader tier**: `REVERSED` -- low,
+high, middle -- for EXACT, `ASCENDING` for POLLED. **Its repetitions carry the
+light**: `CAL_REPS_LIT` for LIT, `CAL_REPS` otherwise. `staircase_steps()` reads
+both back out of the same samples: middle-to-high steps against high-to-middle ones
+for the order, ignoring any level held for fewer than `STEP_SAMPLES` samples; the
+high steps for the light, `LIT_STEPS_MAX` or fewer being LIT.
+
+- **The Leader's staircase carries its own** tier and light. It judges its light
+  from the black of the Follower's beacon.
+- **The Follower decides the pair**: it reads the Leader's flags, judges its own
+  light from the black of the Leader's staircase, and sends `pair_exact = own and
+  peer`, `pair_lit = own and peer` in its own staircase.
+- **The Leader adopts what it reads**, without combining it with its own.
+
+> Only one side moves. A Follower that misreads the Leader -- a missed high step
+> reads DARK as LIT -- moves the pair as a whole: to a slower rung, or to a faster
+> one that is a gamble, where CRC failures demote. Only a Leader that misreads the
+> Follower can split the rungs. When each badge combined both flags itself, either
+> misread split them.
 
 ### Agreeing a rung
 
-**A staircase also carries its sender's frame-rate class, in how many
-repetitions it has**, and both badges start the data phase on the slower
-class's rung. Each computes that from the same two flags, so they agree with
-no message of their own -- the same trick as the scheme flag, in a different
-property of the same signal.
+Both badges start the data phase on the rung `start_index()` gives from the pair's
+flags -- the Follower's, which the Leader adopted -- so they agree with no message:
 
-- **A badge's class** is fixed when its staircase starts: **FAST** if the
-  median of its last `FRAME_SAMPLES` frame times can sample the fastest rung
-  the panel allows -- 2.5 frames a slot, so frames up to 20 ms -- and **SLOW**
-  otherwise. The median, not the live frame time, so one slow frame as
-  calibration begins does not decide it.
-- **It sends** `CAL_REPS` repetitions if FAST and `CAL_REPS_SLOW` if SLOW, in
-  every staircase it sends, both of a Leader's that offers the backlight.
-- **It reads** its peer's from the peer's first staircase: `staircase_steps()`
-  counts high steps -- one a repetition, in either order, held for
-  `STEP_SAMPLES` -- and `SLOW_STEPS_MIN` or more is SLOW.
-- **Both start** on `start_index()`: the fastest rung FAST stands for when
-  both are FAST, `SLOW_INDEX` (100 ms) when either is SLOW, plus
-  `OPTIMISTIC_RUNGS`. FAST stands for `FAST_INDEX` (80 ms) on pixels, and for
-  `BACKLIGHT_INDEX` (32 ms) for continuous badges on the backlight. A
-  continuous badge is always FAST: it samples between frames, so its frames
-  do not bound it. **LIT** is a third class, a continuous badge in a lit room
-  -- its black at least `LIT_BLACK_COUNTS` -- sent as `CAL_REPS_LIT` (2)
-  repetitions and read as `LIT_STEPS_MAX` or fewer high steps. Two LIT badges
-  on the backlight start on `BACKLIGHT_LIT_INDEX` (16 ms); a LIT badge with a
-  FAST one starts on the FAST rung. A Leader judges its light from the black
-  of the Follower's beacon, the one reading it has before its own staircase
-  goes out; a Follower from the black of the Leader's staircase. A missed
-  high step reads a FAST badge as LIT, which splits the rungs only when the
-  reader is LIT too and on the backlight. Both badges must run the same app: a continuous badge and
-  a once-a-frame one would not agree on what FAST means. From
-  there the ladder works as before: a demotion moves both badges one rung, so
-  two that started together stay together.
-- **The thresholds are asymmetric on purpose.** Reading a SLOW staircase as
-  FAST takes two missed high steps out of five and splits the rungs; reading a
-  FAST one as SLOW takes one spurious step and only costs speed.
-- **A badge that predates this** sends `CAL_REPS` and so reads as FAST, which
-  is what it assumed of itself.
+| Pair | Room | Start | Why |
+|---|---|---|---|
+| EXACT | LIT | **8 ms** (`EXACT_LIT_INDEX`) | lit settle 1.0-1.5 ms [measured-all], budgeted 2.5; the rule allows 6, not on the ladder until M5 says so |
+| EXACT | DARK | **16 ms** (`EXACT_INDEX`) | 7.75 ms worst from off [measured-all], budgeted 10; 10 ms if M4 puts the dim low's 90% under 4 |
+| POLLED | LIT | 16 ms (`BACKLIGHT_LIT_INDEX`) | the read loop's rung, unchanged |
+| POLLED | DARK | 32 ms (`BACKLIGHT_INDEX`) | the same |
 
-> **Why it exists.** Each badge used to start on the rung its own live frame
-> time allowed, on the grounds that both badges are the same hardware. They
-> are not the same firmware: v2 runs the panel at 60 Hz and v3 at 90, and a
-> frame that slips to two refreshes moves a badge's rung from 50 ms to 100.
-> Two badges on different rungs almost never recover, because each demotion
-> moves both and leaves them as far apart as before. Simulated, 8 seeds x 6
-> scenarios x 3 payloads, before and after:
->
-> | Leader / Follower frame | before | after |
-> |---|---|---|
-> | 11.1 / 33.3 ms | 35 of 144 | **143 of 144** |
-> | 33.3 / 11.1 ms | 0 of 144 | **144 of 144** |
-> | 11.1 / 11.1, 16.7 / 16.7, and either mix | 141, 136, 140, 139 | the same: FAST badges calibrate exactly as before |
-> | 33.3 / 33.3 ms | 140 of 144, median 28.9 s | 137 of 144, 33.2 s: two 1.2 s longer staircases |
->
-> With the backlight scheme offered, 8 seeds x 6 scenarios each for 33.3/11.1,
-> 11.1/33.3 and 33.3/33.3 delivered 48 of 48 and read every class right.
+plus `OPTIMISTIC_RUNGS` (0). A rung `r` is one an EXACT pair can start on when its
+window -- `max(settle, 0.4 r)` to `r - max(guard, 0.15 r)` -- is at least
+`WINDOW_MIN_US` and `r >= SLOT_MIN_MS`: settle + window + guard, where the read loop
+needed three settle times.
 
-> **Slow frames still cost accuracy.** At 33 ms frames a frame of edge
-> quantisation is a third of a 100 ms slot, and the simulator's I2 check (slot
-> grids within a quarter slot) trips in a few such runs -- 3 of 48 for two
-> 33 ms badges, 7 of 48 before this change -- though each still delivered.
-> FAST is the case the protocol is built for; SLOW is the case it survives.
-
-- **`separation()` scores 0 when the middle step did not hold steady**, which
-  is how a sensor that follows the backlight's PWM is caught. A middle and a
-  high step last equally long, so a clean staircase puts about as many samples
-  in each; flicker scatters the middle step's to either end, and the few left
-  can still fit a plausible grey. Fewer than half as many middle samples as
-  high ones fails it. Middle samples are those in the `L_grey` band (below)
-  between `L_black + span/4` and `L_black + 3*span/4`; high ones are those
-  above `L_black + 3*span/4`.
-- **One direction decides for both.** The Follower measured only Leader to
-  Follower. Applying that to Follower to Leader rests on the badges being the
-  same hardware, which rate selection already assumes.
-- **Which schemes a badge offers is the caller's setting**, passed to
-  `Transfer(schemes=...)`; `SCHEME_FIELDS` is always included.
-- **Mixed settings work.** A fields-only Leader never offers; a fields-only
-  Follower never accepts. Either way both end up in fields.
-
-> In simulation -- 24 seeds x 6 scenarios x 3 payloads, both sensor models,
-> swings of 9000 and 2400 -- both badges agreed on the scheme in every run.
-> With an averaging sensor, choosing picked the backlight and delivered **432
-> of 432** at both swings, against 419-427 for fields alone; with a flickering
-> one it fell back to fields every time and delivered 425-426. The extra
-> staircase costs 2.4 s. Mixed pairs settle on fields and deliver as fields
-> does. All of it in a model without edge bleed, and with the sensor question
-> unmeasured: what choosing buys is the chance to use the backlight on
-> hardware where it is better, at no risk where it is not.
-
-> There is deliberately no "calibration ready" handshake. Defining one in data symbols
-> was circular — the Leader could not classify data symbols until it had calibrated,
-> and could not calibrate until the Follower said it was done. Making the second
-> staircase both the signal and the calibration source removes the dependency.
+> **Why the frame-rate classes went.** Each badge used to carry FAST or SLOW --
+> whether its frames could sample the fastest rung -- in its staircase's
+> repetitions, and both started on the slower class's rung: a 90 Hz badge paired
+> with a 30 Hz one had delivered 35 and 0 of 144. A badge reading continuously was
+> always FAST, its frames bounding nothing, and now every badge does: the class,
+> `CAL_REPS_SLOW`, `FRAME_SAMPLES` and the 100 ms SLOW rung are gone. v2 at 60 Hz and
+> v3 at 90 still differ, but only in the beacons' presents, which period detection
+> with ±20% absorbs.
 
 ### Reading the levels
 
@@ -1493,35 +1455,44 @@ first edge out of black, at the start of every message.**
 
 - Every transmission begins after a run of black and starts on the transmitter's slot
   boundary, so that edge is a shared reference that needs no agreement.
-- The crossing of `T_low` is **interpolated** between the last dark sample and the
-  first lit one, never rounded to the frame that noticed it — a frame is a third of a
-  slot at the fastest rung. `T_low` sits a fifth to a quarter of the way up the swing, which
-  a first-order response reaches in roughly a tenth of its settling time, so the
-  crossing tracks the true edge on a fast panel and a slow one alike.
-- If the first lit sample is already at or above `T_high` the panel has arrived and
-  the chord has the slope of the *sampling* interval rather than the panel's. The
-  estimate is then the middle of the two samples, which is the answer that is wrong
-  by as little as possible either way.
-- The measured edge is then corrected for two biases, both of which push it late:
-  half a frame, because the peer can only raise a symbol on one of its own frames;
-  and a tenth of `LCD_SETTLE_MS`, the climb to `T_low`. Uncorrected these measured
-  +7 ms against a 35 ms slot on the rung in use when it was measured, which was most
-  of the quarter-slot budget.
+- The edge is found **after the fact, in the reader's history**: when a slot is
+  decided lit while acquiring, `reader.rise()` scans back from the slot's window
+  close -- no further than 2.5 slots, the end of the peer's last light, or the
+  oldest reading kept -- for the first crossing of `T_low` plus the fitted flicker,
+  a threshold per step of `max(3, d/32/100 µs)` 100 µs bins. EXACT: two consecutive
+  100 µs bins lit confirm it; POLLED: lit 1 ms running (`POLL_CONFIRM_US`), and the
+  last dark reading no more than `gap_for(d, read)` before -- an eighth of the slot,
+  inside its guard, but never under three of the loop's own read intervals nor
+  under 1 ms or over `POLL_GAP_US` (5 ms). A rise that came while the loop was blind
+  for a present or a collection is somewhere in the gap, and is not locked on; a
+  crossing interpolated across a wider gap could be 2-3 ms off. At 1 ms a loop
+  reading every 2 ms refused every rise and never locked.
+- The crossing is **interpolated** between the last bin below and the first above.
+- The boundary is the crossing less `EDGE_LAG_LIT_US` or `EDGE_LAG_DARK_US`, by this
+  badge's own light: the backlight's PWM wait and the sensor's climb to `T_low`.
 - Re-basing happens only while **acquiring** — between messages, never inside one.
   The Leader acquires in `STEP_CRC` before the reply starts and in `STEP_FINISH`; the
   Follower in `STEP_BLOCK` outside a block, in `STEP_VERDICT`, and in `STEP_FINISH`.
 - It requires **1.5 slots of real silence** first, so the edge is the start of a
-  transmission and not a symbol inside one.
-- A re-base **re-frames the slot in progress rather than deciding it**. Its samples
-  were taken before the edge and belong to the silence. Deciding it would push a
-  spurious symbol into a pattern match that may be part way through, which is what
-  made the Complete Pattern — the one pattern with no lead-in — impossible to match.
+  transmission and not a symbol inside one -- counted from the end of the peer's
+  last light, or of this badge's own transmission, **to the start of the slot the
+  crossing is in**, not to the crossing. A reply comes one silent slot after this
+  badge stops, and a slow sensor crosses well into it: counted to the crossing, the
+  Leader locked on CRC replies, late by the sensor's delay, read a CRC bit as the
+  Data Sync Error, and demoted alone (simulation, a sensor three times slower than
+  measured).
+- A re-base **renumbers the grid**: the slot decided on the old grid is discarded,
+  and slot 0 of the new one -- the symbol whose edge was just found -- is decided
+  next, from the readings already there. The crossing counts as the peer's last
+  light, so slot 0 cannot lock again: one re-base a message.
 
 Re-basing moves `epoch` and never `duration`; a rate change moves `duration` and never
 `epoch` (I3). The two are deliberately separate operations.
 
-> **Residual error.** The transmitter can only raise a symbol on one of its own
-> frames, so symbol edges carry up to a frame of quantisation that no receiver can
+> **Residual error, once a frame.** (The figures here are from when every badge
+> read once a frame; an EXACT pair's edges are placed to tens of µs -- see
+> "Reading".) The transmitter could only raise a symbol on one of its own
+> frames, so symbol edges carried up to a frame of quantisation that no receiver could
 > remove — about ±5.5 ms at 90 fps and ±8.3 ms at 60, against a quarter-slot budget of 12.5 ms at the
 > 50 ms rung. Measured over 506 acquisitions (16 seeds x 6 scenarios x 2
 > payloads), lock error after correction is a median of 3 ms, 9 ms at the 95th
@@ -1569,6 +1540,16 @@ Re-basing moves `epoch` and never `duration`; a rate change moves `duration` and
 > simulated runs. With both badges re-basing onto each other every message,
 > the error in each estimate adds to the last; with one reference, the
 > Follower's errors do not accumulate.
+>
+> **The POLLED exception.** A POLLED Follower that accepts a block owes a
+> collection (`collect_owed`) and makes it as it queues its next message;
+> the reply gap delays the message whole, so its CRC reply or Complete Ack
+> comes after one silent slot plus the collection's 20-46 ms -- 1.5 slots or
+> more on 16-32 ms rungs -- and the Leader may re-base on it. Accepted:
+> collected at once, it missed the Complete a slot behind the verdict. The
+> re-base lands within the guard in simulation (POLLED rows 144, `k3.0`
+> included). `test_reply_gap` pins the gap; an EXACT Follower collects at
+> once and keeps the one slot.
 
 ### Where this still fails
 
@@ -1695,18 +1676,20 @@ with our model", not "works".
 There is no negotiation phase and no verification phase. Both existed and both were
 deleted.
 
-- Both badges start on the rung their calibration staircases agreed -- the
-  slower of their two frame-rate classes: **80 ms** on pixels when both are
-  FAST, **32 ms** for continuous badges on the backlight, **100 ms** when either
-  is SLOW. See "Agreeing a rung". No message of its own carries it.
-- A badge's own **proven rung**, `conservative_index()`, is the fastest whose
-  duration is at least 2.5 samples -- a frame, or `FINE_MS` for a continuous
-  badge -- **and** at least `SETTLE_SLOTS` settle times: `LCD_SETTLE_MS` (72 ms)
-  on pixels, which is the 80 ms rung on either firmware. A continuous badge
-  on the backlight counts only `BACKLIGHT_PROVEN_MS` (50 ms) as proven, though
-  it starts on 32: the rungs between are a gamble, so a bad CRC there
-  demotes. It decides only whether a CRC failure may demote (see "Data send
-  mode"), never where a transfer starts.
+- Both badges start on the rung their calibration staircases agreed: **8 or 16 ms**
+  for an EXACT pair, lit or dark, **16 or 32** for a POLLED one. See "Agreeing a
+  rung". No message of its own carries it.
+- The **proven rung**, `conservative_index()`, is `BACKLIGHT_PROVEN_MS` (50 ms):
+  every start is faster, so every start is a gamble, and a bad CRC there demotes.
+  It decides only whether a CRC failure may demote (see "Data send mode"), never
+  where a transfer starts.
+- **Known defect F-B1, left as it was**: the Leader's own demotion goes out as a
+  Data Sync Error in `STEP_VERDICT`, which the Follower compares against a tail one
+  symbol too short and so never matches. The two then sit a rung apart. It turns
+  a CRC failure into a split rather than causing one, and why a pair forced onto a
+  rung too fast for its sensor splits rather than steps down. In the 2026-10-07
+  sweeps it costs no run (two of 576 in round 2; see "What simulation says"); the POLLED
+  47% losses once put down to it were a flicker rate learnt from too little.
 
 > **Why the start is agreed rather than computed alone.** Starting each badge on
 > its own proven rung assumed both badges were the same hardware running at the
@@ -1797,10 +1780,14 @@ Entered by the Leader; the Follower is in receive mode at the same time. For eac
 - Compare it against the CRC of the bytes just sent:
   - **Equal** — transmit CRC Good and move to the next block.
   - **Different** — count a retry and transmit CRC Bad, resending the same block.
-- Black before the reply's first data symbol is discarded. A black after it means the
-  Follower sent the Data Sync Error Pattern instead of a CRC: step one rung slower,
-  reset the retry count, and resend the block with `SYNC_LEAD_IN` extra black slots
-  in front.
+- Black before the reply's first data symbol is discarded. **Two blacks in a row**
+  after it mean the Follower sent the Data Sync Error Pattern instead of a CRC --
+  `_  _  _` after its leading black: step one rung slower, reset the retry count, and
+  resend the block with `SYNC_LEAD_IN` extra black slots in front, which still
+  covers the four symbols the Follower has left to send. One black alone is a
+  misread bit and counts as one: a slow sensor reads a middle symbol out of a fall
+  as black, and taking that for the pattern demoted the Leader alone (simulation,
+  a sensor three to four times slower than measured). The CRC catches it.
 - On a CRC failure beyond the first `MAX_BLOCK_RETRIES` for one block:
   - if the current rung is faster than the proven one, transmit the Data Sync Error
     Pattern, step one rung slower once it has been sent, reset the retry count, and
@@ -1841,7 +1828,11 @@ them was watched.
   sub-state, ends the transfer with `ERR_LOST_PEER`. Exempted in `STEP_FINISH` on
   both sides: the Leader waiting to be acknowledged after Complete, where the
   retry budget is the timeout instead, and the Follower lingering after its
-  acknowledgement, where `LINGER_SLOTS` is.
+  acknowledgement, where `LINGER_SLOTS` is. And a Follower that has just
+  accepted a block allows `COMPLETE_RETRY_SLOTS + len(COMPLETE)` more
+  (`idle_grace`), until it next reads light: it cannot tell the Leader's
+  silence before a next block from a Complete it missed, and the Leader's
+  repeat of Complete comes 18 slots after the first, past the 16 it allowed.
 - **Stalling.** More than `STALL_SLOTS` slots spent listening without the
   transfer advancing ends it the same way. Advancing means a pattern matched, a
   token collected, a verdict acted on, or something queued to transmit.
@@ -2029,38 +2020,36 @@ A payload is a **list of byte strings**, joined by the Field Separator:
 ## Implementation constraints
 
 - MicroPython on this badge has **no threading and no multiprocessing**. The protocol
-  runs in the frame loop or it does not run.
-- Every phase is a per-frame state machine, not a blocking loop. Each frame a badge
-  sets the screen to the field its state calls for, samples the sensor, and advances at
-  most one step.
+  runs in the transfer loop or it does not run.
+- Every phase is a state machine driven by `work(now)`, not a blocking loop. Each
+  pass of the caller's loop waits for `due_us()`, shows `field_at(now)`, and calls
+  `work(now)`, which decides whatever its reader has completed since.
 
-> This is not a style preference. Transmitting means changing the screen, and the screen
-> only changes when the frame is presented. A blocking loop that "sends a block" would
-> hold one colour for the whole block and transmit nothing at all.
+> Transmitting means changing the screen. A blocking loop that "sends a block" would
+> hold one level for the whole block and transmit nothing at all.
 
-- Every timeout is a deadline compared against `time.ticks_ms()`, evaluated once per
-  frame. None is a sleep.
-- Decide state transitions once at the top of a frame and use that decision for both
-  what is drawn and what is acted on.
-
-> Re-testing a deadline after the frame is presented reads a newer clock than the frame
-> showed, so the badge acts on a state it never displayed. That mistake made
-> `wifi_scanner` show "Rescan in 1 sec" and never "Rescanning channels".
-
-- Avoid allocating in the per-frame path, and call `gc.collect()` deliberately
-  between blocks: when the data phase starts, before its first block; on the Leader
-  before every block it sends after a verdict -- the next block, or a resend after CRC
-  Bad or its own demotion; and on the Follower when it accepts a CRC Good.
-- The per-slot allocations that remain are accepted: `SlotReceiver.feed` starts new
-  sample lists every slot; pattern matches `"".join` the recent symbols on every
-  decided slot; `send()` copies its symbols with `list()`; `StaircaseReader` grows its
-  sample buffer to 512 and takes `min`/`max` over it every sample; and
-  `collect_block` counts bytes with a generator after every byte.
-
-> A GC pause that straddles a slot boundary corrupts a symbol. The rule was once
-> absolute and the code did not meet it, so it is now a preference, with the
-> collections between blocks bounding how much garbage builds up. Whether a pause
-> ever lands badly on hardware is **[unmeasured]**.
+- Every timeout is a deadline compared against the reader's clock -- µs since the
+  transfer began, accumulated so it never wraps. None is a sleep. A transfer that
+  reaches `TRANSFER_MAX_US` ends `ERR_LOST_PEER`, so the clock stays a small int.
+- **The protocol never collects garbage itself.** It sets `collect_due` and the caller
+  collects at the top of its next pass, never inside a call: when the Follower's
+  closing gap begins, when the Leader finds it, on the Leader after a verdict before
+  the next block, and on the Follower when it accepts CRC Good -- each while that
+  badge holds LOW or only listens. An EXACT reader goes on reading through it; a
+  POLLED one is blind for it [**unmeasured** on v3; ≤ 46 ms on v2 [measured-v2]],
+  so a POLLED Follower that accepts a block owes the collection
+  (`collect_owed`) until it next queues a message, which the reply gap then
+  delays whole: collected at once, it missed the Complete that follows the
+  verdict by a slot. Not an EXACT one: the delay is silence the Leader may
+  phase-lock after, and on a slow sensor its lock on the reply's rise to the
+  middle landed a slot late.
+- Nothing per reading is Python's: the ring's readings are summed by viper kernels
+  (`fastadc.py`), a POLLED reading is an index and two adds. Per slot: one
+  `parts()` query, a few corrections and a median. The per-slot allocations that
+  remain are accepted: pattern matches `"".join` the recent symbols, `send()` copies
+  its symbols, `collect_block` counts bytes with a generator. With 7.7 MB free
+  [measured-v2] an automatic collection inside one transfer is unlikely; Dev Mode's
+  M3 measures the garbage a slot leaves.
 
 ## How the constants were measured
 
@@ -2102,25 +2091,30 @@ Three things learned doing it are worth keeping:
 
 ## Throughput
 
-- One bit per slot, half duplex, so the raw rate is `1 / slot`: 62 bit/s at
-  the 16 ms rung two LIT badges start on with the backlight, 31 bit/s at the
-  32 ms rung they start on in the dark, 12.5 bit/s at the 80 ms rung pixels
-  start on.
-- A typical credential, in simulation, from the first beacon: 10.5 s in a lit
-  room, 15.3 s in the dark, 23.6 s on pixels -- see "Reading continuously".
-  Setup, about 2.7 s of discovery and 4-6 s of calibration, is most of it.
+- One bit per slot, half duplex, so the raw rate is `1 / slot`: 125 bit/s on
+  the 8 ms rung two LIT EXACT badges start on, 62 bit/s on 16 ms (EXACT in
+  the dark, POLLED lit), 31 bit/s on 32 ms (POLLED in the dark).
+- A typical credential, in simulation, from the first beacon: **5.5 s** lit
+  and **7.5 s** dark for an EXACT pair, 7.3 s and 11.1 s for a POLLED one,
+  each including the simulator's 1.5 s start skew in four scenarios of six
+  -- see "What simulation says". Before the ring, 10.6 s and 15.3 s.
+  Discovery is about 0.7 s and calibration 1.6-1.8 s.
 - Per-block overhead is 47 slots: lead-in 4, Begin 9, End 9, CRC 16, verdict 9. Plus 6
   slots for the Complete Pattern.
-- Ladder values are what the clock keeps. Each symbol is on screen for a whole number
-  of frames, so individual symbols run long or short of the slot -- 39 to 62 ms on the
-  50 ms rung at 90 fps, and whole 16.7 ms frames -- 33, 50 or 67 ms **[inferred-v2]** --
-  at 60 -- but the boundaries are on the clock
-  and do not drift: symbols average **50.0 ms** apart there, measured across an
-  825-symbol transfer.
-- Setup is 4.8 s of calibration, 2400 ms in each direction, and 7.2 s when the Leader
-  offers the backlight scheme. A SLOW badge's staircases are 3600 ms each, 1.2 s
-  more apiece. Nothing else — the starting rung is read from the staircases.
+- Ladder values are what the clock keeps, in µs: a transmitter changes its
+  backlight one pass of its loop after each boundary, and a receiver decides
+  from its reader's history, so neither rounds a symbol to a frame.
 - The Follower finishes `LINGER_SLOTS` slots after the Leader, by design.
+
+**Before 2026-10-05**, stepped once a frame (the figures here are from then):
+
+- Each symbol was on screen for a whole number of frames, so individual
+  symbols ran long or short of the slot -- 39 to 62 ms on the 50 ms rung at
+  90 fps, and whole 16.7 ms frames -- 33, 50 or 67 ms **[inferred-v2]** -- at
+  60 -- but the boundaries were on the clock and did not drift: symbols
+  averaged **50.0 ms** apart there, measured across an 825-symbol transfer.
+- Setup was 4.8 s of calibration, 2400 ms in each direction, and 7.2 s when
+  the Leader offered the backlight scheme.
 - Simulated end to end at 90 fps, including discovery and both calibrations. Median
   over 8 seeds, with the delivery rate beside it:
 
@@ -2128,14 +2122,10 @@ Three things learned doing it are worth keeping:
       settles in 16 ms  ends on 50 ms, twice 65  typical 24.4 s  8/8   worst 51.0 s  8/8
       settles in 32 ms  mostly demotes to 65     typical 46.0 s  7/8   worst 92.0 s  6/8
 
-  Typical is a 15-byte SSID with a 20-byte key; worst case is 32 and 63. About 5 s of
-  every figure is calibration. A 32 ms panel is past what the constants are built for
-  and is quoted to show where this stops working, not as a supported case.
-- **At 60 fps**, v2's best, 144 runs (8 seeds x 6 scenarios x three payloads: a
-  WPA2 credential, an open one with an empty key, the longest) deliver 136 against
-  141 at 90 fps, with
-  a median of 27.1 s against 18.1 s: more transfers demote to 65 or 80 ms. At 30 fps,
-  a frame of two refreshes, they start on the 100 ms rung and take a median 28.9 s.
+  Typical is a 15-byte SSID with a 20-byte key; worst case is 32 and 63.
+- **At 60 fps**, v2's best, 144 runs deliver 136 against 141 at 90 fps, with
+  a median of 27.1 s against 18.1 s. At 30 fps they started on the 100 ms
+  rung and took a median 28.9 s.
 
 > These are slower than the figures the optimistic rung used to quote, and that
 > comparison was never real: the fast rung's timings assumed a gamble that measurement

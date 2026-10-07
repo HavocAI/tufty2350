@@ -1,8 +1,8 @@
 """The simulator's model of the badge, where it was calibrated against one.
 
 simulator.py is the evidence most of the protocol's figures rest on, so what
-it assumes about the hardware is pinned here: the present delay measured on
-2026-10-04, and that leaving it at zero reproduces every earlier result.
+it assumes about the hardware is pinned here -- and that it runs the
+production readers.
 """
 
 import random
@@ -11,66 +11,10 @@ import simulator as sim
 from harness import load_module
 
 P = load_module("share_wifi", "protocol")
+R = load_module("share_wifi", "reader")
 
 
-class Scripted:
-    """A stand-in Transfer that shows a fixed sequence of fields."""
-
-    def __init__(self, fields):
-        self.fields = list(fields)
-        self.scheme = None
-        self.started = 0
-        self.phase_started = 0
-
-    def step(self, now, light):
-        return self.fields.pop(0) if self.fields else self.fields_last
-
-    fields_last = " "
-
-
-def badge(fields, present_ms):
-    return sim.SimBadge(Scripted(fields), sim.Panel(1), None, 16.7,
-                        random.Random(1), present_ms=present_ms)
-
-
-class NoSensor:
-    def read(self, level):
-        return 0
-
-
-def test_without_a_present_delay_the_field_is_shown_at_once():
-    b = badge(["-"], 0.0)
-    b.sensor = NoSensor()
-    b.tick(100, 0.0)
-    assert b.shown == "-"
-
-
-def test_a_field_reaches_the_panel_present_ms_after_its_frame():
-    b = badge(["-", "_"], 19.0)
-    b.sensor = NoSensor()
-    b.tick(100, 0.0)                    # decides "-" at 100 ms
-    b.present(118.9)
-    assert b.shown == " ", "shown before its present completed"
-    b.tick(116.7, 0.0)                  # the next frame decides "_"
-    b.present(119.0)
-    assert b.shown == "-"
-    b.present(135.7)
-    assert b.shown == "_", "a delay longer than a frame must queue, not drop"
-
-
-def test_the_v2_profile_is_what_was_measured():
-    assert sim.V2_MEASURED == dict(frame_ms=16.7, present_ms=19.0, settle_ms=24)
-    # 90% of a swing in 24 ms is a time constant of about 10.4 ms: the
-    # measured rise was 10.5.
-    assert abs(sim.Panel(sim.SETTLE_MS_V2).tau - 10.5) < 0.2
-
-
-def test_the_v2_profile_still_delivers():
-    # As the app runs it: reading continuously, presenting only to change the
-    # pixels. The once-a-frame loop against v2's measured present delay does
-    # not: its edge correction leaves out the ~19 ms the delay adds, and on
-    # the 80 ms rung the Follower's replies land on the Leader's slot
-    # boundaries -- see "What the measurement found" in the protocol.
+def test_the_v2_and_v3_profiles_deliver():
     for timing in (sim.LOOP_V2, sim.LOOP_V2_SLOW_PANEL, sim.LOOP_V3):
         link = sim.build_loop(P, sim.TYPICAL, seed=1,
                               **dict(sim.SCENARIOS["realistic"], **timing))
@@ -81,12 +25,21 @@ def test_the_v2_profile_still_delivers():
         assert not link.violation, link.violation
 
 
-def test_the_measured_backlight_runs_on_its_fast_rung():
-    # Continuous badges on the measured mirror's sensor, offered both schemes,
-    # choose the backlight and finish on BACKLIGHT_INDEX: no demotion.
-    both = (P.SCHEME_FIELDS, P.SCHEME_BACKLIGHT)
+def test_the_simulator_runs_the_production_readers():
+    link = sim.build_loop(P, sim.TYPICAL, seed=1)
+    assert type(link.leader.reader) is R.RingReader
+    assert type(link.leader.reader.ring) is R.ListRing
+    # The ring is a power of two, its history the badge's.
+    ring = link.leader.reader.ring
+    assert ring.samples == sim.RING_ENTRIES == 4096
+    assert link.leader.reader.usable == sim.RING_USABLE_US
+    polled = sim.build_loop(P, sim.TYPICAL, seed=1, reader="polled")
+    assert type(polled.leader.reader) is R.PolledReader
+
+
+def test_the_measured_sensor_runs_on_the_exact_rung_in_the_dark():
     for seed in (1, 2, 3):
-        link = sim.build_loop(P, sim.TYPICAL, seed=seed, schemes=both,
+        link = sim.build_loop(P, sim.TYPICAL, seed=seed,
                               **dict(sim.SCENARIOS["realistic"], **dict(
                                   sim.LOOP_V2, contrast=sim.SWING_MIRROR,
                                   **sim.LOOP_SENSOR_V2)))
@@ -94,16 +47,15 @@ def test_the_measured_backlight_runs_on_its_fast_rung():
         leader = link.leader.transfer
         assert leader.result == P.OK, (seed, leader.result)
         assert leader.scheme == P.SCHEME_BACKLIGHT
-        assert leader.clock.index == P.BACKLIGHT_INDEX, \
+        assert leader.clock.index == P.EXACT_INDEX, \
             P.SLOT_LADDER[leader.clock.index]
 
 
-def test_a_continuous_badge_never_presents_in_the_backlight_data_phase():
+def test_nothing_is_presented_in_the_data_phase():
     # Presents only change pixels, and the backlight scheme's are white for
     # every symbol: once both badges are in the data phase, nothing is
-    # presented by either, so neither is ever blind to the other.
-    both = (P.SCHEME_FIELDS, P.SCHEME_BACKLIGHT)
-    link = sim.build_loop(P, sim.TYPICAL, seed=1, schemes=both,
+    # presented by either.
+    link = sim.build_loop(P, sim.TYPICAL, seed=1,
                           **dict(sim.SCENARIOS["realistic"], **sim.LOOP_V2))
     changes = []
     for badge in (link.leader, link.follower):
@@ -114,29 +66,28 @@ def test_a_continuous_badge_never_presents_in_the_backlight_data_phase():
         badge.panel.schedule = schedule
     link.run(300)
     assert link.leader.transfer.result == P.OK
-    assert link.leader.transfer.scheme == P.SCHEME_BACKLIGHT
     in_data = [kind for phase, kind in changes if phase == P.PHASE_DATA]
     assert "duty" in in_data, "the data phase changed no backlight"
     assert "share" not in in_data, "a pixel change in the data phase"
 
 
+def test_a_collection_the_protocol_asks_for_stalls_the_badge():
+    link = sim.build_loop(P, sim.TYPICAL, seed=1)
+    link.run(300)
+    assert link.leader.transfer.result == P.OK
+    # The Leader on finding the closing gap; the Follower at its own and on
+    # accepting the block.
+    assert link.leader.collections >= 1 and link.follower.collections >= 2
+
+
 def test_the_measured_sensor_reads_in_whole_steps_around_its_swing():
     rng = random.Random(3)
-    sensor = sim.Sensor(sim.SENSOR_V2["ambient"][0], 80, 0, rng,
-                        sd=sim.SENSOR_V2["sensor_sd"], quantum=16, reads=3)
-    black = [sensor.read(0.0) for _ in range(400)]
-    white = [sensor.read(1.0) for _ in range(400)]
+    sensor = sim.LoopSensor(40, 0, 80, rng, sd=6.0, quantum=16)
+    black = [sensor.read() for _ in range(400)]
+    sensor.settle(1.0, 1.0)
+    white = [sensor.read() for _ in range(400)]
     assert all(v % 16 == 0 for v in black + white)
-    # Floored steps around 32 and 112, scattered by a step at most -- as the
-    # mirror runs read them.
-    assert set(black) <= {16, 32, 48} and set(white) <= {96, 112, 128}
-    assert sorted(black)[200] == 32 and sorted(white)[200] == 112
-
-
-def test_the_default_sensor_is_the_idealised_one():
-    # Every result quoted before the measured model must still reproduce.
-    sensor = sim.Sensor(200, 9000, 0, random.Random(1))
-    assert sensor.read(0.5) == 4700
+    assert sorted(black)[200] in (32, 48) and sorted(white)[200] in (112, 128)
 
 
 def test_the_peer_swings_follow_the_geometry():

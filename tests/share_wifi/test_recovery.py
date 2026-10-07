@@ -29,7 +29,7 @@ Transfer = protocol.Transfer
 
 def on_air(side, now):
     """The symbol `side` is showing from its queue, or None if it is not."""
-    if not side.tx:
+    if not side.tx or side.tx_slot is None:
         return None
     index = side.clock.number(now) - side.tx_slot
     if 0 <= index < len(side.tx):
@@ -67,7 +67,7 @@ def run_with_framing_failure(payload, after_bytes, scenario="ideal", seed=1):
         check(now)
         if not (leader.phase == follower.phase == protocol.PHASE_DATA):
             return
-        now = int(now)
+        now = int(now * 1000)
         # The literal rule, over the window the defect lived in: from the
         # failure until the Leader has sent the whole block, the Follower
         # queues nothing at all.
@@ -118,11 +118,12 @@ def assert_recovers(payload, after_bytes, scenario="ideal", seed=1):
 
 
 def test_a_framing_failure_early_in_a_block_recovers_on_one_rung():
+    # The ideal scenario's ambient is a lit room's: the pair starts on the
+    # EXACT lit rung.
     leader = assert_recovers(simulator.TYPICAL, after_bytes=3)
-    start = Transfer(True, simulator.TYPICAL, frame_ms=lambda: 11)
-    assert leader.clock.index == start.start_index() - 1, \
+    assert leader.clock.index == protocol.EXACT_LIT_INDEX - 1, \
         "one failure should cost exactly one rung, not %d" % (
-            start.start_index() - leader.clock.index)
+            protocol.EXACT_LIT_INDEX - leader.clock.index)
 
 
 def test_a_framing_failure_late_in_a_block_recovers_on_one_rung():
@@ -143,35 +144,40 @@ def test_a_framing_failure_recovers_on_a_noisy_link_too():
             assert_recovers(simulator.TYPICAL, after, "realistic", seed)
 
 
-def test_a_framing_failure_waits_for_quiet_and_then_asks_once():
-    # Frame by frame on one badge: the request goes out only after
-    # RESEND_QUIET_SLOTS of black, and it is the one Data Sync Error.
+def test_a_framing_failure_breaks_in_and_then_asks_once():
+    # Reading by reading on one badge: the Follower that loses framing holds
+    # high -- breaking in -- for as long as the Leader is lit, sends nothing,
+    # and once the Leader has been dark BREAK_ACK_SLOTS sends the one Data
+    # Sync Error, then demotes one rung.
     follower = T.Transfer(False)
     follower.levels = T.levels()
     follower.now = 0
     follower.start_data(0, 5)
     rng = random.Random(1)
-    slot = follower.clock.duration
+    slot = follower.clock.duration // 1000
     now = 0
+    shown = []
 
     def hold(symbol, slots):
         nonlocal now
         for _ in range(slots * slot // T.FRAME_MS):
-            follower.step(now, T.light_from(symbol, rng))
+            shown.append(follower.step(now, T.light_from(symbol, rng)))
             now += T.FRAME_MS
 
     hold(" ", 6)
     for symbol in protocol.BEGIN_BLOCK + "-_- ":         # black after 3 bits
         hold(symbol, 1)
-    assert follower.want_resend and not follower.in_block
-    for _ in range(40):                                  # the rest of the block
+    hold("-", 1)            # a slot is decided once its window has closed
+    assert follower.breaking and not follower.in_block
+    del shown[:]
+    hold("-", 1)
+    for _ in range(10):                                  # the Leader goes on
         hold(rng.choice("-_"), 1)
-    assert not follower.tx, "it must not answer over a Leader still sending"
-    assert not follower.pending_slow_down
-    hold(" ", protocol.RESEND_QUIET_SLOTS + 2)
+    assert set(shown) == {protocol.HIGH}, "it should hold high, breaking in"
+    assert not follower.tx and not follower.pending_slow_down
+    hold(" ", protocol.BREAK_ACK_SLOTS + 2)
     assert "".join(follower.tx) == protocol.SYNC_ERROR, \
-        "it should ask with the Data Sync Error Pattern once the Leader is quiet"
-    assert follower.resend_requests == 1
+        "it should ask with the Data Sync Error Pattern once the Leader stops"
     hold(" ", len(protocol.SYNC_ERROR) + 2)
     assert follower.clock.index == 4, "one failure, one rung"
 
@@ -184,7 +190,7 @@ def test_a_framing_failure_waits_for_quiet_and_then_asks_once():
 
 def test_a_leader_with_no_bytes_sends_one_empty_block():
     for payload in ([b""], [], None, ()):
-        leader = Transfer(True, payload, frame_ms=lambda: 11)
+        leader = Transfer(True, payload)
         assert leader.blocks == [[]], "%r: %r" % (payload, leader.blocks)
         leader.levels = T.levels()
         leader.now = 0

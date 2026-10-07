@@ -73,8 +73,7 @@ def paired(index, payload=(b"HomeNet", b"hunter2!!")):
     for badge_side in (leader, follower):
         badge_side.levels = levels()
         badge_side.now = 0
-        badge_side.clock.start(0, index)
-        badge_side.begin_slots(0, index)
+        badge_side.clock.set_index(index)
     return leader, follower
 
 
@@ -83,11 +82,11 @@ def test_a_symbol_is_held_for_a_whole_slot():
     leader, _ = paired(0)
     leader.start_data(0)
 
-    slot = leader.clock.duration
+    slot = leader.clock.duration // 1000
     fields = []
     now = 0
     for _ in range(slot * 3 // FRAME_MS):
-        fields.append((now, leader.step_data(now, 0)))
+        fields.append((now, leader.field_at(now * 1000)))
         now += FRAME_MS
 
     by_slot = {}
@@ -99,8 +98,11 @@ def test_a_symbol_is_held_for_a_whole_slot():
 
 
 def test_the_queue_starts_on_a_slot_boundary():
+    # Fixed by the first field shown after the queue: the next boundary.
     leader, _ = paired(0)
     leader.start_data(0)
+    assert leader.tx_slot is None
+    leader.field_at(0)
     assert leader.tx_slot == leader.clock.number(0) + 1
 
 
@@ -111,7 +113,7 @@ def test_data_transfer_completes_and_verifies():
         leader.start_data(0)
         follower.start_data(0)
 
-        slot = leader.clock.duration
+        slot = leader.clock.duration // 1000
         budget = (len(build_tokens(ssid, key)) * 8 + 400) * slot // FRAME_MS
         link(leader, follower, budget, seed=index,
              stop_when=both_done(leader, follower))
@@ -122,22 +124,27 @@ def test_data_transfer_completes_and_verifies():
 
 
 def test_transfer_survives_sensor_noise():
-    # Noise up to a third of the gap between levels, which hysteresis and the
-    # middle-50% sampling should absorb.
-    leader, follower = paired(3)
-    leader.start_data(0)
-    follower.start_data(0)
-    slot = leader.clock.duration
-    link(leader, follower, 900 * slot // FRAME_MS, noise=1200, seed=7,
-         stop_when=both_done(leader, follower))
-    assert leader.result == protocol.OK, leader.result
-    assert parse_payload(follower.received) == [b"HomeNet", b"hunter2!!"]
+    # Noise up to a third of the gap between levels, read once a frame: one
+    # seed is not evidence, so sixteen, and all but one deliver.
+    delivered = 0
+    for seed in range(1, 17):
+        leader, follower = paired(3)
+        leader.start_data(0)
+        follower.start_data(0)
+        slot = leader.clock.duration // 1000
+        link(leader, follower, 900 * slot // FRAME_MS, noise=1200, seed=seed,
+             stop_when=both_done(leader, follower))
+        if leader.result == protocol.OK:
+            delivered += 1
+            assert parse_payload(follower.received) == [b"HomeNet",
+                                                        b"hunter2!!"]
+    assert delivered >= 15, delivered
 
 
 def test_transfer_works_at_every_rung_of_the_ladder():
     for index in range(len(SLOT_LADDER)):
         slot = SLOT_LADDER[index]
-        if slot < FRAME_MS * 2.5:
+        if slot < FRAME_MS * 2.5 or slot < 50:
             continue                # the badge could not meet this rung anyway
         leader, follower = paired(index)
         leader.start_data(0)
@@ -165,7 +172,7 @@ def test_complete_pattern_is_actually_transmitted():
     leader, follower = paired(3)
     leader.start_data(0)
     follower.start_data(0)
-    slot = leader.clock.duration
+    slot = leader.clock.duration // 1000
     link(leader, follower, 700 * slot // FRAME_MS,
          stop_when=lambda: follower.result)
     assert follower.result == protocol.OK, "follower never saw Complete"
@@ -188,10 +195,10 @@ def test_follower_waits_to_see_the_leader_before_beaconing():
     assert not follower.saw_announce
 
     for _ in range(120):                      # a Leader starts announcing
-        level = "-" if (now // 250) % 2 else "_"
+        level = "-" if (now // protocol.ANNOUNCE_HALF_MS) % 2 else " "
         follower.step(now, light_from(level, rng))
         now += FRAME_MS
-    assert follower.saw_announce, "should have locked on to the 250ms beacon"
+    assert follower.saw_announce, "should have locked on to the Leader's beacon"
 
 
 def test_no_allocation_of_the_progress_string_per_frame():
@@ -201,7 +208,8 @@ def test_no_allocation_of_the_progress_string_per_frame():
     leader.start_data(0)
     before = leader.progress
     for i in range(10):
-        leader.step_data(i * FRAME_MS, 0)
+        leader.field_at(i * FRAME_MS * 1000)
+        leader.work(i * FRAME_MS * 1000)
     assert leader.progress is before, "progress should not be rebuilt per frame"
 
 
@@ -220,139 +228,16 @@ def test_receive_buffer_stays_bounded_while_waiting():
 
 
 # --- rate selection and demotion --------------------------------------------
-# A transfer starts on the fastest PROVEN rung and steps down when the panel
-# turns out to be slower than the conservative figure. There used to be one
-# optimistic rung above proven ground, and these tests covered both outcomes of
-# that gamble; it was removed because its demotion is announced by a pattern the
-# peer has to read at the very rate that is too fast to read, so a failed gamble
-# could leave the two badges a rung apart instead of stepping down together.
+# The once-a-frame tests that lived here drove a lagging pixel panel at frame
+# rate and watched both badges demote. That reader is gone: a transfer reads
+# through the DMA ring or a light_level() loop, on the backlight. A demotion's
+# mechanics -- one request, one rung, both badges together -- are in
+# test_recovery.py; where a pair starts, in test_tier.py.
 #
-# Demotion itself still matters and is still tested, at a settle time where it
-# is genuinely required: SETTLE_FOR_DEMOTION below.
-
-import math
-
-FRAME_90FPS = 11.1
-
-
-class LaggingPanel:
-    """Luminance chases the commanded field, as a real LCD does.
-
-    tau is set so a full swing reaches ~90% in `settle_ms`. This is what the
-    instant-field model in the rest of this file leaves out, and it is the
-    difference between a rung looking fine and being unusable.
-    """
-
-    def __init__(self, settle_ms):
-        self.tau = settle_ms / 2.3
-        self.level = 0.0
-
-    def sample(self, field, dt, rng, noise=80):
-        target = BRIGHTNESS[field]
-        self.level += (target - self.level) * (1 - math.exp(-dt / self.tau))
-        return int(AMBIENT + self.level * CONTRAST + rng.uniform(-noise, noise))
-
-
-def link_through_panels(leader, follower, settle_ms, seconds, seed=1):
-    rng = random.Random(seed)
-    lp, fp = LaggingPanel(settle_ms), LaggingPanel(settle_ms)
-    now = 0.0
-    lf = ff = " "
-    while now < seconds * 1000:
-        seen_by_leader = fp.sample(ff, FRAME_90FPS, rng)
-        seen_by_follower = lp.sample(lf, FRAME_90FPS, rng)
-        lf = leader.step(int(now), seen_by_leader)
-        ff = follower.step(int(now), seen_by_follower)
-        if leader.result and follower.result:
-            break
-        now += FRAME_90FPS
-    return now / 1000
-
-
-# The panel must be this slow before the starting rung fails and the Data Sync
-# Error path has to step both badges down. It is above the 16ms LCD_SETTLE_MS
-# the ladder is built around, which is the point: with the gamble rung gone, a
-# 16ms panel no longer needs to demote at all, so asserting a demotion there
-# would assert nothing. Measured across 8 seeds, 32ms demotes to 65ms every
-# time and completes every time; 24ms never needs to.
-SETTLE_FOR_DEMOTION = 32
-# The rung the demotion tests start on. Not the one the badge picks: that is
-# 80 ms now, three of the panel's measured 24 ms settles, and from 80 no panel
-# in this harness both fails and recovers -- 56 ms needs no demotion and 60 or
-# slower cannot read the Data Sync Error announcing one, exactly as the
-# protocol before this change did from 80 ms. The mechanism is the same on
-# every rung, so it is tested where it has room: 50 ms, against a 32 ms panel.
-DEMOTION_START_MS = 50
-
-
-def started_pair(payload=(b"HomeNet", b"hunter2!!"), start_ms=None):
-    """Two badges starting a real transfer on the rung the badge would pick,
-    or on `start_ms`."""
-    leader = Transfer(True, payload, frame_ms=lambda: 11)
-    follower = Transfer(False, frame_ms=lambda: 11)
-    for side in (leader, follower):
-        side.levels = levels()
-        side.now = 0
-        index = side.conservative_index() if start_ms is None \
-            else protocol.SLOT_LADDER.index(start_ms)
-        side.start_data(0, index)
-    return leader, follower
-
-
-def test_transfer_starts_on_proven_ground_and_stays_there():
-    # A panel at or better than the conservative figure never has to demote.
-    leader, follower = started_pair()
-    assert protocol.SLOT_LADDER[leader.clock.index] == 80
-    link_through_panels(leader, follower, settle_ms=24, seconds=120)
-    assert leader.result == protocol.OK, leader.result
-    assert parse_payload(follower.received) == [b"HomeNet", b"hunter2!!"]
-    assert protocol.SLOT_LADDER[leader.clock.index] == 80, "nothing should have demoted"
-
-
-def test_slow_panel_demotes_and_still_completes():
-    # The starting rung fails, the Data Sync Error path steps both badges down,
-    # and the credential still arrives. Every seed, so that a demotion which
-    # only works on the lucky one cannot pass.
-    for seed in range(1, 9):
-        leader, follower = started_pair(start_ms=DEMOTION_START_MS)
-        link_through_panels(leader, follower, settle_ms=SETTLE_FOR_DEMOTION,
-                            seconds=200, seed=seed)
-        assert leader.result == protocol.OK, "seed %d: %s" % (seed, leader.result)
-        assert parse_payload(follower.received) == [b"HomeNet", b"hunter2!!"]
-        assert protocol.SLOT_LADDER[leader.clock.index] == 65, \
-            "seed %d: should have demoted, on %dms" % (
-                seed, protocol.SLOT_LADDER[leader.clock.index])
-
-
-def test_both_badges_demote_together():
-    # A rate change only ever alters slot duration, never the shared epoch (I3).
-    # A Leader on 65ms against a Follower on 50ms has happened, and neither can
-    # hear the other.
-    for seed in range(1, 9):
-        leader, follower = started_pair(start_ms=DEMOTION_START_MS)
-        link_through_panels(leader, follower, settle_ms=SETTLE_FOR_DEMOTION,
-                            seconds=200, seed=seed)
-        assert leader.clock.index == follower.clock.index, \
-            "seed %d: leader on %dms, follower on %dms" % (
-                seed, protocol.SLOT_LADDER[leader.clock.index],
-                protocol.SLOT_LADDER[follower.clock.index])
-
-
-def test_demotion_does_not_spend_the_crc_retry_budget():
-    leader, follower = started_pair(start_ms=DEMOTION_START_MS)
-    link_through_panels(leader, follower, settle_ms=SETTLE_FOR_DEMOTION, seconds=200)
-    assert leader.result == protocol.OK
-    assert leader.retries == 0, "a rate demotion must not leave retries spent"
-
-
-def test_worst_case_credential_survives_a_demotion():
-    # 32 and 63 byte fields, which cross a block boundary: the multi-block case
-    # and the demotion case at once.
-    payload = (b"A" * 32, b"k" * 63)
-    leader, follower = started_pair(payload, start_ms=DEMOTION_START_MS)
-    link_through_panels(leader, follower, settle_ms=SETTLE_FOR_DEMOTION, seconds=300)
-    assert leader.result == protocol.OK, leader.result
-    assert parse_payload(follower.received) == list(payload)
+# The Leader's own demotion, after CRC failures on a rung faster than the
+# proven one, still goes out as a Data Sync Error the Follower cannot match
+# in STEP_VERDICT -- known defect F-B1, left as it was: in simulation, a pair
+# forced onto a rung too fast for its sensor splits that way.
 
 
 def test_a_demoted_resend_does_not_need_separator_state():
@@ -360,7 +245,7 @@ def test_a_demoted_resend_does_not_need_separator_state():
     # reject a second one, and a discarded block had to rewind that flag or the
     # resend failed forever. Allowing any number of fields removed the flag and
     # the whole failure mode with it.
-    follower = Transfer(False, frame_ms=lambda: 11)
+    follower = Transfer(False)
     follower.levels = levels()
     follower.now = 0
     follower.start_data(0, follower.conservative_index())

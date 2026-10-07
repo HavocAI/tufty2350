@@ -501,25 +501,29 @@ def fields_of(namespace, scheme=None):
     return namespace["FIELD_COLOR"][scheme], namespace["FIELD_BACKLIGHT"][scheme]
 
 
-def test_the_default_offers_both_schemes_with_fields_to_fall_back_on():
+def test_the_fields_scheme_holds_the_backlight_at_full():
+    # Beacons are drawn in it, before anything is calibrated.
     namespace, app = app_with()
-    assert namespace["SIGNALLING"] == (namespace["SCHEME_FIELDS"],
-                                       namespace["SCHEME_BACKLIGHT"])
     colors, lights = fields_of(namespace)
     assert set(lights.values()) == {1.0}, \
         "the fields scheme should hold the backlight at full"
 
 
-def test_a_transfer_is_offered_exactly_the_configured_schemes():
+def test_a_transfer_reads_through_the_launchs_reader():
+    # Under CPython there is no `machine`, so no ring: the POLLED reader,
+    # light_level() into bins, made once per launch and the reason kept.
     namespace, app = app_with(CREDENTIALS)
     frame(namespace, "DOWN")
     frame(namespace, "A")                 # Receive
     frame(namespace, "A")                 # past the alignment line
-    assert app.transfer.offers_backlight is True
-    namespace["SIGNALLING"] = (namespace["SCHEME_FIELDS"],)
+    reader = app.transfer.reader
+    assert reader is namespace["polled_reader"]()
+    assert not app.transfer.exact
+    assert namespace["ring_reader"]() is None
+    assert namespace["ring_note"](), "why there is no ring is kept"
     app.transfer = None
     app.begin_transfer(False)
-    assert app.transfer.offers_backlight is False
+    assert app.transfer.reader is reader, "one reader per launch"
 
 
 def test_the_app_draws_each_scheme_from_the_protocols_table():
@@ -878,11 +882,12 @@ def in_transfer(leader=False):
 
 
 def scripted(namespace, fields):
-    """Make the transfer's sample() -- the listen loop's call, once a sample
-    -- return these fields, one a frame."""
+    """Make the transfer's field_at() -- the loop's first call, once a pass
+    -- return these fields, one a frame, and its work do nothing."""
     queue = list(fields)
-    namespace["app"].transfer.sample = \
-        lambda now, t, value, t_us=None, span_us=0: queue.pop(0)
+    transfer = namespace["app"].transfer
+    transfer.field_at = lambda t: queue.pop(0)
+    transfer.work = lambda t: None
 
 
 def test_a_transfer_signals_at_lores_with_runs_clear_off():
@@ -910,9 +915,28 @@ def test_the_field_is_the_whole_screen_and_nothing_else():
 
 # --- the listen loop, as the badge runs it --------------------------------------
 
+class FakeReader:
+    """A reader whose clock moves 1 ms each time it is read."""
+
+    def __init__(self):
+        self.t = 0
+        self.stops = 0
+        self.pumped = []
+
+    def pump(self, until):
+        self.pumped.append(until)
+
+    def now_us(self):
+        self.t += 1000
+        return self.t
+
+    def stop(self):
+        self.stops += 1
+
+
 class LoopTransfer:
-    """Stands in for a Transfer: the fields to return, one a call, and DONE
-    once they run out. Counts its calls."""
+    """Stands in for a Transfer: the fields to show, one a pass, and DONE
+    once they run out. Counts its passes."""
 
     def __init__(self, protocol_scheme, fields, leader=True):
         self.scheme = protocol_scheme
@@ -922,8 +946,10 @@ class LoopTransfer:
         self.leader = leader
         self.received = []
         self.calls = 0
+        self.reader = FakeReader()
+        self.collect_due = False
 
-    def sample(self, now, t, value, t_us=None, span_us=0):
+    def field_at(self, t):
         self.calls += 1
         if not self.fields:
             self.result = protocol.OK
@@ -931,8 +957,11 @@ class LoopTransfer:
             return protocol.LOW
         return self.fields.pop(0)
 
-    def deadline(self):
-        return None
+    def work(self, t):
+        pass
+
+    def due_us(self):
+        return self.reader.t
 
     def fail(self, code):
         self.result = code
@@ -963,7 +992,7 @@ def test_the_listen_loop_changes_the_backlight_without_presenting():
     presents, fills = display.updates, len(screen.fills)
     lights = len(display.backlights)
     app.do_transfer()
-    assert fake.calls == len(symbols) + 1, "one sample a pass, then done"
+    assert fake.calls == len(symbols) + 1, "one field a pass, then done"
     assert display.updates == presents, "the loop presented"
     assert len(screen.fills) == fills, "the loop filled the screen"
     # Low, high, middle, low: each change made once.
@@ -989,27 +1018,65 @@ def test_the_listen_loop_returns_to_present_a_change_of_pixels():
     assert app.screen == namespace["TRANSFER"]
 
 
-def test_read_sample_reads_back_to_back_for_its_time():
-    namespace = in_transfer()
-    values = iter(range(1000000))
-    namespace["badge"].light_level = lambda: next(values)
-    out = [0] * 6
-    namespace["read_sample"](2000, None, out)
-    now, t, mean, t_us, span, n = out
-    assert n > 1 and span >= 2000, out
-    # Readings 0..n-1: their mean, at about the middle of the span.
-    assert mean == (n - 1) // 2, out
-    assert 0 <= namespace["time"].ticks_diff(now, t) <= 2, out
+def test_the_reader_lives_for_the_whole_transfer():
+    # Built in begin_transfer and stopped in finish_transfer, the single
+    # exit: do_transfer() returns to run() at every pixel change, and must
+    # not touch the reader then.
+    namespace = looping()
+    app = namespace["app"]
+    scheme = protocol.SCHEME_FIELDS
+    namespace["show_full"](namespace["FIELD_COLOR"][scheme][protocol.LOW], 1.0)
+    fake = LoopTransfer(scheme, [protocol.LOW, protocol.HIGH, protocol.LOW,
+                                 protocol.HIGH, protocol.LOW])
+    app.transfer = fake
+    returns = 0
+    while app.screen == namespace["TRANSFER"]:
+        app.do_transfer()
+        returns += 1
+        assert returns < 20
+    assert returns >= 4, "every pixel change returns to run()"
+    assert fake.reader.stops == 1, "stopped once, at the end"
 
 
-def test_read_sample_stops_at_the_deadline():
-    # Transmitting: the symbol changes at the deadline, so the sample ends
-    # there however long it was to run.
-    namespace = in_transfer()
-    time = namespace["time"]
-    out = [0] * 6
-    namespace["read_sample"](10 ** 6, time.ticks_ms() - 1, out)
-    assert out[5] == 1, out
+def test_a_collection_the_protocol_asks_for_happens_between_its_calls():
+    namespace = looping()
+    app = namespace["app"]
+    scheme = protocol.SCHEME_BACKLIGHT
+    namespace["show_full"](namespace["FIELD_COLOR"][scheme][protocol.LOW],
+                           protocol.LOW_BACKLIGHT)
+    fake = LoopTransfer(scheme, [protocol.LOW] * 4)
+    order = []
+    fake.work = lambda t: (order.append("work"),
+                           setattr(fake, "collect_due", True))
+    import gc
+    real = gc.collect
+    gc.collect = lambda *a: order.append("collect") or real()
+    try:
+        app.transfer = fake
+        app.do_transfer()
+    finally:
+        gc.collect = real
+    assert "collect" in order and order[0] == "work"
+    assert all(order[i] != order[i + 1] or order[i] == "work"
+               for i in range(len(order) - 1)), order
+    assert not fake.collect_due
+
+
+def test_on_exit_stops_the_ring_and_never_raises():
+    # HOME calls on_exit() and then resets; a raise would skip the reset.
+    namespace, app = app_with()
+
+    class Ring:
+        stopped = 0
+
+        def stop(self):
+            Ring.stopped += 1
+            raise OSError("anything")
+    namespace["_READERS"]["ring"] = Ring()
+    namespace["on_exit"]()
+    assert Ring.stopped == 1
+    namespace["_READERS"]["ring"] = None
+    namespace["on_exit"]()
 
 
 def test_b_cancels_from_inside_the_listen_loop():
@@ -1029,15 +1096,15 @@ def test_b_cancels_from_inside_the_listen_loop():
     app.do_transfer()
     assert fake.result == protocol.ERR_CANCELLED
     assert fake.calls < 1000 and polls[0] >= 3
-    assert fake.calls <= 3 * namespace["POLL_PASSES"] + 1, fake.calls
+    # One poll every POLL_MS of the reader's clock, which moves a ms a pass.
+    assert fake.calls <= 3 * namespace["POLL_MS"] + 2, fake.calls
 
 
-def test_a_transfer_reads_continuously_and_times_the_refresh():
+def test_a_transfer_starts_its_reader_and_its_clock_at_zero():
     namespace = in_transfer()
     transfer = namespace["app"].transfer
-    assert transfer.continuous is True
-    # The refresh, timed by presenting: at least one ms whatever the stub.
-    assert transfer.frame_ms() >= 1
+    assert transfer.started == 0 and transfer.phase_started == 0
+    assert transfer.reader.now_us() < 10 ** 6
 
 
 def test_the_field_is_drawn_only_when_it_changes():
@@ -2247,7 +2314,7 @@ def test_twenty_measurements_are_saved_and_there_is_no_cap():
     import json
     size = len(json.dumps(saved))
     # The spec's storage budget: about 550 bytes a measurement.
-    assert size < 21 * 650, size
+    assert size < 21 * 720, size
 
 
 def test_b_saves_every_measurement_numbered_and_exits():
@@ -2565,7 +2632,8 @@ def test_the_probe_shows_each_step_before_it_runs_and_then_saves():
     probe = saved["frame_probe"]
     assert sorted(probe) == sorted(list(steps) + ["firmware", "temperature_c"])
     for name in steps:
-        assert "error" not in probe[name], (name, probe[name])
+        if name != "ring":
+            assert "error" not in probe[name], (name, probe[name])
     assert sorted(probe["breakdown"]) == ["field", "status"]
     assert sorted(probe["breakdown"]["field"]) == sorted(
         ["frame", "clear", "field", "measure", "present", "poll"])
@@ -2575,20 +2643,21 @@ def test_the_probe_shows_each_step_before_it_runs_and_then_saves():
     assert probe["firmware"]["set_framerate"] in (True, False)
     reads = dict(probe["reads"])
     detail = reads.pop("detail")
-    assert sorted(reads) == ["listen", "loop", "read", "sample", "transfer",
+    assert sorted(reads) == ["loop", "read", "sample", "transfer",
                              "transfer_timed"]
     for entry in reads.values():
         assert entry["calls"] > 0 and entry["per_s"] > 0, entry
-    # Where the instrumented listener's time went: every reading is a first
-    # of its ms or a later one, and the slow path's parts were each timed.
-    # One protocol call a sample, each holding readings.
+    # Where the instrumented listener's time went: one work() a pass, and
+    # its parts each timed.
     timed = reads["transfer_timed"]["calls"]
-    assert detail["sample"]["calls"] == timed, (detail["sample"], timed)
-    for name in ("filter_sample", "pool_coarse", "step_data"):
+    assert detail["work"]["calls"] == timed, (detail["work"], timed)
+    for name in ("window_value", "decide_slot", "data_field"):
         assert name in detail, detail
-    assert detail["reads_per_sample"] >= 1 and detail["read_us"] > 0, detail
     assert isinstance(detail["phase"], int)
-    assert "light" in detail and "flicker" in detail
+    assert "flicker" in detail and detail["exact"] is False
+    # No ring here: the ring step says why, and the firmware entry too.
+    assert "error" in probe["ring"]["quiet"]
+    assert probe["firmware"]["ring"]
     # What it changed, it put back.
     assert gc.isenabled()
     assert namespace["display"].backlights[-1] == namespace["BACKLIGHT_NORMAL"]
@@ -2624,41 +2693,30 @@ def test_the_reads_step_never_presents():
     assert display.updates == before + 1
 
 
-def test_the_probe_transfer_pass_is_a_continuous_listener_that_stays_one():
-    # What the reads step times as "transfer": the real listen loop's pass,
-    # on a Transfer that keeps listening however long nobody sends.
+def test_the_probe_transfer_pass_is_a_listener_that_stays_one():
+    # What the reads step times as "transfer": the real loop's pass, on a
+    # Transfer that keeps listening however long nobody sends.
     namespace, app = dev_app()
-    listener = namespace["probe_listener"]()
-    assert listener.continuous and listener.phase == protocol.PHASE_DATA
-    assert listener.scheme == protocol.SCHEME_BACKLIGHT
-    assert protocol.SLOT_LADDER[listener.clock.index] == 32
-    app.probe_listener = listener
-    app.probe_passes = 0
+    reader = namespace["polled_reader"]()
     t = [10000000]
-    saved = time.ticks_ms
-    time.ticks_ms = lambda: t[0] // 1000
+    saved = time.ticks_us
+    time.ticks_us = lambda: t[0]
+    reader.ticks_us = time.ticks_us
+    reader.light = lambda: (t.__setitem__(0, t[0] + 60) or 32)
     try:
-        for _ in range(20000):          # 8 s of passes at 0.4 ms
-            t[0] += 400
+        listener = namespace["probe_listener"](reader)
+        assert listener.phase == protocol.PHASE_DATA
+        assert listener.scheme == protocol.SCHEME_BACKLIGHT
+        assert protocol.SLOT_LADDER[listener.clock.index] == 32
+        app.probe_listener = listener
+        app.probe_passes = 0
+        for _ in range(3000):
             app.probe_transfer()
     finally:
-        time.ticks_ms = saved
+        time.ticks_us = saved
+    assert t[0] - 10000000 > 2000000, "it should have listened for seconds"
     assert listener.phase == protocol.PHASE_DATA, listener.result
     assert listener.result is None
-
-
-def test_the_probe_listener_is_a_slot_receiver_on_the_fast_rung():
-    namespace, app = dev_app()
-    receiver = namespace["probe_receiver"]()
-    assert receiver.clock.index == namespace["FAST_INDEX"]
-    assert receiver.levels.t_low < receiver.levels.t_high
-    # Decides slots like a real one: a slot of white reads as HIGH.
-    clock = receiver.clock
-    start = clock.epoch
-    decided = [receiver.feed(start + t, 112)
-               for t in range(0, clock.duration * 2 + 2, 2)]
-    decided = [d for d in decided if d is not None]
-    assert decided == [load_module("share_wifi", "protocol").HIGH] * 2, decided
 
 
 def test_b_cancels_the_probe_and_saves_nothing():
@@ -2876,3 +2934,12 @@ def test_the_2nd_badge_prompt_is_the_alignment_screen():
     assert namespace["ALIGN_TEXT"] in drawn
     assert any(r[1] <= screen.width // 2 < r[1] + r[3]
                and r[4] == screen.height for r in screen.rects), screen.rects
+
+
+def test_the_probe_times_a_full_staircase_replay():
+    # M7's replay: every kept sample of a full buffer re-fed, after a fit.
+    namespace, app = dev_app()
+    out = namespace["probe_replay"]()
+    protocol = load_module("share_wifi", "protocol")
+    assert 0 < out["samples"] <= protocol.FLICKER_BUFFER, out
+    assert out["us"] >= 0

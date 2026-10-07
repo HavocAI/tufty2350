@@ -118,65 +118,72 @@ Pimoroni set plus other team apps; see [README.md](README.md).
   also the one app the simulator cannot run, because there is no `network`
   module there.
 - `share_wifi` — shares credentials between badges over the screen and light
-  sensor. Six files: `protocol.py` is the wire format and state machine, pure
-  Python with no badge globals and no knowledge of WiFi; `measure.py` is Dev
+  sensor. Seven files: `protocol.py` is the wire format and state machine, pure
+  Python with no badge globals and no knowledge of WiFi; `reader.py` is how a
+  transfer reads the sensor, as times and means, pure too; `measure.py` is Dev
   Mode's measurement engine, `probe.py` its frame timing probe and
   `flicker.py` its room-flicker capture, all pure in the same way;
   `__init__.py` is the shell around them — drawing, buttons, storage,
-  connecting; and `fastadc.py`, badge-only, reads the sensor straight from
-  the RP2350's ADC registers, by viper and by DMA, for the probe.
+  connecting; and `fastadc.py`, badge-only, drives the RP2350's ADC and DMA
+  registers: the DMA ring a transfer reads through, its viper kernels, and
+  the probe's captures.
 
   It completes a transfer end to end **in simulation**: `python3
-  tests/share_wifi/simulator.py` delivers the payload in all six scenarios with
-  both badges reporting `OK`, and asserts the link invariants on every tick
-  rather than at the end. Swept over 8 seeds x 6 scenarios x 3 payloads — a WPA2
-  credential, an open one with an empty key, and the longest a credential can
-  be — it delivers **144 of 144** in the fields scheme stepping once a frame,
-  and 144 of 144 letting calibration choose a scheme. `--loop` runs the badges
-  as the app now does, **reading continuously** (below): with the sensor as
-  measured (`--optics=mirror`) and calibration choosing (`--auto`), 144 of
-  144 on the backlight's 32 ms rung in the dark, median 15.3 s, and on its
-  16 ms rung in a lit room, 10.5 s; and 144 of 144 on pixels' 80 ms rung,
-  23.6 s. The app shell also launches and walks every screen in
+  tests/share_wifi/simulator.py` runs both badges through the production
+  readers and asserts the link invariants on every tick rather than at the
+  end; `tests/share_wifi/sweep.py` sweeps it over 8 seeds x 6 scenarios x 3
+  payloads — a WPA2 credential, an open one with an empty key, and the
+  longest a credential can be. With the sensor as measured, an **EXACT** pair
+  (both reading by DMA ring) delivers **144 of 144 in every row** — dark,
+  lit, flickering, three times the light, slow sensors, slow reads, three
+  times the work — at a median **7.5 s in the dark on 16 ms and 5.5 s lit on
+  8 ms**, against 15.3 and 10.6 s before. A **POLLED** pair (no ring) takes
+  11.1 and 7.3 s and delivers 144 in most rows, as do mixed pairs in all;
+  "before" is HEAD as of 2026-10-06 run in its own simulator over the same
+  rows. One row is under it: POLLED under a once-a-cycle 60 Hz light, 138
+  against 142, data-phase framing failures that move with the unmeasured
+  staircase-replay stall. The first round of this change lost more, and
+  blamed F-B1 for it wrongly -- see "What simulation says" in the protocol. The app shell also launches and walks every screen in
   the Badgeware simulator without raising — but that is the API working, not
   the optics.
 
-  **A transfer reads continuously.** `do_transfer()` is a loop that reads the
-  sensor back to back for a 2 ms sample -- `read_sample()`, nothing but
-  locals -- and hands their mean to `Transfer(continuous=True).sample()`,
-  which pools samples into 8 ms ones for calibration. A change of
-  backlight is made in the loop; only a change of pixels returns to `run()` to
-  be presented. So on the backlight scheme, whose pixels are white for every
-  symbol, nothing is presented in the data phase and neither badge is ever
-  blind; and the scheme's 1-8 ms sensor settle, rather than the panel's 24,
-  sets its rung: it starts on 32 ms, pixels on 80 -- and on **16 ms when both
-  badges are in a lit room**, where the sensor is fastest, which each says
-  in its staircase (the LIT class). A continuous badge takes the backlight
-  whenever it calibrated, calibrates in 150 ms steps rather than 200, and
-  **breaks in**: a Follower that loses the block shows high, and the Leader,
-  which reads while it transmits, stops at once instead of sending the rest
-  -- up to 17 s of it -- then resends after repeating its last verdict. See
-  "Reading continuously" in the protocol, which also has the stress sweeps
-  and where it fails. Room lights flicker at 120 Hz, some by nearly half
-  their light (measured), so in the data phase a continuous badge learns the
-  flicker before calibration -- the region, 50 or 60 Hz, and the light's
-  own shape, from a window its peer is known dark in -- then corrects every
-  sample with a table and tracks the mains' drift with a phase lock (see
-  "Mains flicker is fitted" in the protocol; in simulation a 0.02 Hz drift
-  took the old learner to 77 of 144, and the fit to 144). It takes the
-  flicker off every 2 ms sample: `sample()` takes the sample's time in µs for it.
-  Before any fit, a Follower in the handshake drops a coarse sample its own
-  present cut short (`HANDSHAKE_GAP_MS`): at three times the lit room's
-  light one such sample hid the Leader's beacon edge and 30 of 144 failed;
-  now 144 (see "Peer present" in the protocol).
-  **The protocol is called once a sample, not once a reading**, because on
-  the badge each Python operation costs microseconds and a protocol call
-  about a millisecond [measured-v2]: called per reading, it took every
-  pass -- 380, then 705, then 1,073 µs a reading -- and a shortcut for
-  readings in the same ms never ran, since no two readings ever were.
-  MicroPython's unix port, six to fifteen times *faster* on the same
-  change, is no guide to the badge's costs. See "What a reading costs" in
-  the protocol.
+  **A transfer reads through a reader, and the protocol is called once a
+  slot.** Where the firmware allows, `fastadc.Ring` has the ADC free-run at
+  50 kHz into a 32 KB DMA ring for the whole transfer — 327 ms of readings,
+  each timed by its index — read through PSRAM's uncached alias by viper
+  kernels; `reader.RingReader` gives the protocol times and means. It is
+  made and verified once a launch, on the first transfer; anything it
+  cannot confirm leaves the launch on `reader.PolledReader`, which bins
+  `light_level()` readings whenever the protocol has nothing due.
+  `do_transfer()` waits for `transfer.due_us()`, shows `field_at(now)`, then
+  calls `work(now)`, which decides every slot whose window has closed from
+  the median of its flicker-corrected parts; it collects garbage only when
+  the protocol sets `collect_due`. `finish_transfer()` and `on_exit()` stop
+  the ring. A pair's tier (EXACT or POLLED) and light (LIT or dark) travel
+  in the Follower's staircase, which the Leader adopts; they set the start
+  rung — 8/16 ms EXACT, 16/32 POLLED — and nothing else. The phase lock
+  finds the peer's edge after the fact, in the reader's history. See
+  "Reading" in the protocol, which has the stress sweeps, every unmeasured
+  assumption with its Dev Mode measurement, and where it fails. The 2 ms
+  sample loop it replaced ("reading continuously", 2026-10-05) is described
+  there too: why each reading's cost mattered — a protocol call about a ms
+  on the badge [measured-v2], the unix port no guide to it.
+
+  **Breaking in** stays: a Follower that loses the block shows high, and the
+  Leader, which reads while it transmits, stops at once and resends after
+  repeating its last verdict. **Mains flicker** is fitted in calibration —
+  the region, 50 or 60 Hz, and the light's shape, from a window the peer is
+  known dark in, where each badge's fit stall lands — then every part is
+  corrected from a table and the mains' drift tracked by a phase lock (see
+  "Mains flicker is fitted" in the protocol). Before any fit, a POLLED
+  Follower in the handshake drops a coarse sample its own present cut short
+  (`HANDSHAKE_GAP_MS`).
+
+  **F-B1, open:** a Follower in `STEP_VERDICT` cannot match the Leader's
+  Data Sync Error, whose tail is shorter than the pattern it looks for, so a
+  demotion the Leader starts can split the rungs. It turns a CRC failure
+  into a split: 2 of 576 POLLED runs in one sweep, none in the last, and
+  none once fixed in simulation. Fix it next.
 
   The screen transmits on **the whole screen, at `LORES`, with nothing else
   drawn**, `run()`'s clear switched off and the field redrawn only when it
@@ -188,52 +195,40 @@ Pimoroni set plus other team apps; see [README.md](README.md).
   are mirrored, so whichever edge it is near is now the field. See "Screen as a
   transmitter" in the protocol.
 
-  **Two light-level schemes**, in `LEVEL_SCHEMES` in `protocol.py`. *Fields*,
-  the original, puts the level in the pixels at full backlight. *Backlight*
-  uses white pixels for every symbol -- low included, so it never changes a
-  pixel -- and sets `display.backlight()` per symbol: 0.5 for low -- dim, not
-  off, which keeps the sensor faintly lit and cut the dark room's edge delay
-  from 1.2-1.9 ms to 0.3 on the badge -- 0.82 for the middle (57% PWM duty on
-  the badge's v2, whose backlight has no floor; 61% on v3 -- see the table
-  above), 1.0 for high. `SIGNALLING` in `__init__.py`
-  says which a badge may use, and offers both: calibration measures both,
-  signalled by the order of the staircase steps, and a continuous badge
-  keeps the backlight unless its middle step did not hold. See "Choosing a
-  scheme" in the spec.
+  **One data scheme, the backlight**, in `LEVEL_SCHEMES` in `protocol.py`:
+  white pixels for every symbol, and `display.backlight()` per symbol — 0.5
+  for low (dim, not off, which keeps the sensor faintly lit and cut the dark
+  room's edge delay from 1.2-1.9 ms to 0.3 on the badge), 0.82 for the
+  middle (57% PWM duty on the badge's v2, whose backlight has no floor; 61%
+  on v3 — see the table above), 1.0 for high. *Fields*, levels in the
+  pixels, now draws only the beacons; the fields staircase and the choice
+  between schemes went (see "Why the fields staircase went" in the
+  protocol).
 
   Beware what `tests/share_wifi/simulator.py` takes for granted. It once
   modelled a middle field at 45% of the swing while the app sent `color.grey`,
-  7% of it, and every scenario passed. Its default assumes the sensor
-  *averages* the backlight's ~3.8kHz PWM, which the second hardware run
-  **[measured-v2]** at every duty from 0.25 to 1.0; `--flicker` models one that
-  follows it, where the backlight scheme cannot work and choosing falls back
-  to fields. It runs both badges at 11.1 ms frames, with each field on the
-  panel the instant it is decided, unless told otherwise. `--v2` models the
-  badge on the desk as measured on 2026-10-04 -- 60 Hz, a field reaching the
-  panel 19 ms after its frame starts, a panel settling 90% in 24 ms -- and
-  delivery falls from 136 to 99 of 144 in it. See "What the measurement
-  found" in the protocol. `--optics=mirror|aligned|overlap` replaces its
-  idealised sensor -- a 9000-count swing, every count resolved -- with the
-  measured one: 16-count steps, Gaussian noise, an 80-count swing or the swing
-  a second badge is predicted to give. In it the old fixed contrast floor,
-  `MIN_CONTRAST` (192), refused everything; the noise-based check that
-  replaced it (below) delivers 314 of 432 under v2 timing. See
-  [.agents/docs/optical-coupling.md](.agents/docs/optical-coupling.md).
-  `--auto` lets calibration choose. `--loop` (with `--v3`, `--slow-panel`,
-  `--optics=`) runs continuous badges instead, modelled from the measured
-  read rate, present, panel dead time and backlight, and with `--optics` a
-  sensor whose speed is set by the light on it, fitted to `backlight_step`.
-  The levels are pinned in the spec and checked against the app, the
-  protocol's table and the simulator.
+  7% of it, and every scenario passed. It assumes the sensor *averages* the
+  backlight's ~3.8kHz PWM, which the second hardware run **[measured-v2]** at
+  every duty from 0.25 to 1.0. It models the badge as measured — v2's 60 Hz
+  presents, the panel's dead time, the backlight at the next PWM wrap, a
+  sensor whose speed is set by the light on it, fitted to `backlight_step` —
+  and charges every pass, decided slot, collection and flicker fit a cost
+  that blinds a POLLED badge; those costs are guesses until Dev Mode M3 and
+  M7 measure them. `--optics=mirror|aligned|overlap` gives it the measured
+  sensor: 16-count steps, Gaussian noise, an 80-count swing or the swing a
+  second badge is predicted to give (see
+  [.agents/docs/optical-coupling.md](.agents/docs/optical-coupling.md)).
+  `--polled` and `--mixed` choose the readers, `--v3` and `--slow-panel` the
+  timing. The levels are pinned in the spec and checked against the app,
+  the protocol's table and the simulator.
 
-  **Calibration agrees the starting rung.** Each badge's staircase carries
-  its frame-rate class in its repetition count -- 3 for FAST, 5 for SLOW (the
-  100 ms rung) -- and both start on the slower class's. FAST stands for the
-  fastest rung the scheme's settle allows: 80 ms on pixels, three of the
-  panel's measured 24 ms, and 32 ms for continuous badges on the backlight. A
-  continuous badge is always FAST: its frames do not bound its sampling. Before it, each badge started on the rung its own frame
-  time allowed, and a 90Hz badge paired with a 30Hz one delivered 35 and 0 of
-  144 in simulation; now 143 and 144. See "Agreeing a rung" in the protocol.
+  **Calibration is one backlight staircase each way, and the Follower
+  decides the pair.** Each staircase carries its badge's tier in its order
+  and its light in its repetitions — 2 for LIT, 3 for dark; the Follower's
+  carries the *pair's*, which the Leader adopts, so a misread can make the
+  pair slower or faster but cannot split it. The frame-rate classes (FAST,
+  SLOW) went: no badge's frames bound its sampling now. See "The flags" and
+  "Agreeing a rung" in the protocol.
 
   The epoch calibration derives is only an estimate on the badge that *measured*
   the staircase rather than transmitting it, so receivers do not depend on it:
@@ -286,6 +281,10 @@ Pimoroni set plus other team apps; see [README.md](README.md).
   badge's own backlight and decodes the reflection with the transfer's own
   continuous receiver at 50 down to 16 ms: the first hardware check of the
   continuous path, and a measurement of the edge delay it assumes.
+  Two mirror tests run the same through the **DMA ring**:
+  `backlight_step_ring` (M4) times every transition the backlight scheme
+  makes at 20 µs resolution, and `loopback_ring` (M5) decodes a block with
+  the real EXACT receiver at 16 down to 6 ms -- neither has run yet.
   **measure room flicker** is a tool of its own: A takes a measurement of
   about 30 s, as many as wanted, B saves them all under `room_flicker` -- the
   strongest frequency from 20 Hz to 1 kHz and its size in counts, the
@@ -293,7 +292,8 @@ Pimoroni set plus other team apps; see [README.md](README.md).
   transfer's own `FlickerFilter` fit on the capture with the flicker left
   before and after correction, and the mains' drift from 80 more windows,
   in mHz **against the badge's own clock** -- because mains flicker would be
-  noise inside the lit room's 16 ms slots. `flicker.py` is its pure module.
+  noise inside the lit room's 8 ms slots -- and `window_residual` (M6), the
+  flicker the fit leaves in an 8 ms rung's window. `flicker.py` is its pure module.
   *clear saved measurements* deletes the file. The probe's
   `flicker_filter` step times the filter itself.
   See "Dev Mode" in
@@ -320,8 +320,11 @@ Pimoroni set plus other team apps; see [README.md](README.md).
   noise no longer limits a slot -- the sensor's settle does. In the same
   run `reads.transfer` got *slower*, 705 µs a pass against 380, and the
   next, with `reads.detail` timing it, showed why: a protocol call per
-  reading costs a ms. `reads.transfer` is now a pass of the sampling loop,
-  and `reads.detail` the call's parts and the readings a sample held. Every
+  reading costs a ms. `reads.transfer` is now a pass of the transfer loop
+  on the polled reader, and `reads.detail` the parts of its work. The
+  `ring` step (M3) runs the real EXACT listener through the ring for 2 s,
+  quiet and presenting, and `firmware` (M1) records what the ring needs;
+  neither has run yet. Every
   Dev Mode tool and the probe also record the chip's temperature,
   `temperature_c`, at each test. It works on v2, and ruled itself out as why
   the panel's edges were slower in some runs. See "probe frame timing" in the spec

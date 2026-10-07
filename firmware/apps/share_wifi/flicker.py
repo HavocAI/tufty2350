@@ -47,7 +47,7 @@ HARMONIC_HZ = tuple(sorted({m * h for m in FLICKER_MAINS
 
 # The fit is fed what the transfer feeds it: FINE_MS means, one every
 # SAMPLE_EVERY_US -- the rate a transfer keeps them at -- from the first
-# FLICKER_FIT_MS of the capture. The rest, about 50 ms, is held out: the
+# FLICKER_FIT_MS of the capture. The rest, about 90 ms, is held out: the
 # flicker left after correction is measured there, on samples the fit never
 # saw.
 SAMPLE_BINS = FINE_MS * 1000 // BIN_US
@@ -60,6 +60,11 @@ SAMPLE_SPAN_US = SAMPLE_BINS * BIN_US
 # the phases is the flicker's offset from nominal. Measured against the
 # badge's own clock, so a crystal off by x ppm reads as x ppm of the mains.
 DRIFT_WINDOWS = 80
+# Dev Mode M6: the flicker left in an EXACT slot's window at the lit 8 ms
+# rung -- 3.5 ms, every 8 ms -- over the held-out part, before and after the
+# fit's correction. Whether that rung survives a flickering room.
+RESIDUAL_WINDOW_BINS = 7
+RESIDUAL_EVERY_BINS = 16
 DRIFT_HZ = (100, 120)
 # Flicker smaller than this at DRIFT_HZ, in counts, has no phase to track.
 DRIFT_MIN_COUNTS = 2
@@ -256,6 +261,37 @@ def fit_capture(capture):
     for k in range(held, len(ts)):
         after.append(flicker.correct(ts[k], vs[k], spans[k]))
     out["held_out"] = len(before)
+    sd = _sd(before)
+    if sd is not None:
+        out["sd_before"] = round(sd, 1)
+        out["sd_after"] = round(_sd(after), 1)
+    out["window_residual"] = window_residual(capture, flicker)
+    return out
+
+
+def window_residual(capture, flicker):
+    """M6: windows of RESIDUAL_WINDOW_BINS every RESIDUAL_EVERY_BINS over
+    the capture's held-out part, their means' spread before and after
+    `flicker` corrects them, in counts."""
+    sums = capture.sums
+    counts = capture.counts
+    span = RESIDUAL_WINDOW_BINS * BIN_US
+    before = []
+    after = []
+    b = FLICKER_FIT_MS * 1000 // BIN_US
+    while b + RESIDUAL_WINDOW_BINS <= BINS:
+        total = 0
+        count = 0
+        for k in range(b, b + RESIDUAL_WINDOW_BINS):
+            total += sums[k]
+            count += counts[k]
+        if count:
+            value = total // count
+            t = time.ticks_add(capture.start_us, b * BIN_US + span // 2)
+            before.append(value)
+            after.append(flicker.correct(t, value, span))
+        b += RESIDUAL_EVERY_BINS
+    out = {"window_ms": span / 1000.0, "windows": len(before)}
     sd = _sd(before)
     if sd is not None:
         out["sd_before"] = round(sd, 1)

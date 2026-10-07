@@ -34,6 +34,8 @@ def loaded_names(path):
             bound.add(node.name)
         elif isinstance(node, ast.arg):
             bound.add(node.arg)
+        elif isinstance(node, ast.ExceptHandler) and node.name:
+            bound.add(node.name)
     return bound, read
 
 
@@ -57,19 +59,43 @@ def test_protocol_imports_in_a_bare_interpreter():
     assert result.stdout.strip() == str(0x29B1)
 
 
-def test_frame_time_is_injected_not_imported():
-    # The one thing the protocol cannot know by itself. It must arrive as a
-    # callable rather than by reaching for badge.ticks_delta.
+def test_the_reader_is_injected_not_imported():
+    # The one thing the protocol cannot do by itself is read the sensor. A
+    # reader arrives as an argument -- the ring's or light_level()'s -- and
+    # the protocol never reaches for fastadc, machine or the badge.
     protocol = load_module("share_wifi", "protocol")
-    seen = []
+    source = open(PROTOCOL).read()
+    for name in ("fastadc", "import machine", "rp2."):
+        assert name not in source, name
 
-    def frame_ms():
-        seen.append(1)
-        return 16
+    class Reader:
+        exact = True
+        asked = []
 
-    transfer = protocol.Transfer(True, (b"net", b"password1"), frame_ms=frame_ms)
-    transfer.conservative_index()
-    assert seen, "conservative_index should consult the injected frame time"
+        def newest_us(self):
+            self.asked.append("newest")
+            return 0
+
+    transfer = protocol.Transfer(True, (b"net", b"password1"), Reader())
+    transfer.work(1000)
+    assert transfer.exact and Reader.asked, "work() should ask the reader"
+
+
+def test_reader_references_no_badge_globals():
+    _, read = loaded_names(os.path.join(APPS, "share_wifi", "reader.py"))
+    leaked = sorted(read & BADGE_GLOBALS)
+    assert not leaked, "reader.py reaches for the badge: %s" % leaked
+
+
+def test_reader_imports_in_a_bare_interpreter():
+    result = subprocess.run(
+        [sys.executable, "-B", "-c",
+         "import sys; sys.path.insert(0, %r); import reader; "
+         "print(reader.ref_sum([1, 2, 3, 4], 3, 1, 3))"
+         % os.path.join(APPS, "share_wifi")],
+        capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "9"
 
 
 def test_app_shell_still_exposes_the_protocol():

@@ -144,14 +144,17 @@ def test_a_light_flickering_once_a_cycle_no_longer_defeats_calibration():
             assert transfer.result == P.OK, (light_name, transfer.result)
             assert transfer.fit_result == "flicker"
             assert transfer.flicker.mains == mains
-        assert P.SLOT_LADDER[link.leader.transfer.clock.index] == 16
+        assert link.leader.transfer.clock.index == P.EXACT_LIT_INDEX
 
 
 def test_both_badges_lock_onto_the_drift():
+    # A transfer on the ring is over in ~4 s, so the rate's line has less
+    # to go on than it had at 16 ms slots: within 2 steps a second of the
+    # true 6.4, which over the data phase's ~2 s is under 4 degrees.
     link = run("led60", 2)
     for transfer in (link.leader.transfer, link.follower.transfer):
         assert transfer.result == P.OK
-        assert abs(transfer.flicker.rate - 6.4) < 1.5, transfer.flicker.rate
+        assert abs(transfer.flicker.rate - 6.4) < 2.0, transfer.flicker.rate
 
 
 def test_a_dark_room_without_flicker_fits_steady():
@@ -165,3 +168,52 @@ def test_a_dark_room_without_flicker_fits_steady():
     for transfer in (link.leader.transfer, link.follower.transfer):
         assert transfer.result == P.OK
         assert transfer.fit_result == "steady", transfer.fit_result
+
+
+def _flicker_residual(badge):
+    """The rms of the badge's flicker estimate against the room's true
+    flicker, over 30 ms from now: what it would take off a part."""
+    sensor, transfer = badge.sensor, badge.transfer
+    if transfer.flicker.harmonics is None:
+        return None
+    errors = []
+    for i in range(300):
+        t = transfer.reader.now_us() + i * 97
+        at = badge.start_at + t / 1000.0
+        true = sensor.light * sensor.flicker * math.sin(
+            2 * math.pi * sensor.flicker_hz * at / 1000.0 + sensor.phase)
+        errors.append(transfer.flicker.amount(t, 0) - true)
+    return math.sqrt(sum(e * e for e in errors) / len(errors))
+
+
+def test_a_polled_leaders_flicker_stays_fitted_through_a_block():
+    # The regression: a POLLED Leader's fit stall blinded most of its
+    # closing gap, it learnt a drift rate from a handful of updates in a
+    # room with none, and extrapolated it through its first block -- 30
+    # counts rms by 9 s against 16 of flicker, and the CRC reply misread.
+    # Now the rate needs FLICKER_RATE_MIN_UPDATES, and the Leader tracks
+    # through the block from the Follower's dark slots.
+    import sweep
+    # Seeds 2, 4 and 6 are the ones the old rate threw off: 10 counts rms
+    # as the block began, 26-29 by its end.
+    for seed in (2, 4, 6):
+        kw = dict(sim.SCENARIOS["ideal"])
+        kw.update(sweep.TIMING["v2"])
+        kw.update(sweep.OPTICS["lit47"])
+        kw["reader"] = kw["peer_reader"] = "polled"
+        link = sim.build_loop(P, sim.WORST, seed=seed, **kw)
+        residuals = []
+        for tenth in range(30, 140, 5):
+            link.run(tenth / 10.0)
+            leader = link.leader.transfer
+            if leader.result is not None:
+                break
+            if leader.phase == P.PHASE_DATA and leader.tx:
+                residual = _flicker_residual(link.leader)
+                if residual is not None:
+                    residuals.append(residual)
+        # 6-9 counts throughout, as a ring Leader's: the table's whole
+        # counts and the fit's own error.
+        assert len(residuals) >= 5, (seed, residuals)
+        assert sum(residuals) / len(residuals) < 8.5, (seed, residuals)
+        assert max(residuals) < 11.0, (seed, residuals)

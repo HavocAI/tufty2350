@@ -4,21 +4,22 @@ Markers such as [measured-v2] in the comments below name the firmware a claim
 holds for: legend in .agents/docs/README.md.
 
 Runs the real protocol from first beacon to final Complete Pattern: discovery,
-calibration in both directions, rate selection, payload, acknowledgements. The
-only things faked are the physical layer and the clock.
+calibration in both directions, rate selection, payload, acknowledgements --
+and the real readers (firmware/apps/share_wifi/reader.py): an EXACT badge's
+RingReader over a simulated DMA ring, a POLLED badge's PolledReader fed the
+readings its loop would take. Faked: the physical layer, the clock, and how
+long the badge's Python takes.
 
 What is modelled:
 
-- Each badge's LCD as a first-order lag, so a field takes time to appear. This
-  is the thing that decides whether a slot rate works, and leaving it out makes
-  every rate look fine.
-- The backlight the app sets with each symbol, through the firmware's own
-  value-to-PWM-duty curve, and optionally the PWM ripple (`--flicker`). Either
-  of the protocol's LEVEL_SCHEMES; `--auto` lets calibration choose between them.
-- Ambient light, sensor noise, and the two badges seeing slightly different
-  ambient levels.
-- Frame jitter, because badge.ticks_delta is not constant.
-- Start skew: nobody presses Share and Receive at the same instant.
+- Each badge's LCD as a first-order lag, behind a present that waits for the
+  panel's vertical blank; the backlight live at the next PWM wrap.
+- The sensor following the light at a speed the light sets, its noise and
+  its 16-count steps, room light, and the room's mains flicker.
+- The work each pass of the app's loop does, the collections the protocol
+  asks for, and the flicker fit's stall: an EXACT badge keeps reading
+  through all of them, a POLLED one is blind.
+- Start skew, and each badge's crystal (`ppm`).
 
 What is not modelled: anything about the panel that is not a first-order lag,
 ambient drift during a transfer, and the badges moving relative to each other.
@@ -26,7 +27,15 @@ A pass here means "agrees with our model of the hardware", not "works".
 """
 
 import math
+import os
 import random
+import sys
+
+# reader.py, the app's own: the simulator runs the production readers.
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(
+    os.path.dirname(os.path.abspath(__file__)))), "firmware", "apps",
+    "share_wifi"))
+import reader as readers                    # noqa: E402
 
 
 # --- the backlight ------------------------------------------------------------
@@ -49,190 +58,10 @@ def backlight_duty(value):
     return (8192 + int(level * (65535 - 8192) + 0.5)) / 65535
 
 
-# The LED is gated by that PWM at sys_clk / 65536 -- about 3.8kHz at 250MHz, a
-# 260us period. The light leaving the panel therefore averages to `duty` but is
-# really full-on or off from one instant to the next. [inferred-all]
-#
-# Whether the sensor sees the average or the instant is `pwm_ripple`:
-# 0.0 = averaged (a backlight driver that smooths PWM into a steady current, or
-#       a sensor far slower than 260us)
-# 1.0 = instantaneous: each read lands on an on- or off-phase, chosen by duty.
-#       What the hardware notes predict -- the sensor is a phototransistor that
-#       responds in microseconds, and light_level() is a single ADC conversion.
-# Measured since: the badge's sensor averages, at every duty from 0.25 to 1.0
-# [measured-v2] -- a PWM frequency both firmwares share. The default assumes
-# averaging; only
-# the backlight scheme depends on it, and `--flicker` shows it failing there.
-# The default fields scheme never sets a partial backlight, so it is immune.
-
-# The pixels' share of the panel's swing. The middle field's is an ASSUMPTION
-# about what the app transmits, and it has been wrong before: the app once sent
-# color.grey, 7% of the swing, while this modelled 45% and every scenario
-# passed. MID_FIELD_RGB measured at 40% on hardware, as the tinted
-# rgb(151, 162, 146) it was then; its full-white successor keeps the share.
+# The pixels' share of the panel's swing: black, white, and the fields
+# scheme's middle, which measured 40% on hardware. Beacons are drawn in it.
 PIXEL_SHARE = {"black": 0.0, "white": 1.0}
 MID_FIELD_SHARE = 0.45
-
-
-def scheme_model(protocol, scheme=None):
-    """(levels, backlight) for Panel, from protocol.LEVEL_SCHEMES.
-
-    The same table the app draws from, so the simulator cannot drift from what
-    the app transmits except through the pixel shares above.
-    """
-    levels, backlight = {}, {}
-    table = protocol.LEVEL_SCHEMES[scheme or protocol.SCHEME_FIELDS]
-    for symbol, (pixels, light) in table.items():
-        levels[symbol] = PIXEL_SHARE.get(pixels, MID_FIELD_SHARE) \
-            if isinstance(pixels, str) else MID_FIELD_SHARE
-        backlight[symbol] = light
-    return levels, backlight
-
-
-class Panel:
-    """An LCD whose luminance chases the field it has been told to show.
-
-    `settle_ms` is the time to reach ~90% of a full swing. The datasheet gives
-    16ms for a black->white->black round trip, so ~8ms for one transition, and
-    grey-to-grey on IPS is usually about twice that.
-
-    `levels` is the pixels' share of the swing per symbol, and `backlight` the
-    `display.backlight()` value set with it. backlight=None holds it constant,
-    which is how the app transmitted before it drove the backlight per symbol.
-    Unlike the liquid crystal, the backlight has no lag: it changes the moment
-    the field does.
-    """
-
-    def __init__(self, settle_ms, brightness=1.0, backlight=None, levels=None,
-                 pwm_ripple=0.0, rng=None, schemes=None):
-        self.tau = max(0.5, settle_ms / 2.3)
-        self.brightness = brightness
-        self.level = 0.0
-        # scheme -> (levels, duty). None is the fallback: `levels` and
-        # `backlight` as given, used for any scheme `schemes` does not name.
-        self.models = {None: (levels or self.LEVELS, self._duty(backlight))}
-        for name, (scheme_levels, scheme_backlight) in (schemes or {}).items():
-            self.models[name] = (scheme_levels, self._duty(scheme_backlight))
-        self.pwm_ripple = pwm_ripple
-        # Its own stream, so a run with the backlight held constant draws
-        # exactly the random numbers it always did.
-        self.rng = rng or random.Random(0)
-
-    # The fields scheme, for a Panel built without `levels`. build() always
-    # passes them, from scheme_model().
-    LEVELS = {" ": 0.0, "_": MID_FIELD_SHARE, "-": 1.0}
-
-    # The badge on the desk is v2, and MID_BACKLIGHT is set for its curve.
-    @staticmethod
-    def _duty(backlight):
-        if backlight is None:
-            return None
-        return dict((s, backlight_duty_v2(v)) for s, v in backlight.items())
-
-    def show(self, field, dt_ms, scheme=None):
-        """Light leaving the panel, showing `field` in `scheme`."""
-        levels, duty = self.models.get(scheme, self.models[None])
-        target = levels[field]
-        self.level += (target - self.level) * (1 - math.exp(-dt_ms / self.tau))
-        return self.level * self.light(field, duty) * self.brightness
-
-    def light(self, field, duty):
-        """The backlight's output as the sensor sees it, 0.0-1.0."""
-        if duty is None:
-            return 1.0
-        duty = duty[field]
-        if duty in (0.0, 1.0) or not self.pwm_ripple:
-            return duty
-        instant = 1.0 if self.rng.random() < duty else 0.0
-        return duty + self.pwm_ripple * (instant - duty)
-
-
-class Sensor:
-    """A phototransistor reading the peer's panel, plus ambient and noise.
-
-    By default an idealised one: `noise` is the half-width of uniform noise
-    and every count is resolved. With `sd` set it is the badge's as measured:
-    Gaussian noise of that standard deviation, readings floored to whole
-    `quantum`s (16 -- a 12-bit ADC read as u16), and the app's median of
-    `reads` immediate readings (sample_light() takes three).
-    """
-
-    def __init__(self, ambient, contrast, noise, rng, sd=None, quantum=1,
-                 reads=1):
-        self.ambient = ambient
-        self.contrast = contrast
-        self.noise = noise
-        self.rng = rng
-        self.sd = sd
-        self.quantum = quantum
-        self.reads = reads
-
-    def read(self, peer_level):
-        if self.sd is None:
-            value = self.ambient + peer_level * self.contrast
-            value += self.rng.uniform(-self.noise, self.noise)
-            return max(0, min(65535, int(value)))
-        values = sorted(self._one(peer_level) for _ in range(self.reads))
-        return values[len(values) // 2]
-
-    def _one(self, peer_level):
-        value = self.ambient + peer_level * self.contrast
-        value += self.rng.gauss(0, self.sd)
-        value = int(value) // self.quantum * self.quantum
-        return max(0, min(65535, value))
-
-
-class SimBadge:
-    """A Transfer plus the hardware it would be running on.
-
-    `present_ms` is how long after a frame starts its field reaches the panel.
-    Zero, the default, puts it there at once, as every result quoted before
-    2026-10-04 assumed. On the badge it is the frame's drawing, the wait for
-    vertical blank and the write -- see PRESENT_MS_V2 -- and it can be longer
-    than a frame, so changes queue.
-    """
-
-    def __init__(self, transfer, panel, sensor, frame_ms, rng, start_at=0,
-                 present_ms=0.0):
-        self.transfer = transfer
-        self.panel = panel
-        self.sensor = sensor
-        self.frame_ms = frame_ms
-        self.rng = rng
-        self.start_at = start_at
-        self.present_ms = present_ms
-        self.field = " "            # what the Transfer last decided
-        self.scheme = None
-        self.shown = " "            # what the panel has been told to show
-        self.shown_scheme = None
-        self.pending = []           # (when, field, scheme), oldest first
-        self.next_frame = start_at
-        self.started = False
-
-    def present(self, now):
-        """Hand the panel every field whose present has completed by `now`."""
-        while self.pending and self.pending[0][0] <= now:
-            _, self.shown, self.shown_scheme = self.pending.pop(0)
-
-    def due(self, now):
-        return now >= self.next_frame
-
-    def tick(self, now, peer_level):
-        if not self.started:
-            self.transfer.started = now
-            self.transfer.phase_started = now
-            self.started = True
-        light = self.sensor.read(peer_level)
-        self.field = self.transfer.step(int(now), light)
-        self.scheme = self.transfer.scheme
-        if self.present_ms:
-            self.pending.append((now + self.present_ms, self.field, self.scheme))
-        else:
-            self.shown, self.shown_scheme = self.field, self.scheme
-        # Frame times wobble; badge.ticks_delta is not a constant.
-        jitter = self.rng.uniform(-0.15, 0.15) * self.frame_ms
-        self.next_frame = now + self.frame_ms + jitter
-        return self.field
 
 
 # --- continuous invariant checking ------------------------------------------
@@ -276,6 +105,16 @@ class Invariants:
         self.accepted = 0               # whole blocks the Follower has taken
         self.last_received = 0
         self.violations = []
+        # The two LoopBadges, when there are: each badge's clock starts at
+        # its own start, so epochs are compared on the shared timeline.
+        self.badges = None
+
+    def _epoch(self, which):
+        transfer = (self.leader, self.follower)[which]
+        if self.badges is None:
+            return transfer.clock.epoch
+        badge = self.badges[which]
+        return badge.start_at * 1000 + transfer.clock.epoch / badge.rate
 
     def _state(self, now):
         return ("t=%.0fms leader[phase=%d sub=%d rung=%dms epoch=%d blk=%d "
@@ -283,10 +122,12 @@ class Invariants:
                 "tokens=%d res=%s]"
                 % (now,
                    self.leader.phase, self.leader.sub,
-                   self.leader.clock.duration, self.leader.clock.epoch,
+                   self.leader.clock.duration // 1000,
+                   self.leader.clock.epoch // 1000,
                    self.leader.block_index, self.leader.result,
                    self.follower.phase, self.follower.sub,
-                   self.follower.clock.duration, self.follower.clock.epoch,
+                   self.follower.clock.duration // 1000,
+                   self.follower.clock.epoch // 1000,
                    len(self.follower.received), self.follower.result))
 
     def _fail(self, now, code, detail):
@@ -320,8 +161,8 @@ class Invariants:
                 self._fail(now, "I1",
                            "rungs split for %.0fms: leader %dms, follower %dms"
                            % (now - self.split_since,
-                              self.leader.clock.duration,
-                              self.follower.clock.duration))
+                              self.leader.clock.duration // 1000,
+                              self.follower.clock.duration // 1000))
             return              # I2 is meaningless across different durations
         self.split_since = None
 
@@ -336,8 +177,8 @@ class Invariants:
         # lost: a link that has not locked by then is not acquiring, it is
         # broken -- which is exactly what the uncorrected calibration skew did,
         # sitting half a slot out until ERR_LOST_PEER.
-        duration = self.leader.clock.duration
-        skew = (self.leader.clock.epoch - self.follower.clock.epoch) % duration
+        duration = self.leader.clock.duration          # us
+        skew = (self._epoch(0) - self._epoch(1)) % duration
         phase_error = min(skew, duration - skew)
         if phase_error <= duration / 4.0:
             self.skew_since = None
@@ -345,11 +186,13 @@ class Invariants:
         if self.skew_since is None:
             self.skew_since = now
             return
-        if now - self.skew_since > self.protocol.LOST_PEER_SLOTS * duration:
+        if now - self.skew_since > \
+                self.protocol.LOST_PEER_SLOTS * duration / 1000.0:
             self._fail(now, "I2",
-                       "slot grids %.1fms apart on a %dms slot for %.0fms "
+                       "slot grids %.2fms apart on a %.0fms slot for %.0fms "
                        "(%.2f slots, limit 0.25)"
-                       % (phase_error, duration, now - self.skew_since,
+                       % (phase_error / 1000.0, duration / 1000.0,
+                          now - self.skew_since,
                           phase_error / float(duration)))
 
     def _check_framing(self, now):
@@ -397,7 +240,7 @@ class Invariants:
 
 
 class Link:
-    """Drives two SimBadges against each other on a shared timeline."""
+    """Two badges on a shared timeline."""
 
     def __init__(self, leader, follower, step_ms=1.0, invariants=None):
         self.leader = leader
@@ -411,44 +254,6 @@ class Link:
         self.invariants = invariants
         self.violation = None
 
-    def run(self, limit_seconds=180):
-        deadline = limit_seconds * 1000
-        last = None
-        while self.now < deadline:
-            # Each badge's panel keeps settling whether or not it drew a frame.
-            self.leader.present(self.now)
-            self.follower.present(self.now)
-            l_level = self.leader.panel.show(self.leader.shown, self.step_ms,
-                                             self.leader.shown_scheme)
-            f_level = self.follower.panel.show(self.follower.shown,
-                                               self.step_ms,
-                                               self.follower.shown_scheme)
-
-            if self.leader.due(self.now):
-                self.leader.tick(self.now, f_level)
-            if self.follower.due(self.now):
-                self.follower.tick(self.now, l_level)
-
-            state = (self.leader.transfer.phase, self.follower.transfer.phase)
-            if state != last:
-                self.log.append((self.now, state))
-                last = state
-
-            if self.invariants is not None and self.violation is None:
-                try:
-                    self.invariants.check(self.now)
-                except InvariantError as broken:
-                    # Record the FIRST divergence and stop checking, but keep
-                    # running: the result codes the run ends with are still
-                    # worth seeing, and every later violation is downstream of
-                    # this one.
-                    self.violation = str(broken)
-
-            if self.leader.transfer.result and self.follower.transfer.result:
-                break
-            self.now += self.step_ms
-        return self.now / 1000
-
     # Raises with the time and both badges' state if anything broke, so a test
     # can be a bare `link.run(...); link.assert_invariants()`.
     def assert_invariants(self):
@@ -456,75 +261,23 @@ class Link:
             raise InvariantError(self.violation)
 
 
-# `contrast` is the swing the sensor sees across the peer's full black-to-white
-# range: 64-80 counts through a mirror [measured-all]; from a second badge,
-# [unmeasured] -- see .agents/docs/optical-coupling.md for the prediction.
+# --- the badges ---------------------------------------------------------------
+# The app as it runs a transfer: a loop that, each pass, shows
+# field_at(now), calls work(now), and waits for due_us() -- reading, while
+# it waits, through its reader. Only a change of pixels goes back to run()
+# to be presented; a change of backlight is a display.backlight() call, live
+# at once. Modelled from the badge as measured:
 #
-# It is NOT a function of how much of the screen transmits. The sensor sits
-# about 1mm outside the right edge at mid height and reads a patch near itself,
-# so the swing depends on whether that patch lands on a transmit band -- near
-# full if it does, near nothing if it does not, and somewhere between if it
-# straddles an edge. 9000 models the intended case: a band under the sensor.
-#
-# Sweep it rather than trusting it. The link still delivers 94-95 of 96 runs
-# down to 1600, so the number below is not what the protocol's margin rests on.
-def build(protocol, payload, settle_ms=16, ambient=(200, 240), contrast=9000,
-          noise=80, frame_ms=11.1, start_skew_ms=0, seed=1, check=True,
-          schemes=None, backlight=None, levels=None, pwm_ripple=0.0,
-          follower_schemes=None, present_ms=0.0, sensor_sd=None, quantum=1,
-          reads=1):
-    """A Leader and Follower ready to be run from their very first frame.
-
-    `schemes` is what each Transfer may use -- the protocol's default, fields
-    only, if omitted -- and each panel shows whichever scheme its Transfer is
-    in, modelled from protocol.LEVEL_SCHEMES. `backlight` and `levels` replace
-    that model for every scheme, for trying ones the protocol does not have;
-    `pwm_ripple` is the sensor model. See Panel. `follower_schemes`, if
-    given, is the Follower's own setting, for pairing two badges set up
-    differently.
-    """
-    rng = random.Random(seed)
-    if levels or backlight:
-        models = None
-    else:
-        models = dict((name, scheme_model(protocol, name))
-                      for name in protocol.LEVEL_SCHEMES)
-    allowed = schemes or (protocol.SCHEME_FIELDS,)
-
-    def panel(which):
-        return Panel(settle_ms, backlight=backlight, levels=levels,
-                     pwm_ripple=pwm_ripple, schemes=models,
-                     rng=random.Random(seed * 2 + which))
-    leader = protocol.Transfer(True, payload, frame_ms=lambda: int(frame_ms),
-                               schemes=allowed)
-    follower = protocol.Transfer(False, frame_ms=lambda: int(frame_ms),
-                                 schemes=follower_schemes or allowed)
-
-    def sensor(which):
-        return Sensor(ambient[which], contrast, noise, rng, sd=sensor_sd,
-                      quantum=quantum, reads=reads)
-
-    sim_leader = SimBadge(
-        leader, panel(0), sensor(0),
-        frame_ms, rng, start_at=0, present_ms=present_ms)
-    sim_follower = SimBadge(
-        follower, panel(1), sensor(1),
-        frame_ms, rng, start_at=start_skew_ms, present_ms=present_ms)
-    checker = Invariants(protocol, leader, follower, payload) if check else None
-    return Link(sim_leader, sim_follower, invariants=checker)
-
-
-# --- continuous badges --------------------------------------------------------
-# The app as it now runs a transfer: a loop that reads the sensor back to
-# back for a sample, hands the protocol their mean, and never presents while
-# it listens. Only a change of pixels goes back to run() to be presented; a
-# change of backlight is a display.backlight() call, live at once. Modelled
-# from the badge as measured:
-#
-# - reads every LOOP_READ_MS for FINE_MS, or up to the next symbol boundary
-#   while transmitting; then the protocol's call, LOOP_CALL_MS give or take,
-#   reading nothing [measured-v2: 0.8-1.5 ms, 2026-10-06b]; its field takes
-#   effect when it returns; none while the badge is presenting;
+# - an EXACT badge's ring takes a reading every 20 us whatever the badge is
+#   doing; here one entry every RING_ENTRY_US holds the sum of RING_READS of
+#   them, each with the DMA's noise, RING_SD [measured-v2: 7.6-9.2 counts a
+#   reading, fast_reads 2026-10-06a/b];
+# - a POLLED badge reads every LOOP_READ_MS while it waits, and nothing while
+#   it works or presents;
+# - a pass costs PASS_WORK_MS, SLOT_WORK_MS a slot it decided and
+#   SAMPLE_WORK_MS a fine sample it took, each give or take, `work_scale`
+#   times over [unmeasured -- Dev Mode M3 ring slot_work]; a collection the
+#   protocol asks for GC_MS [measured-v2: 20-46 ms];
 # - a present waits for the panel's next vertical blank, then writes for
 #   WRITE_MS, and blocks reading throughout [measured-v2];
 # - the liquid crystal starts to move `pixel_dead_ms` after the blank, then
@@ -545,11 +298,26 @@ def build(protocol, payload, settle_ms=16, ambient=(200, 240), contrast=9000,
 # loop around a read was 50-70 us, so this is a floor on the sample's
 # readings, ~20, not a guess at them. The simulation steps 0.1 ms anyway.
 LOOP_READ_MS = 0.1
-LOOP_CALL_MS = 1.0
+LOOP_CALL_MS = 1.0          # kept for callers; the work model replaced it
+PASS_WORK_MS = 0.15
+SLOT_WORK_MS = 1.2
+SAMPLE_WORK_MS = 0.3
+GC_MS = (20.0, 46.0)
+WAKE_MS = 0.06              # a spin pass, ~40-60 us on v2 [measured-v2]
+RING_ENTRY_US = 100
+RING_READS = 5
+RING_ENTRIES = 4096
+RING_USABLE_US = 318000     # the badge's: 327.7 ms less RING_SAFE_US
+RING_SD = 8.5
 # The flicker's fit, once a transfer, stalls the loop that long: 3.3 ms on
 # MicroPython's unix port, and protocol work has run up to ~50 times slower
 # on the badge [inferred-v2]. Pessimistic on purpose.
 LOOP_FIT_MS = 150.0
+# What replaying one kept sample through the staircase reader costs: a
+# correction, a pool and, every other sample, a feed over up to 512 values.
+# 640 samples at this is 160 ms -- the review's 50-150 ms estimate for v2,
+# rounded up [unmeasured -- M7 flicker_filter.replay].
+REPLAY_MS_PER_SAMPLE = 0.25
 WRITE_MS = 7.8
 PWM_PERIOD_MS = 0.263
 SENSOR_K = 36.0             # counts x ms, for the mirror's 80-count swing
@@ -665,97 +433,126 @@ class LoopSensor:
 
 
 class LoopBadge:
-    """A Transfer driven the way the app's listen loop drives it."""
+    """A Transfer driven the way the app's transfer loop drives it, through
+    the production reader: `reader_kind` "ring" (EXACT) or "polled"."""
 
-    def __init__(self, protocol, transfer, panel, sensor, rng, start_at=0.0,
-                 refresh_ms=16.7, pixel_dead_ms=7.0, read_ms=LOOP_READ_MS,
-                 duty=backlight_duty_v2, models=None, call_ms=LOOP_CALL_MS):
+    def __init__(self, protocol, transfer, panel, sensor, rng, reader,
+                 start_at=0.0, refresh_ms=16.7, pixel_dead_ms=7.0,
+                 read_ms=LOOP_READ_MS, duty=None, work_scale=1.0, ppm=0.0,
+                 ring_sd=None, fit_ms=LOOP_FIT_MS):
         self.protocol = protocol
         self.transfer = transfer
         self.panel = panel
         self.sensor = sensor
         self.rng = rng
+        self.reader = reader
+        self.ring = getattr(reader, "ring", None)
         self.start_at = start_at
         self.refresh_ms = refresh_ms
         self.phase_ms = rng.uniform(0, refresh_ms)     # where its blanks fall
         self.pixel_dead_ms = pixel_dead_ms
         self.read_ms = read_ms
-        self.duty = duty
-        self.models = models
+        self.duty = duty or backlight_duty_v2
+        self.work_scale = work_scale
+        self.rate = 1.0 + ppm * 1e-6
+        self.ring_sd = ring_sd
+        self.fit_ms = fit_ms
+        self.local = 0.0            # this badge's own clock, ms since start
+        self.next_entry = RING_ENTRY_US / 1000.0
         self.next_read = start_at
+        self.next_pass = start_at
         self.busy_until = start_at
         self.started = False
-        self.pixels = None          # what has been drawn
+        self.pixels = None
         self.backlight = 1.0
         self.presents = 0
-        self.call_ms = call_ms
         self.fitted = False
-        # The sample being read: its start, its readings' sum, count and
-        # sum of times, and the deadline the protocol gave for it.
-        self.window = start_at
-        self.total = self.count = 0
-        self.times = 0.0
-        self.deadline = None
+        self.collections = 0
+
+    def local_us(self):
+        return int(self.local * 1000)
 
     def next_blank(self, now):
         k = math.ceil((now - self.phase_ms) / self.refresh_ms)
         return self.phase_ms + k * self.refresh_ms
 
-    def due(self, now):
-        return now >= self.next_read and now >= self.busy_until
+    def raw(self):
+        """One reading as the ring holds it: 12 bits, light_level() / 16."""
+        if self.ring_sd is None:
+            return self.sensor.read() >> 4
+        sensor = self.sensor
+        value = sensor.offset + sensor.s + self.rng.gauss(0, self.ring_sd)
+        value = int(value) // 16
+        return 0 if value < 0 else value
 
-    def tick(self, now):
-        transfer = self.transfer
-        protocol = self.protocol
-        if not self.started:
-            transfer.started = int(now)
-            transfer.phase_started = int(now)
-            self.started = True
-            self.window = now
-        if not self.count:
-            self.window = now
-        self.total += self.sensor.read()
-        self.count += 1
-        self.times += now
-        step = self.read_ms * self.rng.uniform(0.9, 1.1)
-        done = now - self.window >= protocol.FINE_MS
-        if self.deadline is not None and int(now) >= self.deadline:
-            done = True
-        if not done:
-            self.next_read = now + step
+    def tick(self, now, dt):
+        if now < self.start_at:
             return
-        # read_sample() ends: the protocol's call, reading nothing.
-        t = self.times / self.count
-        span = now - self.window + step
-        field = transfer.sample(int(now), int(t), self.total // self.count,
-                                int(t * 1000), int(span * 1000))
-        self.total = self.count = 0
-        self.times = 0.0
-        self.deadline = transfer.deadline()
-        now += self.call_ms * self.rng.uniform(0.7, 1.5)
-        if getattr(transfer, "fit_tried", False) and not self.fitted:
+        if not self.started:
+            self.started = True
+            self.reader.start()
+        self.local += dt * self.rate
+        # Sensing.
+        if self.ring is not None:
+            while self.local >= self.next_entry:
+                total = 0
+                for _ in range(RING_READS):
+                    total += self.raw()
+                self.ring.push(total)
+                self.next_entry += RING_ENTRY_US / 1000.0
+        elif now >= self.busy_until and now >= self.next_read:
+            self.reader.add(self.local_us(), self.sensor.read())
+            self.next_read = now + self.read_ms * self.rng.uniform(0.9, 1.1)
+        # A pass of the loop.
+        if now < self.busy_until or now < self.next_pass:
+            return
+        transfer = self.transfer
+        if transfer.collect_due:
+            transfer.collect_due = False
+            self.collections += 1
+            self.busy_until = now + self.rng.uniform(*GC_MS)
+            self.next_pass = self.busy_until
+            return
+        t = self.reader.now_us()
+        field = transfer.field_at(t)
+        self.show(now, field)
+        transfer.work(t)
+        cost = (PASS_WORK_MS + SLOT_WORK_MS * transfer.work_slots
+                + SAMPLE_WORK_MS * transfer.work_samples)
+        cost *= self.rng.uniform(0.7, 1.5) * self.work_scale
+        if transfer.fit_tried and not self.fitted:
             self.fitted = True
-            now += LOOP_FIT_MS
-        pixels, backlight = protocol.LEVEL_SCHEMES[transfer.scheme][field]
+            cost += self.fit_ms
+        # A POLLED Follower's late fit replays the staircase it read: each
+        # kept sample corrected and pooled again [unmeasured -- M7 replay].
+        replayed = getattr(transfer, "replayed", 0)
+        if replayed:
+            transfer.replayed = 0
+            cost += REPLAY_MS_PER_SAMPLE * replayed
+        self.busy_until = max(self.busy_until, now + cost)
+        due = self.start_at + transfer.due_us() / 1000.0 / self.rate
+        self.next_pass = max(self.busy_until, due) \
+            + self.rng.uniform(0, WAKE_MS)
+
+    def show(self, now, field):
+        protocol = self.protocol
+        pixels, backlight = protocol.LEVEL_SCHEMES[self.transfer.scheme][field]
         if backlight != self.backlight:
-            # Set first, in update(), before any present: live at the wrap.
             self.backlight = backlight
             self.panel.schedule(now + self.rng.uniform(0, PWM_PERIOD_MS),
                                 "duty", self.duty(backlight))
-        self.busy_until = now
         if pixels != self.pixels:
             self.pixels = pixels
             blank = self.next_blank(now)
             share = PIXEL_SHARE.get(pixels, MID_FIELD_SHARE) \
                 if isinstance(pixels, str) else MID_FIELD_SHARE
             self.panel.schedule(blank + self.pixel_dead_ms, "share", share)
-            self.busy_until = blank + WRITE_MS
+            self.busy_until = max(self.busy_until, blank + WRITE_MS)
             self.presents += 1
-        self.next_read = self.busy_until
 
 
 class LoopLink(Link):
-    """Two continuous badges on a shared timeline, in STEP_MS steps."""
+    """Two badges on a shared timeline, in STEP_MS steps."""
 
     STEP_MS = 0.1
 
@@ -769,12 +566,13 @@ class LoopLink(Link):
         while self.now < deadline:
             l_out = leader.panel.output(self.now, dt)
             f_out = follower.panel.output(self.now, dt)
-            leader.sensor.settle(f_out, dt)
-            follower.sensor.settle(l_out, dt)
-            if leader.due(self.now):
-                leader.tick(self.now)
-            if follower.due(self.now):
-                follower.tick(self.now)
+            # Each badge's own screen leaks back into its sensor, off the
+            # peer's glass, by `self_coupling` of its output.
+            c = self.self_coupling
+            leader.sensor.settle(f_out + c * l_out if c else f_out, dt)
+            follower.sensor.settle(l_out + c * f_out if c else l_out, dt)
+            leader.tick(self.now, dt)
+            follower.tick(self.now, dt)
             state = (leader.transfer.phase, follower.transfer.phase)
             if state != last:
                 self.log.append((self.now, state))
@@ -791,29 +589,36 @@ class LoopLink(Link):
             self.now += dt
         return self.now / 1000
 
+    def phase_times(self):
+        """Seconds from the start to each phase's first appearance on the
+        Leader: discovery ends at calibration, calibration at data."""
+        firsts = {}
+        for now, (phase, _) in self.log:
+            firsts.setdefault(phase, now / 1000.0)
+        return firsts
 
 def build_loop(protocol, payload, settle_ms=16, ambient=(200, 240),
                contrast=9000, noise=80, start_skew_ms=0, seed=1, check=True,
-               schemes=None, follower_schemes=None, refresh_ms=16.7,
-               pixel_dead_ms=7.0, sensor_sd=None, quantum=1, offset=None,
-               room_light=0, sensor_lag=False, duty=backlight_duty_v2,
-               read_ms=LOOP_READ_MS, k_scale=1.0, flicker=0.0,
-               flicker_hz=120, call_ms=LOOP_CALL_MS, light=None,
-               mains_drift_hz=0.0, **_ignored):
-    """A Leader and Follower that read continuously, as the app now does.
+               refresh_ms=16.7, pixel_dead_ms=7.0, sensor_sd=None, quantum=1,
+               offset=None, room_light=0, sensor_lag=False,
+               duty=backlight_duty_v2, read_ms=LOOP_READ_MS, k_scale=1.0,
+               flicker=0.0, flicker_hz=120, light=None, mains_drift_hz=0.0,
+               reader="ring", peer_reader=None, work_scale=1.0, ppm=(0.0, 0.0),
+               ring_sd=None, fit_ms=LOOP_FIT_MS, self_coupling=0.0,
+               **_ignored):
+    """A Leader and a Follower, as the app runs them.
 
-    Takes the same scenario keywords as build(). With `sensor_sd` -- the
-    measured optics -- `offset` is the ADC floor, `room_light` the room's
-    light in counts, and `sensor_lag` turns on the light-dependent response,
-    `k_scale` times as slow as measured.
+    `reader` is the Leader's ("ring" or "polled"), `peer_reader` the
+    Follower's (the same if not given). With `sensor_sd` -- the measured
+    optics -- `offset` is the ADC floor, `room_light` the room's light in
+    counts, and `sensor_lag` turns on the light-dependent response,
+    `k_scale` times as slow as measured; the ring's readings then carry
+    `ring_sd` (RING_SD by default). `ppm` is each badge's crystal error.
+    `self_coupling` is the share of a badge's own output that reaches its
+    own sensor, off the peer's glass [unmeasured]: 0 by default.
     """
     rng = random.Random(seed)
-    allowed = schemes or (protocol.SCHEME_FIELDS,)
-    leader = protocol.Transfer(True, payload, frame_ms=lambda: int(refresh_ms),
-                               schemes=allowed, continuous=True)
-    follower = protocol.Transfer(False, frame_ms=lambda: int(refresh_ms),
-                                 schemes=follower_schemes or allowed,
-                                 continuous=True)
+    kinds = (reader, peer_reader or reader)
 
     def sensor(which):
         k = SENSOR_K * k_scale * contrast / 80.0 if sensor_lag else None
@@ -825,17 +630,46 @@ def build_loop(protocol, payload, settle_ms=16, ambient=(200, 240),
                           flicker_hz=flicker_hz, mains_drift_hz=mains_drift_hz,
                           **FLICKER_LIGHTS.get(light, {}))
 
-    def badge(transfer, which, start):
-        return LoopBadge(protocol, transfer,
+    holder = {}
+
+    def make_reader(which):
+        def ticks_us():
+            return holder[which].local_us()
+        if kinds[which] == "ring":
+            ring = readers.ListRing(RING_ENTRIES, RING_ENTRY_US)
+            return readers.RingReader(ring, ticks_us, per_entry=RING_READS,
+                                      usable_us=RING_USABLE_US)
+        return readers.PolledReader(None, ticks_us)
+
+    def badge(which, payload_or_none, start):
+        reader_ = make_reader(which)
+        transfer = protocol.Transfer(which == 0, payload_or_none, reader_)
+        sd = None
+        if sensor_sd is not None:
+            sd = RING_SD if ring_sd is None else ring_sd
+        made = LoopBadge(protocol, transfer,
                          LoopPanel(settle_ms, random.Random(seed * 2 + which)),
                          sensor(which), random.Random(seed * 7 + which),
-                         start_at=start, refresh_ms=refresh_ms,
+                         reader_, start_at=start, refresh_ms=refresh_ms,
                          pixel_dead_ms=pixel_dead_ms, read_ms=read_ms,
-                         duty=duty, call_ms=call_ms)
-    checker = Invariants(protocol, leader, follower, payload) if check else None
-    return LoopLink(badge(leader, 0, 0.0), badge(follower, 1, start_skew_ms),
-                    invariants=checker)
+                         duty=duty, work_scale=work_scale, ppm=ppm[which],
+                         ring_sd=sd, fit_ms=fit_ms)
+        holder[which] = made
+        return made
 
+    lead = badge(0, payload, 0.0)
+    follow = badge(1, None, start_skew_ms)
+    checker = None
+    if check:
+        checker = Invariants(protocol, lead.transfer, follow.transfer, payload)
+        checker.badges = (lead, follow)
+    link = LoopLink(lead, follow, invariants=checker)
+    link.self_coupling = self_coupling
+    return link
+
+
+# Every badge now runs the transfer loop; build() is the same thing.
+build = build_loop
 
 # The v2 badge for build_loop(): 60 Hz, and the liquid crystal starting 7 ms
 # after the blank, as on the runs whose rise crossed T_low 13 ms after the
@@ -878,27 +712,7 @@ SCENARIOS = {
     "cold panel":   dict(settle_ms=24, noise=80,  start_skew_ms=1500, ambient=(200, 240)),
 }
 
-# The v2 badge as measured on 2026-10-04, at LORES with the whole screen:
-# 60 Hz frames; a field reaching the panel ~19 ms after its frame starts (draw
-# ~4 ms, wait ~4.7 ms for vertical blank, write 7.8 ms, and the measured rise
-# reaching a tenth of its swing 13-19 ms after the present began -- so 16 to
-# 22 ms, of which 19 is the middle); and 90% settling in 24 ms (rise tau
-# 10.5 ms). Applied over a scenario, it replaces the scenario's own settle.
-FRAME_MS_V2 = 16.7
-PRESENT_MS_V2 = 19.0
-SETTLE_MS_V2 = 24
-V2_MEASURED = dict(frame_ms=FRAME_MS_V2, present_ms=PRESENT_MS_V2,
-                   settle_ms=SETTLE_MS_V2)
-
-# v3 as it would be, unmeasured [inferred-v3]: 90 Hz frames, and the same
-# chain -- a few ms of drawing, the wait for vertical blank, the 7.8 ms write
-# -- putting a field on the panel about 11 ms after its frame starts. The
-# panel is the same, so it settles as v2's does.
-FRAME_MS_V3 = 11.1
-PRESENT_MS_V3 = 11.0
-V3_MODEL = dict(frame_ms=FRAME_MS_V3, present_ms=PRESENT_MS_V3,
-                settle_ms=SETTLE_MS_V2)
-
+# The sensor as measured, in counts. Through a mirror, held flat, the panel's
 # The sensor as measured, in counts. Through a mirror, held flat, the panel's
 # whole black-to-white swing read 80 counts in the dark (2026-10-03) over a
 # 32-count floor, with held levels' readings scattered at a standard
@@ -918,21 +732,16 @@ TYPICAL = (b"HomeNet", b"hunter2!!")
 WORST = (b"A" * 32, b"k" * 63)
 
 
-def report(protocol, payload=TYPICAL, seconds=200, seed=1, builder=None,
-           **transmit):
-    """Run every scenario and print how each one ends.
-
-    `transmit` is passed to build(): schemes=, backlight=, levels=, pwm_ripple=.
-    `builder` is build() unless given -- build_loop() for continuous badges.
-    """
-    builder = builder or build
+def report(protocol, payload=TYPICAL, seconds=200, seed=1, **transmit):
+    """Run every scenario and print how each one ends. `transmit` is passed
+    to build_loop()."""
     names = {v: k[6:].lower() for k, v in vars(protocol).items()
              if k.startswith("PHASE_")}
     print("%-14s %8s  %-16s %-16s %s"
           % ("scenario", "elapsed", "leader", "follower", "payload"))
     broken = []
     for label, kw in SCENARIOS.items():
-        link = builder(protocol, payload, seed=seed, **dict(kw, **transmit))
+        link = build_loop(protocol, payload, seed=seed, **dict(kw, **transmit))
         elapsed = link.run(seconds)
         got = protocol.parse_payload(link.follower.transfer.received)
         reached = names.get(link.follower.transfer.phase, "?")
@@ -951,46 +760,27 @@ def report(protocol, payload=TYPICAL, seconds=200, seed=1, builder=None,
 
 
 if __name__ == "__main__":
-    import os
-    import sys
     # This imports from firmware/apps/, which is packed onto the badge -- so
     # leave no __pycache__ behind there. See tests/run_tests.py.
     sys.dont_write_bytecode = True
-    # Runnable on its own, so it puts the shared harness on the path itself
-    # rather than relying on the runner having done it. `tests/` is where the
-    # harness lives -- beside the runner, shared by every app's tests.
     HERE = os.path.dirname(os.path.abspath(__file__))
     sys.path.insert(0, os.path.dirname(HERE))
     from harness import load_module
-    # --flicker: the sensor follows the backlight's PWM rather than averaging it.
-    # --auto: both badges may use the backlight, and calibration chooses.
-    # --v2: the badge as measured -- 60 Hz, the present delay, a 24 ms panel.
-    # --optics=mirror|aligned|overlap: the sensor as measured, in counts, with
-    # the swing a mirror gave or a peer badge is predicted to.
+    # --v3, --slow-panel: the panel's timing. --optics=mirror|aligned|overlap:
+    # the sensor as measured, with the swing a mirror gave or a peer badge is
+    # predicted to. --polled: both badges on light_level(), as a badge whose
+    # ring was refused; --mixed: the Follower only.
     protocol = load_module("share_wifi", "protocol")
-    allowed = ((protocol.SCHEME_FIELDS, protocol.SCHEME_BACKLIGHT)
-               if "--auto" in sys.argv else (protocol.SCHEME_FIELDS,))
-    # --v3: v3's timing as it would be -- 90 Hz, an 11 ms present delay.
-    extra = dict(V2_MEASURED) if "--v2" in sys.argv else {}
-    if "--v3" in sys.argv:
-        extra = dict(V3_MODEL)
+    extra = dict(LOOP_V3 if "--v3" in sys.argv else
+                 LOOP_V2_SLOW_PANEL if "--slow-panel" in sys.argv else
+                 LOOP_V2)
     swings = {"mirror": SWING_MIRROR, "aligned": SWING_PEER_ALIGNED,
               "overlap": SWING_PEER_OVERLAP}
-    if "--loop" in sys.argv:
-        # --loop: the app as it now runs a transfer, reading continuously --
-        # see build_loop(). --v3 and --slow-panel pick its timing; --optics
-        # the measured sensor, with its light-dependent lag.
-        extra = dict(LOOP_V3 if "--v3" in sys.argv else
-                     LOOP_V2_SLOW_PANEL if "--slow-panel" in sys.argv else
-                     LOOP_V2)
-        for arg in sys.argv:
-            if arg.startswith("--optics="):
-                extra.update(LOOP_SENSOR_V2,
-                             contrast=swings[arg.split("=", 1)[1]])
-        report(protocol, schemes=allowed, builder=build_loop, **extra)
-        sys.exit(0)
     for arg in sys.argv:
         if arg.startswith("--optics="):
-            extra.update(SENSOR_V2, contrast=swings[arg.split("=", 1)[1]])
-    report(protocol, schemes=allowed,
-           pwm_ripple=1.0 if "--flicker" in sys.argv else 0.0, **extra)
+            extra.update(LOOP_SENSOR_V2, contrast=swings[arg.split("=", 1)[1]])
+    if "--polled" in sys.argv:
+        extra["reader"] = "polled"
+    if "--mixed" in sys.argv:
+        extra["peer_reader"] = "polled"
+    report(protocol, **extra)

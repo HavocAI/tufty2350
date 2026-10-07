@@ -186,8 +186,8 @@ probe's bookkeeping), taken off the others:
 - **So a receiver that holds its screen still gets ~108 readings a 50 ms slot**,
   about 40 of them inside the slot's read window, where presenting every frame
   leaves about one: the present blocks reading for 12.4 ms of each 16.7.
-  `share_wifi`'s transfer now reads this way -- see "Reading continuously" in
-  the protocol, and the third loop shape in
+  `share_wifi`'s transfer read this way from 2026-10-05, and now reads by a
+  DMA ring (below) -- see "Reading" in the protocol, and the third loop shape in
   [badgeware-patterns.md](badgeware-patterns.md). The probe's
   `reads.transfer` times a pass of that loop.
 - **A second run agrees** (2026-10-05c): 2,362 listener passes a second,
@@ -221,6 +221,52 @@ probe's bookkeeping), taken off the others:
   viper, 7.6-8.4 counts against 4.3; why is unknown.
   A transfer runs 20-60 s, and a collection costs a slot or more (see
   "Performance tiers"); whether one lands in a transfer is not yet known.
+
+### Reading by DMA ring
+
+`share_wifi` reads the sensor for a whole transfer by DMA into a ring,
+`fastadc.Ring`: the ADC free-running at 50 kHz (`DIV` 959) into its FIFO, one
+channel paced by DREQ 48 writing 16-bit readings into a 32 KB write ring
+(`ring_size=15`, `ring_sel=True`), 16,384 readings, 327.7 ms, with a count of
+0x0FFFFFFF -- `TRANS_COUNT` is 28 bits on RP2350 **[datasheet]**. What it
+rests on, and how sure each is:
+
+- **The heap is PSRAM behind the XIP cache**, at 0x11000000 (chip select 1)
+  **[source-v3: `mpconfigboard.cmake`]**, unconfirmed on v2's build -- the
+  probe's `firmware.heap_addr` (M1) says.
+- **The same PSRAM uncached is at 0x15000000**: `XIP_NOCACHE_NOALLOC_BASE`
+  0x14000000 plus CS1's 16 MB **[Pico SDK `addressmap.h`; the firmware's
+  `st7789.hpp`, `XIP_PSRAM_NOCACHE`]**. The ring's DMA writes and every CPU
+  read go through it, so the cache can neither serve a stale line nor write
+  a dirty one back over fresh DMA data. Reading PSRAM there while DMA writes
+  it has never run on the badge **[unverified]**.
+- **Cache maintenance** is a byte write to `0x18000000 + (address -
+  0x10000000) + op`, one per 8-byte line; op 3, clean by address, also
+  invalidates on RP2350 **[Pico SDK `xip_cache.c`]**. Done once over the
+  buffer's cached alias before first use.
+- **`FCS.OVER` is bit 11 and `FCS.UNDER` bit 10**, sticky and write-1-to-clear
+  **[Pico SDK `adc.h`, RP2350]**. Cleared by writing a known `FCS` value with
+  them set, never by read-modify-write.
+- **`high_pri`** in `pack_ctrl` puts the ring ahead of the panel's DMA in
+  arbitration during a present **[datasheet]**; that the ring loses nothing
+  through a present is **[unmeasured -- M3 `ring.presenting`]**.
+- **Nothing else may use the ADC while it runs**: `light_level()`, the
+  battery and the chip's temperature are all the same ADC.
+- `Ring.verify()` checks all of it on each launch, and a failure leaves the
+  badge reading `light_level()`. `Ring()` first dirties every line of the
+  buffer's cached alias with a marker no reading can be (0xA5C3) and then
+  cleans it; `verify()` checks the uncached alias reads the marker -- the
+  clean wrote it back -- then that the DMA writes where and as fast as its
+  count says, before and after a wrap, and then churns the cache and
+  checks at once that the marker has not landed over the readings: a line
+  the clean left dirty, evicted. Not zeros, the allocator's fill: every
+  line held the marker before the clean, and a dark room's black, about
+  raw 2 with two raw steps of noise, can read 0. Last, the viper kernels
+  against their pure twins. `tests/share_wifi/test_ring_verify.py` runs it
+  over a model of the cache, with a clean that works, one that does
+  nothing and one that leaves lines dirty. M1 records why a ring was
+  refused: "cache clean did not write back" or "a cached line written back
+  over the ring" name the cache; the rest, the DMA or a kernel.
 
 ### What that means for optical signalling
 

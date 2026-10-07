@@ -29,14 +29,15 @@ import time
 
 TOOL_PROBE = "frame_probe"      # its key in the measurements file
 
-STEPS = ("refresh", "write", "breakdown", "reads", "fast_reads", "alloc",
-         "flicker_filter", "gc")
+STEPS = ("refresh", "write", "breakdown", "reads", "fast_reads", "ring",
+         "alloc", "flicker_filter", "gc")
 STEP_TITLES = {
     "refresh": "Refresh rate",
     "write": "Write time",
     "breakdown": "Frame breakdown",
     "reads": "Read rate",
     "fast_reads": "Fast reads",
+    "ring": "DMA ring",
     "alloc": "Allocation",
     "flicker_filter": "Flicker filter",
     "gc": "Garbage collection",
@@ -62,14 +63,16 @@ READ_MS = 1000
 FAST_READS = 4096
 AVERAGES = (1, 4, 16, 64, 256)
 COUNTS_PER_RAW = 16
-# The flicker_filter step's room: 2 ms means one every 3 ms, as a transfer
-# keeps them, of a light at FILTER_MEAN counts flickering FILTER_FLICKER at
-# 120 Hz and FILTER_HARMONIC at 240, with noise of about FILTER_NOISE --
-# the shape of the 2026-10-06 room that flickered 12.5 counts. Leader's
-# window 200 ms, the Follower's 100: FILTER_SAMPLES and half of it.
-FILTER_EVERY_US = 3000
+# The flicker_filter step's room: 2 ms means back to back, as a transfer now
+# pulls them from its reader, of a light at FILTER_MEAN counts flickering
+# FILTER_FLICKER at 120 Hz and FILTER_HARMONIC at 240, with noise of about
+# FILTER_NOISE -- the shape of the 2026-10-06 room that flickered 12.5
+# counts. The Leader's window, 160 ms, is FILTER_SAMPLES; the Follower's,
+# 100 ms, FILTER_FOLLOWER_SAMPLES (M7: a fit on 50 two-ms samples).
+FILTER_EVERY_US = 2000
 FILTER_SPAN_US = 2000
-FILTER_SAMPLES = 66
+FILTER_SAMPLES = 80
+FILTER_FOLLOWER_SAMPLES = 50
 FILTER_MEAN = 700
 FILTER_FLICKER = 12
 FILTER_HARMONIC = 4
@@ -81,7 +84,7 @@ FILTER_CORRECTS = 500
 # timed as `update`, those after as `update_rate` -- by then the rate's line
 # spans the protocol's FLICKER_RATE_MIN_S and every update fits it.
 FILTER_TRACK_POINTS = 8
-FILTER_UPDATES = 48
+FILTER_UPDATES = 64
 FILTER_RATE_BEFORE_S = 0.3
 FILTER_RATE_FROM_S = 0.7
 
@@ -166,9 +169,16 @@ class Hooks:
                  a callable giving (FAST_READS raw readings, the us they took)
                  or raising where the firmware cannot.
     temp         the chip's temperature in degrees C, or None where there is
-                 no sensor: read before every step and once at the end.
+                 no sensor: read before every step and once at the end --
+                 never while the ring step's DMA owns the ADC.
+    ring         the ring step's measurement: called with False (screen
+                 held) and True (presenting every pass), each giving a
+                 dict -- ring_listen()'s, or {"error": why there is no ring}.
     flicker_filter  the protocol's FlickerFilter class, or None to skip the
                  flicker_filter step.
+    replay       the POLLED Follower's late staircase replay, timed: called
+                 with no arguments, returns {"us": ..., "samples": ...}; or
+                 None. Its result goes under flicker_filter.replay (M7).
     cancelled    True to stop: B pressed. Checked after every frame.
     collect, enable, disable    gc.collect, gc.enable, gc.disable
     mem_alloc, mem_free         gc.mem_alloc, gc.mem_free, or None
@@ -176,7 +186,8 @@ class Hooks:
 
     def __init__(self, present, set_vsync, poll, clear, screens, cancelled, collect, enable, disable, mem_alloc=None,
                  mem_free=None, ticks_us=None, reads=(), temp=None, fast=(),
-                 reads_detail=None, flicker_filter=None):
+                 reads_detail=None, flicker_filter=None, ring=None,
+                 replay=None):
         self.present = present
         self.set_vsync = set_vsync
         self.poll = poll
@@ -189,11 +200,13 @@ class Hooks:
         self.mem_alloc = mem_alloc
         self.mem_free = mem_free
         self.ticks_us = ticks_us or time.ticks_us
+        self.replay = replay
         self.reads = reads
         self.temp = temp
         self.fast = fast
         self.reads_detail = reads_detail
         self.flicker_filter = flicker_filter
+        self.ring = ring
 
 
 class FrameProbe:
@@ -407,13 +420,38 @@ class FrameProbe:
                 break
         return out
 
+    # -- the DMA ring (Dev Mode M3)
+
+    def ring(self):
+        """The ring under the real EXACT listener, the screen held and then
+        presenting every pass: see ring_listen()."""
+        hooks = self.hooks
+        if hooks.ring is None:
+            return {"error": "no ring hook"}
+        out = {}
+        for name, presenting in (("quiet", False), ("presenting", True)):
+            try:
+                out[name] = hooks.ring(presenting)
+            except Exception as error:     # noqa: BLE001
+                out[name] = _error(error)
+            if hooks.cancelled():
+                self.cancelled = True
+                break
+        return out
+
     # -- alloc and the flicker filter: module functions, below
 
     def alloc(self):
         return alloc_costs(self.hooks.ticks_us)
 
     def flicker_filter(self):
-        return filter_costs(self.hooks.flicker_filter, self.hooks.ticks_us)
+        out = filter_costs(self.hooks.flicker_filter, self.hooks.ticks_us)
+        if self.hooks.replay is not None and "error" not in out:
+            try:
+                out["replay"] = self.hooks.replay()
+            except Exception as error:     # noqa: BLE001
+                out["replay"] = _error(error)
+        return out
 
     # -- gc
 
@@ -502,6 +540,101 @@ def fast_stats(values, us):
             "mean": round(mean * COUNTS_PER_RAW, 1), "noise": noise}
 
 
+# -- the DMA ring ------------------------------------------------------------
+# Dev Mode M3: an EXACT listener -- a Follower in the data phase on the 8 ms
+# rung, reading through the ring -- run as the transfer loop runs it, for
+# RING_LISTEN_MS. What it settles: the ring's real rate and whether readings
+# are lost (fifo_over, faults), how far behind the protocol falls (lag_max_us)
+# and what a decided slot costs on this badge (slot_work), what the uncached
+# kernels cost, whether a collection mid-listen overruns the ring, and how
+# much garbage a slot leaves.
+
+RING_LISTEN_MS = 2000
+RING_LONG_PASS_US = 5000
+RING_KERNEL_READS = 1000
+
+
+def ring_listen(transfer, ticks_us, present=None, poll=None, collect=None,
+                mem_free=None, cancelled=None, ms=RING_LISTEN_MS):
+    """Runs `transfer` -- listening, through its RingReader, already started
+    -- for `ms`, calling `present` every pass if given. Its budgets are reset
+    every pass: nobody is sending."""
+    reader = transfer.reader
+    ring = reader.ring
+    work = TimeStats()
+    per_slot = TimeStats()
+    passes = TimeStats()
+    slots = 0
+    long_passes = 0
+    lag_max = 0
+    gc_ms = None
+    lost_at_gc = None
+    free_start = mem_free() if mem_free is not None else None
+    start_us = ticks_us()
+    start_position = ring.position()
+    start = reader.now_us()
+    end = start + ms * 1000
+    gc_at = start + ms * 500
+    last = ticks_us()
+    while True:
+        now = reader.now_us()
+        if now >= end:
+            break
+        if present is not None:
+            present()
+        if collect is not None and gc_ms is None and now >= gc_at:
+            lost_at_gc = reader.lost
+            a = ticks_us()
+            collect()
+            gc_ms = time.ticks_diff(ticks_us(), a) / 1000.0
+        reader.pump(transfer.due_us())
+        t = reader.now_us()
+        lag = t - reader.newest_us()
+        if lag > lag_max:
+            lag_max = lag
+        a = ticks_us()
+        transfer.field_at(t)
+        transfer.work(t)
+        w = time.ticks_diff(ticks_us(), a)
+        work.add(w)
+        if transfer.work_slots:
+            slots += transfer.work_slots
+            per_slot.add(w // transfer.work_slots)
+        transfer.idle_slots = 0
+        transfer.stall_slots = 0
+        if poll is not None:
+            poll()
+        b = ticks_us()
+        gap = time.ticks_diff(b, last)
+        passes.add(gap)
+        if gap > RING_LONG_PASS_US:
+            long_passes += 1
+        last = b
+        if cancelled is not None and cancelled():
+            break
+    us = time.ticks_diff(ticks_us(), start_us)
+    readings = ring.position() - start_position
+    reader.check()
+    out = {"rate_hz": round(readings * 1000000.0 / us) if us > 0 else 0,
+           "anchor_spread_us": reader.anchor_width,
+           "fifo_over": reader.lost, "faults": reader.faults,
+           "drift": reader.drift, "lag_max_us": lag_max,
+           "work": work.rate(), "slot_work": per_slot.rate(), "slots": slots,
+           "passes": passes.rate(), "long_passes": long_passes,
+           "rung_ms": transfer.clock.duration // 1000}
+    position = ring.position()
+    a = ticks_us()
+    ring.sum(position - 2 * RING_KERNEL_READS, RING_KERNEL_READS)
+    out["kernel_us_per_1000"] = time.ticks_diff(ticks_us(), a)
+    if gc_ms is not None:
+        out["gc_ms"] = gc_ms
+        out["gc_overran"] = reader.lost > lost_at_gc
+    if free_start is not None and slots:
+        out["garbage_per_slot"] = round(
+            (free_start - mem_free()) / float(slots), 1)
+    return out
+
+
 # -- allocation --------------------------------------------------------------
 # A tuple is a 4-byte type, a 4-byte length and 4 bytes an item, so with the
 # default 16-byte GC blocks a pair is one block, four items two and eight
@@ -584,9 +717,9 @@ def filter_costs(flicker_filter, ticks_us):
     fit_t = ts[:FILTER_SAMPLES]
     fit_v = vs[:FILTER_SAMPLES]
     fit_s = spans[:FILTER_SAMPLES]
-    half = FILTER_SAMPLES // 2
+    half = FILTER_SAMPLES - FILTER_FOLLOWER_SAMPLES
     out = {"samples": FILTER_SAMPLES,
-           "follower_samples": FILTER_SAMPLES - half}
+           "follower_samples": FILTER_FOLLOWER_SAMPLES}
     flicker = flicker_filter()
     t = ticks_us()
     verdict = flicker.fit(fit_t, fit_v, fit_s)
