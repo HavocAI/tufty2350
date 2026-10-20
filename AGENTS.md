@@ -244,8 +244,8 @@ Pimoroni set plus other team apps; see [README.md](README.md).
   **The documents** ([.agents/README.md](.agents/README.md) indexes them):
   the protocol in [.agents/optical_data_transfer/](.agents/optical_data_transfer)
   -- `spec.md` **the authority**, `context.md` its reasons, `tests.md` its
-  checks (the three link to nothing outside themselves, so an agent with
-  only `main` can work from them), `data.md` the evidence,
+  checks (the three link only to each other and to `data.md`, so an agent
+  with only that folder can work from them), `data.md` the evidence,
   `invariants.md` what the simulator asserts; the app in
   [.agents/share_wifi/](.agents/share_wifi) -- `app-spec.md` and the
   briefing `state.md`. Keep the spec and the code in step when either

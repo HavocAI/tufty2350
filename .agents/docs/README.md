@@ -29,7 +29,7 @@ reasoning: the simulator answers most API questions in a minute.
 | How do I draw, animate, transform? | [badgeware-graphics.md](badgeware-graphics.md) |
 | What can the Tufty 2350 physically do? | [badgeware-hardware.md](badgeware-hardware.md) |
 | What did the badge actually measure? | [../optical_data_transfer/data.md](../optical_data_transfer/data.md): every measurement and sweep the optical link rests on -- the only record; the raw files were deleted on 2026-10-19 |
-| How do two badges talk over the screen and light sensor? | [../optical_data_transfer/spec.md](../optical_data_transfer/spec.md), **the authority**; why each value is what it is, [context.md](../optical_data_transfer/context.md); how to check an implementation, [tests.md](../optical_data_transfer/tests.md). The three link to nothing else, so they stand alone |
+| How do two badges talk over the screen and light sensor? | [../optical_data_transfer/spec.md](../optical_data_transfer/spec.md), **the authority**; why each value is what it is, [context.md](../optical_data_transfer/context.md); how to check an implementation, [tests.md](../optical_data_transfer/tests.md). The three link only to each other and to `data.md` beside them, so the folder stands alone |
 | How much light reaches the sensor, and what would a second badge give? | [../optical_data_transfer/optical-coupling.md](../optical_data_transfer/optical-coupling.md) |
 | New to share_wifi and the optical link? Where does it all stand? | [../share_wifi/state.md](../share_wifi/state.md): the briefing for a new agent |
 | What does `share_wifi` do on top of that protocol? | [../share_wifi/app-spec.md](../share_wifi/app-spec.md) |

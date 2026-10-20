@@ -23,7 +23,8 @@ every scenario delivering. **On hardware, one badge facing a mirror** has
 run every piece a transfer uses -- the ring reader, the slot-rate symbols,
 the fast blocks through the protocol's own code -- and decoded them. **Two
 badges have never completed a transfer: there is no second badge.**
-Everything is uncommitted on branch `terrys_toys`, after commit `fdb5ac2`.
+The work is committed on branch `terrys_toys` as `055c262` ("completed
+v2 protocol", 2026-10-19).
 
 ## 2. Rules for working here
 
@@ -267,7 +268,7 @@ retune costs are the badge's. It missed one real failure until 2026-10-12
 (its ring never overwrote and it priced training at 75 ms); fixed, it
 reproduced the badge's losses ([data §10.4](../optical_data_transfer/data.md#L424)).
 
-## 8. Recent changes (uncommitted)
+## 8. Recent changes
 
 - **2026-10-19: the docs reorganised.** The protocol's documents are in
   `.agents/optical_data_transfer/`, the app's in `.agents/share_wifi/`;
