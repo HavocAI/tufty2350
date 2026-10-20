@@ -724,7 +724,10 @@ and DOWN are held too.
    the launcher, `/system/main.py`.
 
 Fonts are in ROMFS at `/rom/fonts`. MicroPython 1.27, the C object
-representation (floats are boxed-free with reduced precision), the GC heap
+representation `MICROPY_OBJ_REPR_A`, under which **every float is a heap
+object**, boxed on each arithmetic result, single precision (32-bit)
+**[source-v2, `py/objfloat.c`]** -- an earlier note here said floats were
+box-free; the GC heap
 in 8MB of PSRAM with **16-byte blocks** -- so any object bigger than one
 block, a 4-tuple or a `rect`, is slow to allocate: 65-145 us, varying run to
 run, against 2.9 us for a pair **[measured-v2]**. No threads. Frozen in: networking, `urllib.urequest`,

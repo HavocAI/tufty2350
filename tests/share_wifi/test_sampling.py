@@ -14,14 +14,6 @@ import simulator
 from harness import load_module
 
 P = load_module("share_wifi", "protocol")
-# Dev Mode's slot receiver, the one the transfer ran until 2026-10-07.
-M = load_module("share_wifi", "measure")
-
-
-def levels():
-    out = P.Levels()
-    out.fit(200, 4250, 9200)
-    return out
 
 
 def run_counting_crc_bad(skew, scenario="ideal", seed=1):
@@ -42,45 +34,13 @@ def run_counting_crc_bad(skew, scenario="ideal", seed=1):
     return link, rejected[0], seconds
 
 
-# --- the receiver -----------------------------------------------------------
-
-def test_a_sample_of_the_next_symbol_at_the_very_end_of_a_slot_is_ignored():
-    # The failing slot, reduced: two settled samples of the middle level, then
-    # one taken 3ms before the boundary that has already caught the high
-    # symbol after it. Counted, the median of the two settled samples is the
-    # higher, and the slot decodes as high.
-    clock = P.SlotClock()
-    clock.start(0, P.SLOT_LADDER.index(50))
-    receiver = M.SlotReceiver(clock, levels(), frame_ms=11)
-    for now, value in ((4, 9200), (15, 4250), (26, 4250), (37, 4250), (47, 9200)):
-        assert receiver.feed(now, value) is None
-    settled = receiver.settled[:receiver.n_settled]
-    assert settled == [4250, 4250], settled
-    assert receiver.feed(52, 9200) == P.MID
-
-
-def test_the_guard_never_leaves_a_slot_without_a_frame_to_decide_from():
-    # A badge never picks a slot shorter than 2.5 frames, and the window that
-    # decides it must still be at least one frame long, or a slot could catch
-    # no settled sample and be decided from its front -- the last symbol's.
-    for frame in range(8, 21):
-        for duration in P.SLOT_LADDER:
-            if duration < frame * 2.5:
-                continue
-            guard = min(frame * P.END_GUARD_PERCENT // 100,
-                        duration // 2 - frame * 6 // 5)
-            window = duration - max(0, guard) - duration // 2
-            assert window >= frame, \
-                "%dms slots at %dms frames: a %dms window" % (duration, frame, window)
-
-
 # --- end to end -------------------------------------------------------------
 
 def test_the_run_that_found_it_no_longer_rejects_its_first_block():
     link, rejected, seconds = run_counting_crc_bad(150)
     assert rejected == 0, "CRC Bad %d times" % rejected
     assert link.leader.transfer.result == P.OK
-    assert P.parse_payload(link.follower.transfer.received) == list(simulator.TYPICAL)
+    assert link.follower.transfer.received == list(simulator.TYPICAL)
     # 23 s on the 80 ms rung; a resent block adds several more.
     assert seconds < 26, "took %.1fs: something was resent" % seconds
 
@@ -95,25 +55,3 @@ def test_no_start_skew_in_the_ideal_scenario_rejects_a_crc():
         "CRC Bad at these skews: %s" % dict((k, v) for k, v in rejected.items() if v)
 
 
-def test_the_leader_keeps_its_own_grid_for_the_crc_reply():
-    # The Leader does not re-base onto the Follower's CRC: it hears only one
-    # silent slot before the reply, short of the 1.5 that phase locking wants.
-    # That looks like an omission and is not. Giving the reply a black lead-in
-    # so the Leader could lock cost 16-21 deliveries in 384 simulated runs:
-    # with both badges re-basing onto each other every message, their
-    # estimates' errors stack. The Leader's grid is the reference; the
-    # Follower follows it.
-    link = simulator.build(P, simulator.TYPICAL, seed=1,
-                           **simulator.SCENARIOS["realistic"])
-    leader = link.leader.transfer
-    rebased = []
-    rebase = leader.rebase
-
-    def recording(boundary, now):
-        rebased.append(leader.sub)
-        return rebase(boundary, now)
-    leader.rebase = recording
-    link.run(200)
-    assert leader.result == P.OK
-    assert leader.STEP_CRC not in rebased, \
-        "the Leader re-based onto a CRC reply: %r" % rebased

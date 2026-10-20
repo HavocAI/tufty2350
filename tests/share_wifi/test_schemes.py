@@ -1,11 +1,9 @@
-"""The light-level schemes: fields for the beacons, the backlight for the rest.
+"""The light levels: every symbol a backlight level behind a white screen.
 
-There is one calibration for every pair now: one staircase each way, in the
-backlight scheme. Fields was the fallback for a sensor that follows the
-backlight's PWM, which the badge's does not [measured-all], and its 80 ms
-floor made it five to ten times slower; it is kept for the beacons, which
-are drawn before anything is calibrated. See "Light levels and symbols" and
-"Calibration" in the protocol.
+Two tables in protocol.LEVEL_SCHEMES, each display.backlight() per symbol:
+SCHEME_BEACON for the beacons -- off and full -- and SCHEME_BACKLIGHT, with
+its dim low, from the staircases on. There are no pixel levels: the screen
+is white from before a transfer to after it. See section 4 of the protocol spec.
 """
 
 import math
@@ -15,19 +13,25 @@ import simulator
 from harness import load_module
 
 P = load_module("share_wifi", "protocol")
-FIELDS, BACKLIGHT = P.SCHEME_FIELDS, P.SCHEME_BACKLIGHT
+BACKLIGHT = P.SCHEME_BACKLIGHT
 
 
-def measured_staircase(order, sample_ms=P.CAL_SAMPLE_MS, settle_ms=4,
-                       noise=80, seed=1):
-    """A StaircaseReader fed one staircase through a lagging sensor."""
+def measured_staircase(settle_ms=4, noise=80, seed=1, lit=False):
+    """A StaircaseReader fed a Follower's staircase through a lagging
+    sensor, a sample every FINE_MS."""
     rng = random.Random(seed)
+    sample_ms = P.FINE_MS
     tau = settle_ms / 2.3
+    reps = P.CAL_REPS_FAST_LIT if lit else P.CAL_REPS_FAST
+    length = P.staircase_ms(reps, P.CAL_OPEN_FAST_MS, P.PLATEAU_FAST_MS,
+                            P.CAL_GAP_FAST_MS)
     level, t = 0.0, 0
     shares = {P.LOW: 0.0, P.MID: 0.45, P.HIGH: 1.0}
     reader = P.StaircaseReader()
-    while t < P.STAIRCASE_MS + 600:
-        field = P.staircase_field(t, order) if t < P.STAIRCASE_MS else P.LOW
+    while t < length + 600:
+        field = P.staircase_field(t, P.STAIRCASE, reps, P.CAL_OPEN_FAST_MS,
+                                  P.PLATEAU_FAST_MS) \
+            if t < length else P.LOW
         level += (shares[field] - level) * (1 - math.exp(-sample_ms / tau))
         light = int(200 + level * 9000 + rng.uniform(-noise, noise))
         if reader.feed(t, light):
@@ -36,37 +40,55 @@ def measured_staircase(order, sample_ms=P.CAL_SAMPLE_MS, settle_ms=4,
     return reader
 
 
-# --- the order flag: the reader tier ------------------------------------------
+# --- the staircase's levels through a lagging sensor ------------------------
 
-def test_the_order_of_a_staircase_can_be_read_back_out_of_its_samples():
-    for order in (P.ASCENDING, P.REVERSED):
+def test_a_staircase_through_a_lagging_sensor_reads_back_three_levels():
+    """The order is the fast flag, tested in test_handshake.py: here what
+    matters is that the levels and the light come back out of the samples,
+    lit and dark."""
+    for lit in (True, False):
         for seed in (1, 2, 3):
-            reader = measured_staircase(order, seed=seed)
+            reader = measured_staircase(seed=seed, lit=lit)
             levels = reader.levels()
-            assert levels is not None
-            rising, falling, _ = P.staircase_steps(reader.values, levels)
-            read = P.REVERSED if falling > rising else P.ASCENDING
-            assert read == order, \
-                "seed %d: read %r back as the other order" % (seed, order)
+            assert levels is not None, (lit, seed)
+            assert abs(levels.black - 200) < 200
+            assert abs(levels.grey - (200 + 0.45 * 9000)) < 400
+            assert abs(levels.white - 9200) < 400
+            highs = P.staircase_highs(reader.values, levels)
+            assert (highs <= P.LIT_STEPS_MAX_FAST) == lit, (lit, seed)
 
 
-def test_order_does_not_change_the_levels_calibration_measures():
-    up = measured_staircase(P.ASCENDING).levels()
-    down = measured_staircase(P.REVERSED).levels()
-    for name in ("black", "grey", "white"):
-        assert abs(getattr(up, name) - getattr(down, name)) < 200, name
+# --- the tables -----------------------------------------------------------------
+
+def test_every_level_is_a_backlight_value_and_nothing_else():
+    """No pixel signalling: each table maps a symbol to one
+    display.backlight() value, and there are only the two tables."""
+    assert set(P.LEVEL_SCHEMES) == {P.SCHEME_BACKLIGHT, P.SCHEME_BEACON}
+    for table in P.LEVEL_SCHEMES.values():
+        assert set(table) == {P.LOW, P.MID, P.HIGH}
+        for value in table.values():
+            assert isinstance(value, float) and 0.0 <= value <= 1.0, value
+    for name in ("SCHEME_FIELDS", "MID_FIELD_RGB", "LCD_SETTLE_MS",
+                 "BACKLIGHT_SETTLE_MS", "END_GUARD_PERCENT"):
+        assert not hasattr(P, name), name
 
 
-# --- which scheme when -----------------------------------------------------------
-
-def test_the_backlight_scheme_never_changes_a_pixel():
-    pixels = set(p for p, _ in P.LEVEL_SCHEMES[BACKLIGHT].values())
-    assert pixels == {"white"}
-    assert P.LEVEL_SCHEMES[BACKLIGHT][P.LOW][1] == P.LOW_BACKLIGHT
-    assert P.LEVEL_SCHEMES[BACKLIGHT][P.MID][1] == P.MID_BACKLIGHT
+def test_the_data_table():
+    table = P.LEVEL_SCHEMES[BACKLIGHT]
+    assert table == {P.LOW: P.LOW_BACKLIGHT, P.MID: P.MID_BACKLIGHT,
+                     P.HIGH: 1.0}
+    assert P.LOW_BACKLIGHT < P.MID_BACKLIGHT < 1.0
 
 
-def test_beacons_are_fields_and_everything_after_is_the_backlight():
+def test_the_beacon_table_is_the_backlight_off_or_full():
+    beacon = P.LEVEL_SCHEMES[P.SCHEME_BEACON]
+    assert beacon[P.LOW] == P.BEACON_LOW_BACKLIGHT == 0.0
+    assert beacon[P.HIGH] == 1.0
+    # Off is off on both firmwares, unlike the dim low.
+    assert simulator.backlight_duty_v2(0.0) == simulator.backlight_duty(0.0) == 0
+
+
+def test_beacons_are_beacons_and_everything_after_is_the_backlight():
     link = simulator.build(P, simulator.TYPICAL, seed=1,
                            **simulator.SCENARIOS["realistic"])
     seen = {}
@@ -79,6 +101,7 @@ def test_beacons_are_fields_and_everything_after_is_the_backlight():
     link.run(200)
     link.assert_invariants()
     assert link.leader.transfer.result == P.OK
-    assert seen[P.PHASE_ANNOUNCE] == {FIELDS}
+    assert seen[P.PHASE_ANNOUNCE] == {P.SCHEME_BEACON}
+    assert seen[P.PHASE_LISTEN] == {P.SCHEME_BEACON}
     assert seen[P.PHASE_DATA] == {BACKLIGHT}
     assert BACKLIGHT in seen[P.PHASE_CAL_SEND]

@@ -24,16 +24,18 @@ reasoning: the simulator answers most API questions in a minute.
 
 | Question | File |
 |---|---|
-| What did the badge actually measure? | [hardware-measurement-2026-09-23.json](hardware-measurement-2026-09-23.json), [-10-03](hardware-measurement-2026-10-03.json), [-10-04](hardware-measurement-2026-10-04.json), [-10-05](hardware-measurement-2026-10-05.json), [-10-05b](hardware-measurement-2026-10-05b.json) (*probe frame timing* only), [-10-05c](hardware-measurement-2026-10-05c.json) (the first with `backlight_step`), [-10-05d](hardware-measurement-2026-10-05d.json), [-10-05e](hardware-measurement-2026-10-05e.json) (the first with no blind stretch in `backlight_step`), [-10-06](hardware-measurement-2026-10-06.json) (loopback, room flicker, temperature); summarised under "What the measurement found" in the protocol |
-| How much light reaches the sensor, and what would a second badge give? | [optical-coupling.md](optical-coupling.md) |
 | How do I write this? What does working code look like? | [badgeware-patterns.md](badgeware-patterns.md) |
 | What is this call, exactly? | [badgeware-api.md](badgeware-api.md) for v3; **[badgeware-api-v2.md](badgeware-api-v2.md) for the badge on the desk** -- every v2 call, read from the v2.0.2 source |
 | How do I draw, animate, transform? | [badgeware-graphics.md](badgeware-graphics.md) |
 | What can the Tufty 2350 physically do? | [badgeware-hardware.md](badgeware-hardware.md) |
-| How do two badges talk over the screen and light sensor? | [optical-data-transfer-protocol.md](optical-data-transfer-protocol.md) |
-| What does `share_wifi` do on top of that protocol? | [share_wifi_spec.md](share_wifi_spec.md) |
+| What did the badge actually measure? | [../optical_data_transfer/data.md](../optical_data_transfer/data.md): every measurement and sweep the optical link rests on -- the only record; the raw files were deleted on 2026-10-19 |
+| How do two badges talk over the screen and light sensor? | [../optical_data_transfer/spec.md](../optical_data_transfer/spec.md), **the authority**; why each value is what it is, [context.md](../optical_data_transfer/context.md); how to check an implementation, [tests.md](../optical_data_transfer/tests.md). The three link to nothing else, so they stand alone |
+| How much light reaches the sensor, and what would a second badge give? | [../optical_data_transfer/optical-coupling.md](../optical_data_transfer/optical-coupling.md) |
+| New to share_wifi and the optical link? Where does it all stand? | [../share_wifi/state.md](../share_wifi/state.md): the briefing for a new agent |
+| What does `share_wifi` do on top of that protocol? | [../share_wifi/app-spec.md](../share_wifi/app-spec.md) |
 | How do I test an app without a badge? | [testing.md](testing.md) |
-| What is being worked on right now? | [.agents/README.md](../README.md) |
+| How do I measure on the badge (the USB dev link, its host program, the measurement subtools)? | "USB dev link" in [../share_wifi/app-spec.md](../share_wifi/app-spec.md); the how-to and hardware checklist in [testing.md](testing.md); the CDC facts under "USB serial" in [badgeware-hardware.md](badgeware-hardware.md) |
+| What is being worked on right now? | [../tasks/README.md](../tasks/README.md) |
 
 **Start with the patterns file.** The others are reference: accurate, but they
 will not tell you which of two documented approaches to pick, or which
@@ -108,8 +110,8 @@ differs, and which claims were measured on which, is the first table in
 - **`light_level()` is 12-bit in a 16-bit frame** — every reading is a multiple
   of 16. The panel's full swing measured five of those steps against two of
   noise, which is not enough for three-level signalling.
-  **[measured-all]**, see
-  [hardware-measurement-2026-09-23.json](hardware-measurement-2026-09-23.json).
+  **[measured-all]**, see section 3 of
+  [../optical_data_transfer/data.md](../optical_data_transfer/data.md).
 
 ## Keeping these honest
 

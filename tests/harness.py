@@ -23,11 +23,15 @@ if not hasattr(time, "ticks_ms"):
     time.ticks_us = lambda: int(time.monotonic() * 1000000)
     time.ticks_diff = lambda a, b: a - b
     time.ticks_add = lambda a, b: a + b
+if not hasattr(time, "sleep_ms"):
+    # Tests never wait: a Dev Mode run's start delay passes at once.
+    time.sleep_ms = lambda ms: None
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # Every app is a folder here, which is also what the firmware image packs
 # into /system/apps.
 APPS = os.path.join(REPO, "firmware", "apps")
+TESTS = os.path.join(REPO, "tests")
 
 
 class Skipped(Exception):
@@ -478,6 +482,10 @@ def load_module(app, module):
     path = os.path.join(APPS, app)
     if path not in sys.path:
         sys.path.insert(0, path)
+    # The dev link's libraries, which go to the badge only over the link.
+    lib = os.path.join(TESTS, app, "devtests", "lib")
+    if os.path.isdir(lib) and lib not in sys.path:
+        sys.path.insert(1, lib)
     return importlib.import_module(module)
 
 

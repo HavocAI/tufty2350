@@ -7,21 +7,70 @@ on what was drawn. They check the state machine, not the appearance.
 import math
 import time
 
+from held import HeldTransfer
 from harness import FakeSecrets, load_module
+import held
 from harness import load_app as harness_load_app
 
 
 def load_app(*args, **kwargs):
     """The app, with its transfer loop taking one reading per update().
 
-    On the badge the loop reads until the pixels must change, which a test
-    that scripts one field a frame -- or steps a real transfer whose peer
-    never appears -- would never reach. The loop itself is tested below with
+    On the badge the loop reads until the transfer ends, which a test that
+    scripts one symbol a frame -- or steps a real transfer whose peer never
+    appears -- would never reach. The loop itself is tested below with
     TRANSFER_PASSES as the badge has it.
     """
     namespace = harness_load_app(*args, **kwargs)
     namespace["TRANSFER_PASSES"] = 1
+    give_ring(namespace)
+    give_pacer(namespace)
     return namespace
+
+
+class FakePacer:
+    """fasttx.Pacer as the app uses it, playing nothing: CPython has no
+    DMA, and a Leader needs a pacer to share."""
+
+    def __init__(self):
+        self.played = []
+
+    def opened(self, div16):
+        return self
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def cc_for(self, backlight, level):
+        return int(level * 1000)
+
+    def word(self, cc):
+        return cc
+
+    def transmit(self, div16, words, n):
+        self.played.append(n)
+
+    def release(self):
+        pass
+
+
+def give_pacer(namespace):
+    """The fast block's pacer, as fast_pacer() would have made it."""
+    from array import array
+    namespace["_FAST"]["pacer"] = (FakePacer(), 16, array("I", bytes(4 * 8000)))
+
+
+def give_ring(namespace):
+    """The DMA ring a transfer reads through, as ring_reader() would have
+    made it: a RingReader over a ListRing nothing fills, on the real clock.
+    Under CPython there is no `machine`, so ring_reader() itself refuses."""
+    readers = namespace["readers"]
+    namespace["_READERS"]["ring"] = readers.RingReader(
+        held.ListRing(4096, 20))
+    namespace["_READERS"]["note"] = None
 
 # The protocol's own names, for those the app does not import itself.
 protocol = load_module("share_wifi", "protocol")
@@ -136,7 +185,7 @@ def test_share_builds_a_payload_from_the_chosen_network():
     assert transfer.leader is True
     assert transfer.payload == [b"Cafe", b"flatwhite",
                                 bytes([namespace["SEC_UNKNOWN"]])]
-    assert transfer.blocks, "payload should already be split into blocks"
+    assert transfer.fast is not None, "a Leader shares in fast blocks"
 
 
 def test_receive_starts_as_the_follower_with_no_payload():
@@ -195,9 +244,9 @@ def test_failed_connection_shows_the_status_description():
 def test_received_credential_is_saved_and_merged():
     # State.modify merges. State.save would drop every other network.
     namespace, app = app_with(CREDENTIALS)
-    transfer = namespace["Transfer"](False)
+    transfer = HeldTransfer(False)
     transfer.result = namespace["OK"]
-    transfer.received = protocol.build_tokens(b"NewNet", b"letmein123")
+    transfer.received = [b"NewNet", b"letmein123"]
     app.finish_transfer(transfer)
 
     stored = namespace["State"].data
@@ -208,9 +257,9 @@ def test_received_credential_is_saved_and_merged():
 
 def test_undecodable_received_payload_reports_decode_error():
     namespace, app = app_with()
-    transfer = namespace["Transfer"](False)
+    transfer = HeldTransfer(False)
     transfer.result = namespace["OK"]
-    transfer.received = list(b"no separator here")
+    transfer.received = [b"one field only, no key or type"[:40] * 2]
     app.finish_transfer(transfer)
     assert app.error == namespace["ERR_DECODE"]
 
@@ -455,120 +504,60 @@ def test_a_centred_line_is_placed_not_just_emitted():
         "centred text was left at the margin: x=%r" % (args[0],)
 
 
-# --- the three transmit fields ----------------------------------------------
-# Two schemes, from protocol.LEVEL_SCHEMES: SCHEME_FIELDS (the default) puts the
-# level in the pixels at full backlight, SCHEME_BACKLIGHT puts it in the
-# backlight with white pixels. Calibration rejects a staircase unless
-# L_mid - L_black >= span / 4 and L_white - L_mid >= span / 4, so a middle level
-# outside that window makes every transfer end ERR_CONTRAST no matter how good
-# the optics are. Checking that is pure arithmetic: no part of it waits on a
-# badge.
+# --- the levels: the backlight on a white screen ----------------------------
+# Every symbol is a display.backlight() value from protocol.LEVEL_SCHEMES,
+# behind a white screen drawn once. Calibration rejects a staircase unless
+# L_mid - L_black >= span / 4 and L_white - L_mid >= span / 4, so a middle
+# level outside that window makes every transfer end ERR_CONTRAST no matter
+# how good the optics are. simulator.backlight_duty() is the firmware's own
+# value-to-duty curve, read out of modules/c/st7789/, and light is taken as
+# proportional to duty -- true for an averaging sensor, which the badge's
+# is [measured-v2].
 
 import simulator
 
-# Relative luminance of the panel's output. Gamma is unmeasured beyond one
-# mirror run, so the plausible range is checked: 1.0 (the framebuffer value IS
-# the light) to 2.5. A field set that works at one end and not the other is not
-# a field set.
 
-PANEL_BLACK = (0, 0, 0)          # FIELD_BLACK: not the palette's tinted
-PANEL_WHITE = (255, 255, 255)    # FIELD_WHITE  color.black and color.white
-PALETTE_GREY = (78, 74, 78)      # color.grey -- what this used to transmit
-
-
-def luminance(rgb, gamma):
-    r, g, b = rgb
-    return (0.2126 * (r / 255.0) ** gamma
-            + 0.7152 * (g / 255.0) ** gamma
-            + 0.0722 * (b / 255.0) ** gamma)
-
-
-def separation(mid, gamma):
-    """(low gap, high gap) as fractions of the swing, per the spec's check."""
-    black = luminance(PANEL_BLACK, gamma)
-    white = luminance(PANEL_WHITE, gamma)
-    span = white - black
-    return (luminance(mid, gamma) - black) / span, (white - luminance(mid, gamma)) / span
-
-
-def schemes(namespace):
-    return (namespace["SCHEME_FIELDS"], protocol.SCHEME_BACKLIGHT)
-
-
-def fields_of(namespace, scheme=None):
-    """(FIELD_COLOR, FIELD_BACKLIGHT) for one scheme, fields by default."""
-    scheme = scheme or namespace["SCHEME_FIELDS"]
-    return namespace["FIELD_COLOR"][scheme], namespace["FIELD_BACKLIGHT"][scheme]
-
-
-def test_the_fields_scheme_holds_the_backlight_at_full():
-    # Beacons are drawn in it, before anything is calibrated.
-    namespace, app = app_with()
-    colors, lights = fields_of(namespace)
-    assert set(lights.values()) == {1.0}, \
-        "the fields scheme should hold the backlight at full"
-
-
-def test_a_transfer_reads_through_the_launchs_reader():
-    # Under CPython there is no `machine`, so no ring: the POLLED reader,
-    # light_level() into bins, made once per launch and the reason kept.
+def test_a_transfer_reads_through_the_launchs_ring():
     namespace, app = app_with(CREDENTIALS)
     frame(namespace, "DOWN")
     frame(namespace, "A")                 # Receive
     frame(namespace, "A")                 # past the alignment line
     reader = app.transfer.reader
-    assert reader is namespace["polled_reader"]()
-    assert not app.transfer.exact
-    assert namespace["ring_reader"]() is None
-    assert namespace["ring_note"](), "why there is no ring is kept"
+    assert reader is namespace["ring_reader"]()
+    assert type(reader) is namespace["readers"].RingReader
     app.transfer = None
     app.begin_transfer(False)
     assert app.transfer.reader is reader, "one reader per launch"
 
 
-def test_the_app_draws_each_scheme_from_the_protocols_table():
-    namespace, app = app_with()
-    for scheme in schemes(namespace):
-        colors, lights = fields_of(namespace, scheme)
-        for symbol, (pixels, light) in namespace["LEVEL_SCHEMES"][scheme].items():
-            assert colors[symbol] == namespace["field_pen"](pixels)
-            assert lights[symbol] == light
+def test_a_badge_without_the_ring_refuses_to_transfer_and_says_why():
+    # Under CPython fastadc cannot import `machine`: the ring is refused, as
+    # on a firmware without what it needs, and there is no other reader.
+    namespace = harness_load_app("share_wifi", networks=CREDENTIALS)
+    app, badge, display = namespace["app"], namespace["badge"], \
+        namespace["display"]
+    frame(namespace, "DOWN")
+    frame(namespace, "A")                 # Receive
+    frame(namespace, "A")                 # past the alignment line
+    assert app.transfer is None, "a transfer started without the ring"
+    assert app.screen == "result"
+    note = namespace["ring_note"]()
+    assert note, "why there is no ring is kept"
+    assert namespace["NO_RING_TEXT"] in app.error and note in app.error
+    assert display.backlights[-1] == namespace["BACKLIGHT_NORMAL"]
+    assert badge.default_clear is not None
+    drawn = frame(namespace)
+    text = " ".join(str(d) for d in drawn)
+    assert "light" in text, list(drawn)
+    # A retry would meet the same refused ring: only a relaunch helps.
+    assert "Retry" not in text, list(drawn)
+    frame(namespace, "B")
+    assert app.screen == "result", "B retried a refused ring"
+    for name in ("polled_reader", "transfer_reader", "RING_ENABLED"):
+        assert name not in namespace, name
 
-
-# The fields scheme.
-
-def test_the_middle_field_can_actually_be_calibrated():
-    namespace, app = app_with()
-    mid = fields_of(namespace)[0][protocol.MID]
-    assert mid[0] == "rgb", "the middle field should be named, not a palette entry"
-    for gamma in (1.0, 1.4, 1.8, 2.2, 2.5):
-        low, high = separation(mid[1:4], gamma)
-        assert low >= 0.25, "gamma %.1f: only %.0f%% above black" % (gamma, low * 100)
-        assert high >= 0.25, "gamma %.1f: only %.0f%% below white" % (gamma, high * 100)
-
-
-def test_the_palette_grey_is_kept_out_of_the_transmit_fields():
-    # Named so the next person to reach for color.grey finds out why not here
-    # rather than on two badges pointed at each other. It fails the check above
-    # at every gamma.
-    low, _ = separation(PALETTE_GREY, 2.2)
-    assert low < 0.25, "color.grey passes now; this test has gone stale"
-    namespace, app = app_with()
-    color = namespace["color"]
-    fields = fields_of(namespace)[0]
-    assert fields[protocol.MID] != color.grey
-    assert len(set((fields[protocol.LOW], fields[protocol.MID],
-                    fields[protocol.HIGH]))) == 3, \
-        "the three fields must be three distinct colours"
-
-
-# The backlight scheme. simulator.backlight_duty() is the firmware's own
-# value-to-duty curve, read out of modules/c/st7789/, and light is taken as
-# proportional to duty -- true for an averaging sensor, the one case this
-# scheme can work in. [inferred-v3]
 
 def test_the_backlight_middle_level_can_actually_be_calibrated():
-    namespace, app = app_with()
     share = simulator.backlight_duty(protocol.MID_BACKLIGHT)
     assert share >= 0.25, "only %.0f%% above black" % (share * 100)
     assert 1 - share >= 0.25, "only %.0f%% below white" % ((1 - share) * 100)
@@ -582,93 +571,41 @@ def test_the_obvious_backlight_values_are_kept_out_of_the_middle():
     for value in (0.25, 0.33):
         assert simulator.backlight_duty(value) < 0.25, \
             "backlight %.2f passes now; this test has gone stale" % value
-    namespace, app = app_with()
     assert protocol.MID_BACKLIGHT not in (0.25, 0.33)
 
 
-def test_the_backlight_scheme_never_changes_a_pixel():
-    # Every symbol is white pixels; only the backlight moves, low being off.
-    # A backlight change is live at once, where a pixel change waits for a
-    # present and the liquid crystal's settle -- so the scheme is fast only
-    # if it never touches a pixel. show_full() compares pens by identity, so
-    # one pen object is what makes a symbol change a display.backlight()
-    # call and nothing else.
+def test_the_transfer_white_is_the_full_range_not_the_tinted_palette():
+    # On the Tufty color.white is rgb(222, 238, 214): drawing with it gave
+    # away part of the swing.
     namespace, app = app_with()
     color = namespace["color"]
-    fields, lights = fields_of(namespace, protocol.SCHEME_BACKLIGHT)
-    low, mid, high = protocol.LOW, protocol.MID, protocol.HIGH
-    assert lights[low] == protocol.LOW_BACKLIGHT == 0.5, \
-        "low is the dim backlight, not off"
-    assert lights[high] == 1.0
-    assert 0.0 < lights[mid] < 1.0
-    assert fields[low] is fields[mid] is fields[high]
-    # The panel's full white, not the palette's tinted color.white.
-    assert fields[high] == color.rgb(255, 255, 255)
-
-
-def test_a_backlight_scheme_symbol_change_draws_nothing():
-    namespace, app = app_with()
-    display = namespace["display"]
-    screen = namespace["screen"]
-    show_field = namespace["show_field"]
-    scheme = protocol.SCHEME_BACKLIGHT
-    show_field(protocol.LOW, scheme)
-    fills = len(screen.fills)
-    backlights = len(display.backlights)
-    for symbol in (protocol.HIGH, protocol.MID, protocol.LOW, protocol.HIGH):
-        show_field(symbol, scheme)
-    assert len(display.backlights) == backlights + 4
-    assert display.backlights[-4:] == [1.0, protocol.MID_BACKLIGHT,
-                                       protocol.LOW_BACKLIGHT, 1.0]
-    assert len(screen.fills) == fills, "a symbol change refilled the screen"
-    # The fields scheme's do change the pixels, and refill.
-    show_field(protocol.LOW, protocol.SCHEME_FIELDS)
-    assert len(screen.fills) == fills + 1
-
-
-def test_fields_use_the_full_range_not_the_tinted_palette():
-    # On the Tufty color.black is rgb(20, 30, 40) and color.white
-    # rgb(222, 238, 214): drawing fields with them gave away part of the swing.
-    namespace, app = app_with()
-    color = namespace["color"]
-    for scheme in schemes(namespace):
-        fields, _ = fields_of(namespace, scheme)
-        assert color.black not in fields.values(), scheme
-        assert color.white not in fields.values(), scheme
-    assert namespace["field_pen"]("white") == color.rgb(255, 255, 255)
-    assert namespace["field_pen"]("black") == color.rgb(0, 0, 0)
+    assert namespace["WHITE_PEN"] == color.rgb(255, 255, 255)
+    assert namespace["WHITE_PEN"] != color.white
+    for name in ("FIELD_COLOR", "FIELD_BACKLIGHT", "show_field"):
+        assert name not in namespace, name
 
 
 # --- the backlight ----------------------------------------------------------
 
-def test_every_frame_is_drawn_in_the_scheme_the_transfer_is_in():
-    for scheme in ("fields", "backlight"):
+def test_every_field_is_its_tables_backlight():
+    for scheme in (protocol.SCHEME_BEACON, protocol.SCHEME_BACKLIGHT):
         namespace = in_transfer()
         transfer = namespace["app"].transfer
-        screen, display = namespace["screen"], namespace["display"]
-        colors, lights = fields_of(namespace, scheme)
-        pairs = set((colors[s], lights[s])
-                    for s in (protocol.LOW, protocol.MID, protocol.HIGH))
+        display = namespace["display"]
         transfer.scheme = scheme          # as calibration would leave it
         symbols = [protocol.LOW, protocol.MID, protocol.HIGH] * 2
         scripted(namespace, symbols)
         for symbol in symbols:
             frame(namespace)
-            # What is up after the frame, whichever of the two it changed:
-            # the last pen filled and the last backlight set.
-            pen, light = screen.fills[-1], display.backlights[-1]
-            assert (pen, light) in pairs, \
-                "%s: pen %r at backlight %r is not one of the three levels" % (
-                    scheme, pen, light)
-            assert (pen, light) == (colors[symbol], lights[symbol]), \
-                (scheme, symbol, pen, light)
+            assert display.backlights[-1] == \
+                protocol.LEVEL_SCHEMES[scheme][symbol], (scheme, symbol)
 
 
 def test_a_transfer_puts_the_backlight_back_when_it_ends():
     # The firmware leaves it at 230/255 with nothing to read the setting back,
-    # and a transfer raises it to full or, in the backlight scheme, can end on
-    # black with it off -- so the app owes a restore on the way out.
-    for scheme in ("fields", "backlight"):
+    # and a transfer can end with it off -- so the app owes a restore on the
+    # way out.
+    for scheme in (protocol.SCHEME_BEACON, protocol.SCHEME_BACKLIGHT):
         namespace, app = app_with(CREDENTIALS)
         display = namespace["display"]
         frame(namespace, "DOWN")
@@ -677,7 +614,8 @@ def test_a_transfer_puts_the_backlight_back_when_it_ends():
         assert app.screen == "transfer"
         app.transfer.scheme = scheme
         frame(namespace)
-        assert display.backlights[-1] in fields_of(namespace, scheme)[1].values()
+        assert display.backlights[-1] in \
+            protocol.LEVEL_SCHEMES[scheme].values()
 
         app.transfer.fail(namespace["ERR_CANCELLED"])
         frame(namespace)
@@ -858,12 +796,10 @@ def test_an_escaped_ssid_is_seeded_under_its_escaped_name():
     assert namespace["radio_ssid"]("%253431") == "%41"
 
 
-# --- the transmitted field --------------------------------------------------
-# During a transfer the whole screen is the field, at LORES, and nothing else
-# is drawn. On the badge (v2 firmware, 60 Hz) a HIRES fill costs 11.4 ms and a
-# frame of two bands and a text column took three refreshes; LORES is a
-# quarter of the pixels. run()'s own clear is switched off and the field is
-# drawn only when it changes. See "Screen as a transmitter" in the protocol.
+# --- the transfer screen -----------------------------------------------------
+# White, drawn once and presented before the reader starts, at the app's own
+# HIRES; every symbol after it a backlight change and nothing drawn. run()'s
+# own clear is off while it runs. See section 5 of the protocol spec.
 
 
 def in_transfer(leader=False):
@@ -890,24 +826,35 @@ def scripted(namespace, fields):
     transfer.work = lambda t: None
 
 
-def test_a_transfer_signals_at_lores_with_runs_clear_off():
+def test_a_transfer_keeps_the_apps_mode_with_runs_clear_off():
     namespace = in_transfer()
     badge = namespace["badge"]
-    assert badge.current_mode == namespace["LORES"] | namespace["VSYNC"]
+    assert badge.current_mode == namespace["HIRES"] | namespace["VSYNC"]
+    assert namespace["LORES"] | namespace["VSYNC"] not in badge.modes, \
+        "a transfer switched to LORES"
     assert badge.default_clear is None, \
-        "run() would clear the screen before every frame"
+        "run() would clear the white before every frame"
 
 
-def test_the_field_is_the_whole_screen_and_nothing_else():
-    namespace = in_transfer()
-    screen = namespace["screen"]
-    scripted(namespace, [protocol.HIGH, protocol.LOW, protocol.MID])
-    colors = namespace["FIELD_COLOR"][namespace["app"].transfer.scheme]
-    for symbol in (protocol.HIGH, protocol.LOW, protocol.MID):
+def test_the_screen_is_white_drawn_once_and_nothing_else():
+    namespace = load_app("share_wifi", networks=CREDENTIALS, alignment=True)
+    screen, display = namespace["screen"], namespace["display"]
+    frame(namespace, "DOWN")
+    frame(namespace, "A")                 # Receive
+    screen.fills = []
+    presents = display.updates
+    frame(namespace, "A")                 # past the alignment line
+    assert namespace["app"].screen == "transfer"
+    # run()'s clear of that frame, then the white, once.
+    assert screen.fills[-1] == namespace["WHITE_PEN"], screen.fills
+    assert screen.fills.count(namespace["WHITE_PEN"]) == 1, screen.fills
+    assert display.updates > presents, "the white was never presented"
+    scripted(namespace, [protocol.HIGH, protocol.LOW, protocol.MID] * 4)
+    for _ in range(12):
         screen.rects = []
         screen.fills = []
         drawn = frame(namespace)
-        assert screen.fills == [colors[symbol]], screen.fills
+        assert screen.fills == [], "a symbol drew pixels"
         assert screen.rects == [], "bands drawn during a transfer"
         assert list(drawn) == [], "text drawn during a transfer: %r" % (
             list(drawn),)
@@ -948,6 +895,7 @@ class LoopTransfer:
         self.calls = 0
         self.reader = FakeReader()
         self.collect_due = False
+        self.fast_burst = None
 
     def field_at(self, t):
         self.calls += 1
@@ -976,15 +924,13 @@ def looping(leader=True):
 
 
 def test_the_listen_loop_changes_the_backlight_without_presenting():
-    # The backlight scheme: every symbol white, so a whole exchange runs in
-    # one update() -- every backlight change made in place, nothing presented
-    # and nothing filled -- until the transfer ends.
+    # Every symbol a backlight level on the white, so a whole exchange runs
+    # in one update() -- every backlight change made in place, nothing
+    # presented and nothing filled -- until the transfer ends.
     namespace = looping()
     app, display, screen = namespace["app"], namespace["display"], namespace["screen"]
     scheme = protocol.SCHEME_BACKLIGHT
-    # The white is already up, as the backlight staircase left it.
-    namespace["show_full"](namespace["FIELD_COLOR"][scheme][protocol.LOW],
-                           protocol.LOW_BACKLIGHT)
+    namespace["show_backlight"](protocol.LOW_BACKLIGHT)
     symbols = [protocol.LOW] * 5 + [protocol.HIGH] * 40 + [protocol.MID] * 40 \
         + [protocol.LOW] * 20
     fake = LoopTransfer(scheme, symbols)
@@ -1002,39 +948,49 @@ def test_the_listen_loop_changes_the_backlight_without_presenting():
     assert app.screen != namespace["TRANSFER"], "a finished transfer moves on"
 
 
-def test_the_listen_loop_returns_to_present_a_change_of_pixels():
+def test_the_transfer_loop_draws_no_pixels_whatever_it_shows():
+    # Every symbol of both tables, through the transfer loop as the badge
+    # runs it, from a scripted transfer: nothing is filled or presented, and
+    # every backlight set is one of the tables'.
     namespace = looping()
-    app, screen = namespace["app"], namespace["screen"]
-    scheme = protocol.SCHEME_FIELDS
-    namespace["show_full"](namespace["FIELD_COLOR"][scheme][protocol.LOW], 1.0)
-    fake = LoopTransfer(scheme, [protocol.LOW] * 30 + [protocol.HIGH] * 30)
-    app.transfer = fake
-    fills = len(screen.fills)
-    app.do_transfer()
-    # Thirty blacks read without drawing, then the high drawn and handed to
-    # run() to present: thirty-one readings.
-    assert fake.calls == 31, fake.calls
-    assert screen.fills[fills:] == [namespace["FIELD_COLOR"][scheme][protocol.HIGH]]
-    assert app.screen == namespace["TRANSFER"]
+    app, display, screen = namespace["app"], namespace["display"], \
+        namespace["screen"]
+    levels = set()
+    for table in protocol.LEVEL_SCHEMES.values():
+        levels.update(table.values())
+    presents, fills = display.updates, len(screen.fills)
+    for scheme in (protocol.SCHEME_BEACON, protocol.SCHEME_BACKLIGHT):
+        lights = len(display.backlights)
+        fake = LoopTransfer(scheme, [protocol.LOW, protocol.HIGH,
+                                     protocol.MID, protocol.LOW] * 10)
+        app.transfer = fake
+        app.screen = namespace["TRANSFER"]
+        app.do_transfer()
+        assert fake.result == protocol.OK
+        set_during = display.backlights[lights:]
+        assert set(set_during[:-1]) <= levels, set_during
+        assert set_during[-1] == namespace["BACKLIGHT_NORMAL"]
+    assert display.updates == presents, "a transfer presented"
+    assert len(screen.fills) == fills, "a transfer filled the screen"
 
 
 def test_the_reader_lives_for_the_whole_transfer():
     # Built in begin_transfer and stopped in finish_transfer, the single
-    # exit: do_transfer() returns to run() at every pixel change, and must
-    # not touch the reader then.
+    # exit: do_transfer() returning to run() -- every pass, here -- must not
+    # touch the reader.
     namespace = looping()
+    namespace["TRANSFER_PASSES"] = 1
     app = namespace["app"]
-    scheme = protocol.SCHEME_FIELDS
-    namespace["show_full"](namespace["FIELD_COLOR"][scheme][protocol.LOW], 1.0)
-    fake = LoopTransfer(scheme, [protocol.LOW, protocol.HIGH, protocol.LOW,
-                                 protocol.HIGH, protocol.LOW])
+    fake = LoopTransfer(protocol.SCHEME_BACKLIGHT,
+                        [protocol.LOW, protocol.HIGH, protocol.LOW,
+                         protocol.HIGH, protocol.LOW])
     app.transfer = fake
     returns = 0
     while app.screen == namespace["TRANSFER"]:
         app.do_transfer()
         returns += 1
         assert returns < 20
-    assert returns >= 4, "every pixel change returns to run()"
+    assert returns >= 5, "one pass a call"
     assert fake.reader.stops == 1, "stopped once, at the end"
 
 
@@ -1042,8 +998,6 @@ def test_a_collection_the_protocol_asks_for_happens_between_its_calls():
     namespace = looping()
     app = namespace["app"]
     scheme = protocol.SCHEME_BACKLIGHT
-    namespace["show_full"](namespace["FIELD_COLOR"][scheme][protocol.LOW],
-                           protocol.LOW_BACKLIGHT)
     fake = LoopTransfer(scheme, [protocol.LOW] * 4)
     order = []
     fake.work = lambda t: (order.append("work"),
@@ -1083,7 +1037,6 @@ def test_b_cancels_from_inside_the_listen_loop():
     namespace = looping()
     app, badge = namespace["app"], namespace["badge"]
     scheme = protocol.SCHEME_BACKLIGHT
-    namespace["show_full"](namespace["FIELD_COLOR"][scheme][protocol.LOW], 0.0)
     fake = LoopTransfer(scheme, [protocol.LOW] * 1000)
     app.transfer = fake
     polls = [0]
@@ -1107,39 +1060,22 @@ def test_a_transfer_starts_its_reader_and_its_clock_at_zero():
     assert transfer.reader.now_us() < 10 ** 6
 
 
-def test_the_field_is_drawn_only_when_it_changes():
-    # The framebuffer keeps the field, and run()'s clear is off, so a frame
-    # that changes nothing has nothing to draw.
+def test_the_backlight_is_set_only_when_the_field_changes():
     namespace = in_transfer()
-    screen, display = namespace["screen"], namespace["display"]
+    display = namespace["display"]
     sequence = [protocol.HIGH, protocol.HIGH, protocol.HIGH, protocol.LOW,
                 protocol.LOW, protocol.HIGH]
     scripted(namespace, [protocol.LOW] + sequence)
-    frame(namespace)                    # LOW: the first frame draws
-    draws = []
+    frame(namespace)
+    sets = []
     for _ in sequence:
-        screen.fills = []
         display.backlights = []
         frame(namespace)
-        draws.append(len(screen.fills))
-        # The fields scheme holds the backlight at full: never set again.
-        assert display.backlights == []
-    assert draws == [1, 0, 0, 1, 0, 1], draws
+        sets.append(len(display.backlights))
+    assert sets == [1, 0, 0, 1, 0, 1], sets
 
 
-def test_the_field_carries_a_protocol_level_and_nothing_else():
-    namespace = in_transfer()
-    screen, app = namespace["screen"], namespace["app"]
-    levels = set(namespace["FIELD_COLOR"][app.transfer.scheme].values())
-    for _ in range(12):
-        screen.fills = []
-        frame(namespace)
-        for pen in screen.fills:
-            assert pen in levels, \
-                "field pen %r is not one of the three levels" % (pen,)
-
-
-def test_leaving_a_transfer_brings_back_hires_and_runs_clear():
+def test_leaving_a_transfer_brings_back_runs_clear_and_the_backlight():
     namespace = in_transfer()
     badge, app = namespace["badge"], namespace["app"]
     frame(namespace, "B")               # cancel
@@ -1151,21 +1087,18 @@ def test_leaving_a_transfer_brings_back_hires_and_runs_clear():
     assert drawn, "the result screen drew nothing"
 
 
-def test_a_new_transfer_redraws_its_first_field():
-    # A mode change reinterprets the framebuffer, so what was "on screen"
-    # before it is not -- the first field after one must be drawn.
+def test_a_new_transfer_draws_its_white_again():
+    # The result screen between drew over it.
     namespace = in_transfer()
     screen, app = namespace["screen"], namespace["app"]
     scripted(namespace, [protocol.LOW] * 2)
     frame(namespace)
     frame(namespace, "B")               # cancel
     frame(namespace, "B")               # the result screen's retry
+    screen.fills = []
     frame(namespace, "A")               # past the alignment line
     assert app.screen == "transfer", app.screen
-    scripted(namespace, [protocol.LOW])
-    screen.fills = []
-    frame(namespace)
-    assert screen.fills, "the first field of a new transfer was not drawn"
+    assert namespace["WHITE_PEN"] in screen.fills
 
 
 def test_menus_still_use_the_whole_width():
@@ -1255,10 +1188,10 @@ def test_a_wep_network_is_still_listed_and_still_shareable():
 def test_a_received_wep_credential_is_saved():
     namespace, app = app_with()
     wep_capable(False)
-    transfer = namespace["Transfer"](False)
+    transfer = HeldTransfer(False)
     transfer.result = namespace["OK"]
-    transfer.received = protocol.build_tokens(
-        b"OldRouter", b"abcde", bytes([namespace["SEC_WEP"]]))
+    transfer.received = [b"OldRouter", b"abcde",
+                         bytes([namespace["SEC_WEP"]])]
     app.finish_transfer(transfer)
     assert namespace["State"].data["OldRouter"] == {"key": "abcde",
                                                     "security": 1}
@@ -1358,8 +1291,6 @@ def test_an_unreadable_status_still_times_out_and_says_why():
     assert "Timed out" in app.message
     assert "unavailable" in app.message, \
         "a timeout with no readable status should name the real obstacle: %r" % app.message
-
-
 
 
 # --- paged lists -------------------------------------------------------------
@@ -1473,26 +1404,32 @@ def test_dev_mode_is_hidden_at_launch():
     assert "Dev Mode" not in main_text(namespace)
 
 
-def test_c_reveals_dev_mode_and_selects_it():
+def hold_c(namespace, ms=5000):
+    """C held for `ms`, a frame at a time, then released."""
+    badge = namespace["badge"]
+    real = badge.held
+    badge.held = lambda button=None: button == "C" or real(button)
+    try:
+        for _ in range(-(-ms // badge.ticks_delta) + 1):
+            frame(namespace)
+    finally:
+        badge.held = real
+    frame(namespace)
+
+
+def test_holding_c_five_seconds_reveals_dev_mode_and_selects_it():
     namespace, app = app_with()
     text = main_text(namespace, "C")
+    assert "Dev Mode" not in text, "a press is not a hold"
+    hold_c(namespace)
+    text = main_text(namespace)
     assert "> Dev Mode" in text
     assert app.cursor == len(namespace["MENU_ITEMS"])
 
 
-def test_c_again_does_nothing():
-    namespace, app = app_with()
-    frame(namespace, "C")
-    frame(namespace, "UP")
-    before = app.cursor
-    drawn = frame(namespace, "C")
-    assert app.cursor == before
-    assert [d for d in drawn if "Dev Mode" in str(d)] == ["  Dev Mode"]
-
-
 def test_dev_mode_stays_after_leaving_the_main_screen():
     namespace, app = app_with(CREDENTIALS)
-    frame(namespace, "C")
+    hold_c(namespace)
     frame(namespace, "DOWN")              # wraps to Share
     frame(namespace, "A")
     assert app.screen == "pick_share"
@@ -1502,7 +1439,7 @@ def test_dev_mode_stays_after_leaving_the_main_screen():
 
 def test_dev_mode_is_not_remembered_across_launches():
     namespace, app = app_with()
-    frame(namespace, "C")
+    hold_c(namespace)
     namespace, app = app_with()
     assert "Dev Mode" not in main_text(namespace)
 
@@ -1510,14 +1447,14 @@ def test_dev_mode_is_not_remembered_across_launches():
 def test_c_does_nothing_off_the_main_screen():
     namespace, app = app_with(CREDENTIALS)
     open_connect(namespace)
-    frame(namespace, "C")
+    hold_c(namespace)
     assert app.screen == "connect_list"
     frame(namespace, "B")
     assert "Dev Mode" not in main_text(namespace)
 
 
 def open_dev(namespace):
-    frame(namespace, "C")
+    hold_c(namespace)
     frame(namespace, "A")
     assert namespace["app"].screen == namespace["DEV"]
 
@@ -1552,26 +1489,9 @@ def test_b_leaves_dev_mode_and_c_does_nothing_there():
     assert app.screen == "main"
 
 
-def test_each_dev_tool_opens_its_first_screen():
-    expected = (("DEV_PROMPT", "Dark room"), ("DEV_ROLE", "Who goes first?"),
-                ("DEV_PROBE_PROMPT", "Probe frame timing"),
-                ("DEV_FLICKER", "Room flicker"),
-                ("DEV_DISPLAY", "Measurements"),
-                ("DEV_SAVED", "Done"))
-    for index, (target, title) in enumerate(expected):
-        namespace, app = app_with()
-        open_dev(namespace)
-        for _ in range(index):
-            frame(namespace, "DOWN")
-        frame(namespace, "A")
-        assert app.screen == namespace[target]
-        drawn = frame(namespace)
-        assert drawn[0] == title, drawn
-
-
-# --- dev mode: the measurement screens ---------------------------------------
-
-measure = load_module("share_wifi", "measure")
+# --- dev mode: what stays on the badge --------------------------------------
+# The tools are dev link subtools, tested in test_devtools.py; the link in
+# test_devmode_app.py.
 
 
 def dev_app():
@@ -1581,79 +1501,6 @@ def dev_app():
     return namespace, namespace["app"]
 
 
-class FastClock:
-    """time.ticks_ms/ticks_us under the test's control.
-
-    Every ticks_us() call moves it 20us on, standing in for a light_level()
-    read, so a settle capture's read-until-the-window-ends loop terminates.
-    A frame moves it on by `frame_ms`. Patched into `time` itself, which the
-    app and measure.py share.
-    """
-
-    def __init__(self):
-        self.us = 10000000
-
-    def ticks_us(self):
-        self.us += 20
-        return self.us
-
-    def ticks_ms(self):
-        return self.us // 1000
-
-    def __enter__(self):
-        self.saved = (time.ticks_ms, time.ticks_us)
-        time.ticks_ms = self.ticks_ms
-        time.ticks_us = self.ticks_us
-        return self
-
-    def __exit__(self, *exc):
-        time.ticks_ms, time.ticks_us = self.saved
-        return False
-
-
-def brightness(pixels, backlight):
-    if pixels == "white":
-        level = 1.0
-    elif pixels == "black":
-        level = 0.05
-    else:
-        level = (sum(pixels) / 765.0) ** 2.2
-    return level * backlight
-
-
-def panel_light(view, ambient=32, span=160):
-    """A sensor reading whatever `view()` says is on the screen it faces.
-
-    Quantised to 16 counts, like the badge's. `view` returns the run whose
-    field is in front of this sensor, or None for a screen showing no run.
-    """
-    def light():
-        run = view()
-        level = 0.0 if run is None else brightness(run.pixels, run.backlight)
-        return (ambient + int(level * span)) // 16 * 16
-    return light
-
-
-def mirror_badge(namespace):
-    app = namespace["app"]
-    namespace["badge"].light_level = panel_light(lambda: app.run)
-
-
-def drive(namespace, clock, screen_name, frame_ms=50, limit=4000,
-          seen=None):
-    """Frames until the app leaves `screen_name`; every string drawn, if asked."""
-    app = namespace["app"]
-    namespace["badge"].ticks_delta = frame_ms
-    for _ in range(limit):
-        if app.screen != screen_name:
-            return
-        clock.us += frame_ms * 1000
-        drawn = frame(namespace)
-        if seen is not None:
-            seen.update(str(d).replace("\n", " ") for d in drawn)
-    raise AssertionError("still on %s after %d frames" % (screen_name, limit))
-
-
 def open_tool(namespace, index):
     open_dev(namespace)
     for _ in range(index):
@@ -1661,133 +1508,10 @@ def open_tool(namespace, index):
     frame(namespace, "A")
 
 
-def test_the_mirror_tool_starts_with_the_dark_room_prompt():
-    namespace, app = dev_app()
-    open_tool(namespace, 0)
-    drawn = frame(namespace)
-    assert drawn[0] == "Dark room"
-    assert ("Turn the lights off. Hold the badge screen-first against a "
-            "mirror.") in drawn
-    assert "A - Start   B - Cancel" in drawn
-
-
-def test_b_at_the_prompt_cancels_and_saves_nothing():
-    namespace, app = dev_app()
-    open_tool(namespace, 0)
-    writes = namespace["State"].writes
-    frame(namespace, "B")
-    assert app.screen == namespace["DEV"]
-    assert app.cursor == 0
-    assert namespace["State"].writes == writes
-    assert "measurements" not in namespace["State"].files
-
-
-def test_b_mid_test_cancels_restores_the_panel_and_saves_nothing():
-    namespace, app = dev_app()
-    mirror_badge(namespace)
-    with FastClock() as clock:
-        open_tool(namespace, 0)
-        frame(namespace, "A")
-        assert app.screen == namespace["DEV_MEASURE"]
-        writes = namespace["State"].writes
-        for _ in range(200):            # past the delay and into the tests
-            clock.us += 50000
-            frame(namespace)
-        assert app.run.test_name is not None
-        frame(namespace, "B")
-    assert app.screen == namespace["DEV"] and app.cursor == 0
-    assert app.run is None
-    assert namespace["State"].writes == writes
-    assert namespace["display"].backlights[-1] == namespace["BACKLIGHT_NORMAL"]
-    assert namespace["badge"].lights == 0.0
-
-
-def test_the_run_waits_three_seconds_after_a():
-    namespace, app = dev_app()
-    mirror_badge(namespace)
-    with FastClock() as clock:
-        open_tool(namespace, 0)
-        frame(namespace, "A")
-        clock.us += 2900000
-        drawn = frame(namespace)
-        assert not app.run_begun
-        assert "Starting" in drawn and "B - Cancel" in drawn
-        clock.us += 200000
-        frame(namespace)
-        assert app.run_begun
-
-
-def complete_mirror_run(namespace, seen=None):
-    app = namespace["app"]
-    with FastClock() as clock:
-        open_tool(namespace, 0)
-        frame(namespace, "A")
-        drive(namespace, clock, namespace["DEV_MEASURE"], seen=seen)
-        assert app.screen == namespace["DEV_PROMPT"]
-        drawn = frame(namespace)
-        assert drawn[0] == "Bright room"
-        assert ("Turn the lights on. Hold the badge against the mirror "
-                "again.") in drawn
-        frame(namespace, "A")
-        drive(namespace, clock, namespace["DEV_MEASURE"], seen=seen)
-
-
-def test_a_whole_mirror_run_saves_both_conditions_and_says_done():
-    namespace, app = dev_app()
-    mirror_badge(namespace)
-    state = namespace["State"]
-    writes = state.writes
-    seen = set()
-    complete_mirror_run(namespace, seen)
-    assert app.screen == namespace["DEV_SAVED"]
-    assert state.writes == writes + 1, "written once, at the end"
-    saved = state.files["measurements"]["mirror"]
-    assert sorted(saved) == ["dark", "lit"]
-    for condition in ("dark", "lit"):
-        assert sorted(saved[condition]) == sorted(
-            list(measure.MIRROR_TESTS) + ["temperature_c"])
-    dark = saved["dark"]
-    assert dark["adc_step"] == 16
-    assert dark["levels"]["fields"]["span"] > 0
-    # No text is drawn while a test runs -- the whole screen is its field --
-    # and a mirror run is tests from start to end, so no progress line shows.
-    assert not any(":" in line and "/11" in line for line in seen), \
-        sorted(line for line in seen if "/11" in line)
-    assert namespace["display"].backlights[-1] == namespace["BACKLIGHT_NORMAL"]
-    assert namespace["badge"].lights == 0.0
-
-    drawn = frame(namespace)
-    assert drawn[0] == "Done"
-    assert "Measurements saved" in drawn
-    assert "Any button - Back" in drawn
-    frame(namespace, "UP")
-    assert app.screen == namespace["DEV"] and app.cursor == 0
-
-
-def test_a_write_that_fails_says_the_measurements_were_not_saved():
-    # The firmware's State.save() swallows OSError whenever /state exists, so
-    # the app writes the file itself to see one. A failed write must not read
-    # as a saved one: a run is minutes of holding a badge still.
-    namespace, app = dev_app()
-    mirror_badge(namespace)
-    state = namespace["State"]
-    state.fail_writes = True
-    complete_mirror_run(namespace)
-    assert app.screen == namespace["DEV_SAVED"]
-    assert "mirror" not in state.files.get("measurements", {})
-    assert namespace["display"].backlights[-1] == namespace["BACKLIGHT_NORMAL"]
-    drawn = frame(namespace)
-    assert drawn[0] == "Done"
-    assert "Could not save measurements" in drawn
-    assert "Measurements saved" not in drawn
-    frame(namespace, "B")
-    assert app.screen == namespace["DEV"]
-
-
 def test_the_app_writes_measurements_itself_rather_than_through_state():
     # State.save() would hide the error this exists to report.
     source = open(namespace_source()).read()
-    body = source.split("def save_measurements", 1)[1].split("\n    def ", 1)[0]
+    body = source.split("def save_measurement(", 1)[1].split("\n\n\ndef ", 1)[0]
     assert "write_measurements(" in body
     assert "State.modify" not in body and "State.save" not in body
 
@@ -1796,108 +1520,6 @@ def namespace_source():
     import os
     from harness import APPS
     return os.path.join(APPS, "share_wifi", "__init__.py")
-
-
-def test_a_test_fills_the_whole_screen_with_its_field_and_no_text():
-    namespace, app = dev_app()
-    mirror_badge(namespace)
-    screen = namespace["screen"]
-    with FastClock() as clock:
-        open_tool(namespace, 0)
-        frame(namespace, "A")
-        # The start delay: the status column, on black.
-        clock.us += 1000000
-        drawn = frame(namespace)
-        assert "B - Cancel" in drawn and "Starting" in drawn
-        clock.us += 2100000
-        frame(namespace)
-        assert app.run.test_name is not None
-        badge = namespace["badge"]
-        assert badge.current_mode == namespace["LORES"] | namespace["VSYNC"]
-        assert badge.default_clear is None
-        seen = set()
-        # The frame above drew the first test's field.
-        shown = namespace["pixels_pen"](app.run.pixels)
-        for _ in range(200):            # through several tests
-            clock.us += 50000
-            screen.rects = []
-            screen.fills = []
-            drawn = frame(namespace)
-            if app.screen != namespace["DEV_MEASURE"]:
-                break
-            pen = namespace["pixels_pen"](app.run.pixels)
-            # Filled only when the pixels change: the framebuffer keeps them,
-            # and a backlight-only change is a display.backlight() call.
-            assert screen.fills == ([pen] if pen is not shown else []), \
-                (screen.fills, pen, shown)
-            shown = pen
-            assert screen.rects == [], "bands drawn during a test"
-            assert not any(isinstance(d, str) for d in drawn), \
-                "text drawn over a test: %r" % (list(drawn),)
-            assert namespace["display"].backlights[-1] == app.run.backlight
-            seen.add(app.run.test_name)
-        assert len(seen) >= 3, seen
-        frame(namespace, "B")           # B still cancels mid-test
-    assert app.screen == namespace["DEV"]
-    assert badge.current_mode == namespace["HIRES"] | namespace["VSYNC"]
-    assert badge.default_clear == namespace["color"].black
-
-
-def test_the_handshake_keeps_the_bands_and_the_status_column():
-    # Only the tests go full screen: while the badges find each other the
-    # user can still read what is happening.
-    namespace, app = dev_app()
-    namespace["badge"].light_level = lambda: 32
-    screen = namespace["screen"]
-    with FastClock() as clock:
-        open_tool(namespace, 1)
-        frame(namespace, "A")           # I go first
-        frame(namespace, "A")           # start
-        for _ in range(100):            # delay, noise second, calling
-            clock.us += 50000
-            screen.rects = []
-            drawn = frame(namespace)
-            assert "B - Cancel" in drawn
-            if app.run_begun:
-                assert app.run.test_name is None
-                assert len(screen.rects) == 2, "the bands, not the whole screen"
-        assert app.run.phase == measure.PHASE_CALLING
-
-
-def test_a_frame_with_a_capture_due_is_presented_before_it_is_read():
-    # Under run(update) the firmware presents after update() returns, then
-    # polls and clears -- ~30 ms on hardware before a capture could start, so
-    # every rise had crossed by the first read. A frame with a settle capture
-    # due is presented by the app itself, and read the moment that returns.
-    namespace, app = dev_app()
-    mirror_badge(namespace)
-    display = namespace["display"]
-    calls = []
-    early = due_frames = 0
-    with FastClock() as clock:
-        open_tool(namespace, 0)
-        frame(namespace, "A")
-        clock.us += 3100000
-        frame(namespace)
-        run = app.run
-        real_presented = run.presented
-
-        def presented(present_us, returned_us=None):
-            calls.append((display.updates, present_us, returned_us))
-            return real_presented(present_us, returned_us)
-        run.presented = presented
-        while app.screen == namespace["DEV_MEASURE"] and len(calls) < 5:
-            before = display.updates
-            clock.us += 50000
-            frame(namespace)
-            if display.updates != before:
-                early += 1
-    assert len(calls) == 5 and early == 5, (len(calls), early)
-    for updates, present_us, returned_us in calls:
-        assert updates >= 1, "read before the frame was presented"
-        assert returned_us is not None and returned_us >= present_us
-    # Frames without a capture are left to run() to present.
-    assert early == len(calls)
 
 
 def test_the_temperature_reader_probes_for_core_temp():
@@ -1935,247 +1557,13 @@ def test_the_temperature_reader_probes_for_core_temp():
         fake.ADC = ADC
         read = reader()
         assert made == [8]
-        assert read() == namespace["core_temp_c"](14021)
+        assert read() == round(27 - (14021 * 3.3 / 65535 - 0.706) / 0.001721,
+                               1)
     finally:
         if saved is None:
             sys.modules.pop("machine", None)
         else:
             sys.modules["machine"] = saved
-
-
-def test_a_backlight_step_is_set_inside_its_capture_with_no_present_first():
-    # display.backlight() is live the moment it is called. If the app set it
-    # with the rest of the field, or presented first, the edge would be over
-    # before the capture's first read.
-    namespace, app = dev_app()
-    mirror_badge(namespace)
-    display = namespace["display"]
-    seen = []
-    with FastClock() as clock:
-        open_tool(namespace, 0)
-        frame(namespace, "A")
-        clock.us += 3100000
-        frame(namespace)
-        run = app.run
-        real_changed = run.changed
-        at_frame = {}
-
-        def changed(change):
-            entered = (display.updates, len(display.backlights))
-
-            def wrapped():
-                seen.append((at_frame["start"], entered,
-                             (display.updates, len(display.backlights))))
-                change()
-                seen.append(("set", display.backlights[-1], run.backlight))
-            return real_changed(wrapped)
-        run.changed = changed
-        while app.screen == namespace["DEV_MEASURE"] and len(seen) < 6:
-            at_frame["start"] = (display.updates, len(display.backlights))
-            clock.us += 50000
-            frame(namespace)
-    assert len(seen) == 6, seen
-    for before, after in zip(seen[0::2], seen[1::2]):
-        start, entered, inside = before
-        # Nothing presented and no backlight set between the frame starting
-        # and the change, which the capture makes itself.
-        assert start == entered == inside, before
-        assert after[1] == after[2], after
-
-
-def test_a_run_with_failed_tests_still_saves_them():
-    # A sensor that reads nothing: most tests fail, and the run is still saved.
-    namespace, app = dev_app()
-    namespace["badge"].light_level = lambda: 0
-    complete_mirror_run(namespace)
-    assert app.screen == namespace["DEV_SAVED"]
-    dark = namespace["State"].files["measurements"]["mirror"]["dark"]
-    assert "error" in dark["adc_step"]
-    assert "error" in dark["levels"]["fields"]
-    assert "frames" in dark["frame_timing"]
-
-
-def test_b_at_the_bright_prompt_drops_the_dark_results_too():
-    namespace, app = dev_app()
-    mirror_badge(namespace)
-    with FastClock() as clock:
-        open_tool(namespace, 0)
-        frame(namespace, "A")
-        drive(namespace, clock, namespace["DEV_MEASURE"])
-    assert app.screen == namespace["DEV_PROMPT"] and app.condition == "lit"
-    writes = namespace["State"].writes
-    frame(namespace, "B")
-    assert app.screen == namespace["DEV"]
-    assert namespace["State"].writes == writes
-    assert app.dark_result is None
-    assert namespace["display"].backlights[-1] == namespace["BACKLIGHT_NORMAL"]
-
-
-def test_a_mirror_run_keeps_the_second_badge_results():
-    namespace, app = dev_app()
-    mirror_badge(namespace)
-    other = {"role": "first", "dark": {"ambient": 16}}
-    namespace["State"].files["measurements"] = {"second_badge": other}
-    complete_mirror_run(namespace)
-    saved = namespace["State"].files["measurements"]
-    assert saved["second_badge"] == other
-    assert "mirror" in saved
-
-
-def test_the_role_screen_asks_who_goes_first_and_has_no_back():
-    namespace, app = dev_app()
-    open_tool(namespace, 1)
-    drawn = frame(namespace)
-    assert drawn[0] == "Who goes first?"
-    assert "A - I go first   B - I go second" in drawn
-    frame(namespace, "C")
-    assert app.screen == namespace["DEV_ROLE"]
-    frame(namespace, "A")
-    assert app.screen == namespace["DEV_PROMPT"] and app.measure_first is True
-
-    namespace, app = dev_app()
-    open_tool(namespace, 1)
-    frame(namespace, "B")
-    assert app.screen == namespace["DEV_PROMPT"] and app.measure_first is False
-    drawn = frame(namespace)
-    assert drawn[0] == "Dark room"
-    # The alignment screen, titled with the room.
-    assert namespace["ALIGN_TEXT"] in drawn
-    assert not any("Turn the lights" in str(d) for d in drawn)
-    frame(namespace, "B")               # the way out is B at the prompt
-    assert app.screen == namespace["DEV"] and app.cursor == 1
-
-
-def test_the_first_badge_holds_still_then_calls_until_it_gives_up():
-    namespace, app = dev_app()
-    namespace["badge"].light_level = lambda: 32
-    with FastClock() as clock:
-        open_tool(namespace, 1)
-        frame(namespace, "A")           # I go first
-        frame(namespace, "A")           # start
-        clock.us += 3100000
-        drawn = frame(namespace)
-        # The run opens on its noise second, then calls.
-        assert "Hold still" in drawn and "Dark room" in drawn
-        assert isinstance(app.run, measure.SecondBadgeRun)
-        assert app.run.first is True
-        clock.us += measure.NOISE_MS * 1000
-        frame(namespace)
-        drawn = frame(namespace)
-        assert "Calling the other badge" in drawn and "Dark room" in drawn
-        assert "No answer from the other badge" not in drawn
-        # Nobody answers: a minute on, it says so, and holds that up.
-        clock.us += measure.HANDSHAKE_TIMEOUT_MS * 1000
-        frame(namespace)
-        drawn = frame(namespace)
-        assert "No answer from the other badge" in drawn
-        assert app.screen == namespace["DEV_MEASURE"]
-        clock.us += measure.NO_ANSWER_HOLD_MS * 1000
-        frame(namespace)
-        assert app.screen == namespace["DEV_PROMPT"]
-        assert app.dark_result["levels"] == {"error": "no handshake"}
-        frame(namespace, "B")
-    assert app.screen == namespace["DEV"] and app.cursor == 1
-    assert namespace["display"].backlights[-1] == namespace["BACKLIGHT_NORMAL"]
-
-
-def test_the_second_badge_says_it_is_answering():
-    namespace, app = dev_app()
-    namespace["badge"].light_level = lambda: 32
-    with FastClock() as clock:
-        open_tool(namespace, 1)
-        frame(namespace, "B")           # I go second
-        frame(namespace, "A")           # start
-        clock.us += 3100000
-        frame(namespace)
-        clock.us += measure.NOISE_MS * 1000
-        frame(namespace)
-        drawn = frame(namespace)
-        assert "Answering the other badge" in drawn and "Dark room" in drawn
-
-
-def test_the_noise_is_measured_after_the_delay_not_during_it():
-    # The hand that pressed A may still be moving the badge during the delay,
-    # so the handshake's threshold comes from the run's first second.
-    namespace, app = dev_app()
-    clock_ref = []
-
-    def light():
-        now = clock_ref[0].us // 1000
-        # Wild during the delay, a 32-count spread once the run is going.
-        if not app.run_begun:
-            return 32 + (400 if (now // 50) % 2 else 0)
-        return 32 + 16 * ((now // 50) % 3)     # 32 counts peak to peak
-    namespace["badge"].light_level = light
-    with FastClock() as clock:
-        clock_ref.append(clock)
-        open_tool(namespace, 1)
-        frame(namespace, "B")           # I go second
-        frame(namespace, "A")           # start
-        for _ in range(64):             # past the 3 s delay
-            clock.us += 50000
-            frame(namespace)
-        assert app.run_begun and app.run.phase == measure.PHASE_NOISE
-        drawn = frame(namespace)
-        assert "Hold still" in drawn
-        for _ in range(25):             # through the noise second
-            clock.us += 50000
-            frame(namespace)
-    assert app.run.phase == measure.PHASE_ANSWERING
-    assert app.run.pulse_noise == 32
-    assert app.run.pulse_threshold == 48    # 1.5 x 32: the floor exactly
-
-
-def test_two_badges_measure_each_other_and_each_saves_its_own_role():
-    # Both apps on one clock, each sensor reading the other's run. Coarse
-    # frames, so the fast symbol rungs may count errors; the point here is
-    # the screens and the saving, which measure.py's own tests do not cover.
-    first, app_a = dev_app()
-    second, app_b = dev_app()
-    # A run's field is only on screen once it has begun: through the start
-    # delay the screen is black, which is what the noise is measured against.
-    first["badge"].light_level = panel_light(
-        lambda: app_b.run if app_b.run_begun else None)
-    second["badge"].light_level = panel_light(
-        lambda: app_a.run if app_a.run_begun else None)
-    mirror = {"dark": {"ambient": 16}}
-    second["State"].files["measurements"] = {"mirror": mirror}
-    with FastClock() as clock:
-        open_tool(first, 1)
-        frame(first, "A")
-        open_tool(second, 1)
-        frame(second, "B")
-        frame_ms = 40
-        first["badge"].ticks_delta = second["badge"].ticks_delta = frame_ms
-        seen = {"first": set(), "second": set()}
-        for _ in range(20000):
-            if (app_a.screen == first["DEV_SAVED"]
-                    and app_b.screen == second["DEV_SAVED"]):
-                break
-            clock.us += frame_ms * 1000
-            for namespace, app, role in ((first, app_a, "first"),
-                                         (second, app_b, "second")):
-                drawn = frame(namespace, "A") \
-                    if app.screen == namespace["DEV_PROMPT"] else frame(namespace)
-                seen[role].update(str(d).replace("\n", " ") for d in drawn)
-        else:
-            raise AssertionError("the two badges never finished")
-    # Each badge has called, answered, sent and measured, and said so.
-    for role in ("first", "second"):
-        for text in ("Hold still", "Calling the other badge",
-                     "Answering the other badge", "Sending",
-                     "Measuring the other badge"):
-            assert text in seen[role], (role, text)
-        assert "No answer from the other badge" not in seen[role], role
-    for namespace, role in ((first, "first"), (second, "second")):
-        saved = namespace["State"].files["measurements"]["second_badge"]
-        assert saved["role"] == role
-        for condition in ("dark", "lit"):
-            assert sorted(saved[condition]) == sorted(
-                list(measure.SECOND_BADGE_TESTS) + ["temperature_c"])
-            assert saved[condition]["ambient"] != {"error": "no handshake"}, \
-                "%s badge never shook hands with the other" % role
-    assert second["State"].files["measurements"]["mirror"] == mirror
 
 
 # --- dev mode: display measurements -------------------------------------------
@@ -2185,162 +1573,11 @@ def open_display(namespace):
     assert namespace["app"].screen == namespace["DEV_DISPLAY"]
 
 
-# --- dev mode: measure room flicker -------------------------------------------
-
-FLICKER_INDEX = 3
-
-
-def flicker_tool():
-    namespace, app = dev_app()
-    open_tool(namespace, FLICKER_INDEX)
-    assert app.screen == namespace["DEV_FLICKER"]
-    return namespace, app
-
-
-def test_the_flicker_tool_says_what_to_do_and_b_with_nothing_leaves():
-    namespace, app = flicker_tool()
-    drawn = frame(namespace)
-    assert drawn[0] == "Room flicker"
-    assert "A - Measure   B - Save & exit" in drawn
-    frame(namespace, "B")
-    assert app.screen == namespace["DEV"] and app.cursor == FLICKER_INDEX
-    assert "measurements" not in namespace["State"].files, "saved nothing"
-
-
-def flickering(namespace, clock, hz=100, size=20):
-    # Flicker of `size` counts on 400, as a lit room's lights might.
-    namespace["badge"].light_level = lambda: int(
-        400 + size * math.sin(2 * math.pi * hz * clock.us / 1e6))
-
-
-def drift_frames(namespace, app, limit=20):
-    """Frames until the drift windows end, each checked: the case lights held
-    off, run()'s clear off, nothing drawn. How many it took."""
-    badge = namespace["badge"]
-    count = 0
-    while app.screen == namespace["DEV_FLICKER_DRIFT"]:
-        assert badge.default_clear is None
-        badge.lights = 1.0
-        drawn = frame(namespace)
-        assert badge.lights == 0.0, "case lights on during the drift"
-        assert not drawn, drawn
-        count += 1
-        assert count <= limit
-    return count
-
-
-def test_each_a_takes_a_measurement_with_the_backlight_off():
-    namespace, app = flicker_tool()
-    namespace["DRIFT_WINDOWS"] = 3
-    display = namespace["display"]
-    badge = namespace["badge"]
-    with FastClock() as clock:
-        flickering(namespace, clock)
-        for n in (1, 2, 3):
-            before = len(display.backlights)
-            drawn = frame(namespace, "A")
-            assert namespace["FLICKER_MEASURING"] in " ".join(drawn).replace("\n", " "), drawn
-            # Off for the capture and the drift windows, back to normal after.
-            assert app.screen == namespace["DEV_FLICKER_DRIFT"]
-            assert display.backlights[before:] == [0.0]
-            assert drift_frames(namespace, app) == 3
-            assert display.backlights[before:] == \
-                [0.0, namespace["BACKLIGHT_NORMAL"]], display.backlights[before:]
-            assert badge.default_clear is not None, "run()'s clear back on"
-            assert len(app.flicker_results) == n
-            drawn = frame(namespace)
-            assert any(("%d measured" % n) in line for line in drawn), drawn
-    result = app.flicker_results[-1]
-    assert result["peak_hz"] == 100, result
-    assert abs(result["peak_counts"] - 20) < 2, result
-    assert result["hz"]["100"] > 10 * result["hz"]["60"], result["hz"]
-    assert result["filter"]["verdict"] == "flicker", result["filter"]
-    assert result["drift"]["hz"] == 100 and result["drift"]["windows"] == 3, \
-        result["drift"]
-
-
-def test_b_during_the_drift_stops_it_and_keeps_the_measurement():
-    namespace, app = flicker_tool()
-    with FastClock() as clock:
-        flickering(namespace, clock)
-        frame(namespace, "A")
-        frame(namespace)
-        frame(namespace, "B")               # held as the frame ends
-    assert app.screen == namespace["DEV_FLICKER"]
-    assert app.flicker_results[-1]["drift"] == {"error": "cancelled"}
-    assert namespace["display"].backlights[-1] == namespace["BACKLIGHT_NORMAL"]
-    assert namespace["badge"].default_clear is not None
-    frame(namespace, "B")                   # and B again saves it
-    saved = namespace["State"].files["measurements"]["room_flicker"]
-    assert saved["1"]["drift"] == {"error": "cancelled"}
-
-
-def test_a_drift_that_reads_nothing_still_ends():
-    namespace, app = flicker_tool()
-    namespace["DRIFT_WINDOWS"] = 3
-    with FastClock() as clock:
-        flickering(namespace, clock)
-        frame(namespace, "A")
-        assert app.screen == namespace["DEV_FLICKER_DRIFT"]
-        # A capture that never reads -- the window passes with no reading.
-        app.flicker.take = lambda light, ticks: None
-        app.flicker.counts[:] = [0] * len(app.flicker.counts)
-        assert drift_frames(namespace, app) == 3
-    assert app.flicker_results[-1]["drift"] == {"error": "too few windows"}
-
-
-def test_a_steady_room_has_no_drift_to_measure_and_takes_no_windows():
-    namespace, app = flicker_tool()
-    with FastClock():
-        namespace["badge"].light_level = lambda: 400
-        frame(namespace, "A")
-    assert app.screen == namespace["DEV_FLICKER"]
-    assert app.flicker_results[-1]["drift"] == {"error": "no mains flicker"}
-    assert namespace["display"].backlights[-2:] == \
-        [0.0, namespace["BACKLIGHT_NORMAL"]]
-
-
-def test_twenty_measurements_are_saved_and_there_is_no_cap():
-    namespace, app = flicker_tool()
-    namespace["DRIFT_WINDOWS"] = 3
-    with FastClock() as clock:
-        flickering(namespace, clock, hz=120)
-        for _ in range(21):
-            frame(namespace, "A")
-            drift_frames(namespace, app)
-    frame(namespace, "B")
-    saved = namespace["State"].files["measurements"]["room_flicker"]
-    assert len(saved) == 21
-    import json
-    size = len(json.dumps(saved))
-    # The spec's storage budget: about 550 bytes a measurement.
-    assert size < 21 * 720, size
-
-
-def test_b_saves_every_measurement_numbered_and_exits():
-    namespace, app = flicker_tool()
-    namespace["State"].files["measurements"] = MEASURED
-    with FastClock():
-        namespace["badge"].light_level = lambda: 400
-        frame(namespace, "A")
-        frame(namespace, "A")
-    frame(namespace, "B")
-    assert app.screen == namespace["DEV_SAVED"] and app.saved_ok
-    saved = namespace["State"].files["measurements"]
-    assert saved["mirror"] == MEASURED["mirror"], "the other tools' results kept"
-    assert sorted(saved["room_flicker"]) == ["1", "2"]
-    assert saved["room_flicker"]["1"]["mean"] == 400.0
-    assert saved["room_flicker"]["1"]["peak_counts"] < 0.5   # steady light
-    frame(namespace)
-    frame(namespace, "A")                  # Done -> Dev Mode, on this tool
-    assert app.screen == namespace["DEV"] and app.cursor == FLICKER_INDEX
-
-
 # --- dev mode: clear saved measurements ---------------------------------------
 
 def clear_saved(namespace):
     open_tool(namespace, namespace["CLEAR_INDEX"])
-    assert namespace["app"].screen == namespace["DEV_SAVED"]
+    assert namespace["app"].screen == namespace["DEV_DONE"]
     return frame(namespace)
 
 
@@ -2349,12 +1586,12 @@ def test_clear_deletes_every_measurement_and_says_so():
     namespace["State"].files["measurements"] = MEASURED
     drawn = clear_saved(namespace)
     assert drawn[0] == "Done"
-    assert "Measurements cleared" in drawn
+    assert namespace["CLEARED"] in drawn
     assert "measurements" not in namespace["State"].files
     frame(namespace, "A")
     assert app.screen == namespace["DEV"] and \
         app.cursor == namespace["CLEAR_INDEX"]
-    frame(namespace, "UP")                  # display measurements
+    frame(namespace, "UP")                  # display saved measurements
     frame(namespace, "A")
     assert "No measurements saved" in frame(namespace)
 
@@ -2400,7 +1637,7 @@ def test_the_real_delete_measurements_on_a_real_directory():
 def test_clear_with_nothing_saved_says_the_same():
     namespace, app = dev_app()
     drawn = clear_saved(namespace)
-    assert "Measurements cleared" in drawn
+    assert namespace["CLEARED"] in drawn
 
 
 def test_a_file_still_there_after_clearing_says_it_could_not():
@@ -2410,21 +1647,6 @@ def test_a_file_still_there_after_clearing_says_it_could_not():
     drawn = clear_saved(namespace)
     assert "Could not clear" in drawn
     assert namespace["State"].files["measurements"] == MEASURED
-
-
-def test_done_after_clearing_does_not_stick_to_the_next_save():
-    namespace, app = dev_app()
-    clear_saved(namespace)
-    frame(namespace, "A")
-    frame(namespace, "UP")
-    frame(namespace, "UP")                  # measure room flicker
-    frame(namespace, "A")
-    assert app.screen == namespace["DEV_FLICKER"]
-    with FastClock():
-        namespace["badge"].light_level = lambda: 400
-        frame(namespace, "A")
-    frame(namespace, "B")
-    assert "Measurements saved" in frame(namespace)
 
 
 def test_display_with_nothing_saved_says_so():
@@ -2461,7 +1683,8 @@ def test_display_pages_through_the_file():
         app = namespace["app"]
         namespace["State"].files["measurements"] = MEASURED
         open_display(namespace)
-        expected = measure.pages(MEASURED, namespace["menu_rows"]())
+        expected = namespace["measurement_pages"](
+            MEASURED, namespace["menu_rows"](), lambda line: [line])
         count = len(expected)
         assert count == 5     # dark; backlight_curve and its (cont.); ...
         drawn = frame(namespace)
@@ -2522,252 +1745,6 @@ def test_a_long_title_keeps_its_end():
         - 2 * reserve
 
 
-# --- dev mode: the case lights ask for attention ------------------------------
-
-def lights_over(namespace, frames=40):
-    """Every case-light level a screen shows over `frames` frames."""
-    badge = namespace["badge"]
-    seen = set()
-    for _ in range(frames):
-        frame(namespace)
-        seen.add(badge.lights)
-    return seen
-
-
-def test_the_case_lights_flash_while_a_measurement_screen_waits():
-    # The user is holding the badge screen-first against a mirror or another
-    # badge, so a screen that needs them flashes the rear LEDs.
-    namespace, app = dev_app()
-    open_tool(namespace, 0)                     # the Dark room prompt
-    assert app.screen == namespace["DEV_PROMPT"]
-    assert lights_over(namespace) == {0.0, 1.0}
-
-    namespace, app = dev_app()
-    open_tool(namespace, 1)                     # Who goes first?
-    assert app.screen == namespace["DEV_ROLE"]
-    assert lights_over(namespace) == {0.0, 1.0}
-
-
-def test_the_case_lights_flash_on_done_and_stay_off_while_measuring():
-    namespace, app = dev_app()
-    mirror_badge(namespace)
-    badge = namespace["badge"]
-    levels = set()
-    real = badge.caselights
-
-    def record(level):
-        if app.screen == namespace["DEV_MEASURE"] and app.run_begun:
-            levels.add(level)
-        real(level)
-    badge.caselights = record
-    complete_mirror_run(namespace)
-    assert levels == {0.0}, "the lights must stay off while measuring"
-    assert app.screen == namespace["DEV_SAVED"]
-    assert lights_over(namespace) == {0.0, 1.0}
-
-
-def test_the_case_lights_flash_while_no_answer_is_shown():
-    namespace, app = dev_app()
-    namespace["badge"].light_level = lambda: 32      # nobody answers
-    badge = namespace["badge"]
-    lit = set()
-    with FastClock() as clock:
-        open_tool(namespace, 1)
-        frame(namespace, "A")                   # I go first
-        frame(namespace, "A")                   # start
-        for _ in range(2000):
-            clock.us += 50000
-            drawn = frame(namespace)
-            if "No answer from the other badge" in drawn:
-                lit.add(badge.lights)
-            elif app.screen == namespace["DEV_MEASURE"] and app.run_begun:
-                assert badge.lights == 0.0, "lit while measuring"
-            if app.screen == namespace["DEV_PROMPT"]:
-                break
-    assert lit == {0.0, 1.0}, lit
-
-
-# --- dev mode: probe frame timing ---------------------------------------------
-
-PROBE_INDEX = 2
-
-
-def run_probe(namespace, limit=20):
-    """Prompt, A, then frames until the probe leaves its screen."""
-    app = namespace["app"]
-    open_tool(namespace, PROBE_INDEX)
-    assert app.screen == namespace["DEV_PROBE_PROMPT"]
-    frame(namespace, "A")
-    seen = []
-    for _ in range(limit):
-        if app.screen != namespace["DEV_PROBE"]:
-            break
-        seen.append(frame(namespace))
-    return seen
-
-
-def test_the_probe_prompt_says_what_it_does_and_b_goes_back():
-    namespace, app = dev_app()
-    open_tool(namespace, PROBE_INDEX)
-    drawn = frame(namespace)
-    assert drawn[0] == "Probe frame timing"
-    assert "A - Start   B - Back" in drawn
-    frame(namespace, "B")
-    assert app.screen == namespace["DEV"] and app.cursor == PROBE_INDEX
-    assert app.probe is None
-
-
-def test_the_probe_shows_each_step_before_it_runs_and_then_saves():
-    import gc
-    namespace, app = dev_app()
-    namespace["State"].files["measurements"] = MEASURED
-    seen = run_probe(namespace)
-    steps, titles = namespace["STEPS"], namespace["STEP_TITLES"]
-    for i, name in enumerate(steps):
-        assert "%s %d/%d" % (titles[name], i + 1, len(steps)) in seen[i], \
-            seen[i]
-    assert app.screen == namespace["DEV_SAVED"] and app.saved_ok
-    saved = namespace["State"].files["measurements"]
-    assert saved["mirror"] == MEASURED["mirror"], "the mirror results were lost"
-    probe = saved["frame_probe"]
-    assert sorted(probe) == sorted(list(steps) + ["firmware", "temperature_c"])
-    for name in steps:
-        if name != "ring":
-            assert "error" not in probe[name], (name, probe[name])
-    assert sorted(probe["breakdown"]) == ["field", "status"]
-    assert sorted(probe["breakdown"]["field"]) == sorted(
-        ["frame", "clear", "field", "measure", "present", "poll"])
-    assert sorted(probe["breakdown"]["status"]) == sorted(
-        ["frame", "clear", "bands", "column", "lights", "measure", "present",
-         "poll"])
-    assert probe["firmware"]["set_framerate"] in (True, False)
-    reads = dict(probe["reads"])
-    detail = reads.pop("detail")
-    assert sorted(reads) == ["loop", "read", "sample", "transfer",
-                             "transfer_timed"]
-    for entry in reads.values():
-        assert entry["calls"] > 0 and entry["per_s"] > 0, entry
-    # Where the instrumented listener's time went: one work() a pass, and
-    # its parts each timed.
-    timed = reads["transfer_timed"]["calls"]
-    assert detail["work"]["calls"] == timed, (detail["work"], timed)
-    for name in ("window_value", "decide_slot", "data_field"):
-        assert name in detail, detail
-    assert isinstance(detail["phase"], int)
-    assert "flicker" in detail and detail["exact"] is False
-    # No ring here: the ring step says why, and the firmware entry too.
-    assert "error" in probe["ring"]["quiet"]
-    assert probe["firmware"]["ring"]
-    # What it changed, it put back.
-    assert gc.isenabled()
-    assert namespace["display"].backlights[-1] == namespace["BACKLIGHT_NORMAL"]
-    assert app.probe is None and app.probe_run is None
-    frame(namespace)
-    frame(namespace, "A")
-    assert app.screen == namespace["DEV"] and app.cursor == PROBE_INDEX
-
-
-def test_the_probe_presents_its_status_before_blocking():
-    namespace, app = dev_app()
-    open_tool(namespace, PROBE_INDEX)
-    frame(namespace, "A")
-    display = namespace["display"]
-    before = display.updates
-    frame(namespace)                       # the refresh step
-    # One present to show "Refresh rate 1/6", then the step's own.
-    assert display.updates == before + 1 + 1 + load_module("share_wifi", "probe").PRESENTS
-
-
-def test_the_reads_step_never_presents():
-    # The point of it: a listener on a static screen, reading with nothing
-    # presented. Only the status frame shown before it goes out.
-    namespace, app = dev_app()
-    open_tool(namespace, PROBE_INDEX)
-    frame(namespace, "A")
-    while app.probe.step_name != "reads":
-        frame(namespace)
-    display = namespace["display"]
-    before = display.updates
-    frame(namespace)
-    assert "reads" in app.probe.results()
-    assert display.updates == before + 1
-
-
-def test_the_probe_transfer_pass_is_a_listener_that_stays_one():
-    # What the reads step times as "transfer": the real loop's pass, on a
-    # Transfer that keeps listening however long nobody sends.
-    namespace, app = dev_app()
-    reader = namespace["polled_reader"]()
-    t = [10000000]
-    saved = time.ticks_us
-    time.ticks_us = lambda: t[0]
-    reader.ticks_us = time.ticks_us
-    reader.light = lambda: (t.__setitem__(0, t[0] + 60) or 32)
-    try:
-        listener = namespace["probe_listener"](reader)
-        assert listener.phase == protocol.PHASE_DATA
-        assert listener.scheme == protocol.SCHEME_BACKLIGHT
-        assert protocol.SLOT_LADDER[listener.clock.index] == 32
-        app.probe_listener = listener
-        app.probe_passes = 0
-        for _ in range(3000):
-            app.probe_transfer()
-    finally:
-        time.ticks_us = saved
-    assert t[0] - 10000000 > 2000000, "it should have listened for seconds"
-    assert listener.phase == protocol.PHASE_DATA, listener.result
-    assert listener.result is None
-
-
-def test_b_cancels_the_probe_and_saves_nothing():
-    namespace, app = dev_app()
-    open_tool(namespace, PROBE_INDEX)
-    frame(namespace, "A")
-    frame(namespace)
-    frame(namespace, "B")
-    assert app.screen == namespace["DEV"] and app.cursor == PROBE_INDEX
-    assert "measurements" not in namespace["State"].files
-    assert app.probe is None
-    assert namespace["display"].backlights[-1] == namespace["BACKLIGHT_NORMAL"]
-
-
-def test_a_failed_probe_save_says_so():
-    namespace, app = dev_app()
-    namespace["State"].fail_writes = True
-    run_probe(namespace)
-    assert app.screen == namespace["DEV_SAVED"] and not app.saved_ok
-    assert "Could not save measurements" in frame(namespace)
-
-
-def test_probe_results_appear_in_display_measurements():
-    namespace, app = dev_app()
-    run_probe(namespace)
-    frame(namespace, "A")                  # Done -> Dev Mode
-    frame(namespace, "DOWN")
-    frame(namespace, "DOWN")
-    frame(namespace, "A")
-    assert app.screen == namespace["DEV_DISPLAY"]
-    titles = [page[0] for page in app.pages]
-    assert any("frame_probe.refresh" in t for t in titles), titles
-    assert any("breakdown.status" in t for t in titles), titles
-    for _ in range(len(app.pages)):        # every page drawn, for the fit test
-        frame(namespace, "DOWN")
-
-
-def test_the_panel_is_restored_after_each_step_so_the_next_status_shows():
-    # The breakdown draws the measuring screen, whose first step is the
-    # ambient reading with the backlight off.
-    namespace, app = dev_app()
-    open_tool(namespace, PROBE_INDEX)
-    frame(namespace, "A")
-    display = namespace["display"]
-    while app.probe.step_name != "breakdown":
-        frame(namespace)
-    frame(namespace)
-    assert 0.0 in display.backlights, "the breakdown never set its backlight"
-    assert display.backlights[-1] == namespace["BACKLIGHT_NORMAL"]
-
-
 # --- display measurements: values wider than the screen ------------------------
 
 LONG_VALUES = {"frame_probe": {
@@ -2793,9 +1770,9 @@ def test_a_value_wider_than_the_screen_wraps_instead_of_being_cut():
             limit = width - hang if continued else width
             assert namespace["text_width"](text) <= limit, (text, limit)
         seen[page[0]] = rows
-    version = seen["frame_probe.firmware"]
-    assert version[0][0].startswith("version: ") and not version[0][1]
-    assert len([r for r in version if r[1]]) >= 1, version
+    rows = seen["frame_probe.firmware"]
+    at = [i for i, r in enumerate(rows) if r[0].startswith("version: ")][0]
+    assert not rows[at][1] and rows[at + 1][1], rows
     # Every character is still there, in order, the breaks aside.
     for key, rows_key in (("version", "frame_probe.firmware"),
                           ("error", "frame_probe.write"),
@@ -2826,33 +1803,6 @@ def test_wrapped_rows_are_drawn_indented_under_their_line():
             box = [b for t, b in boxes if t == text][0]
             assert box[0] == margin + (hang if continued else 0), (text, box)
         frame(namespace, "DOWN")
-
-
-def test_the_status_between_tests_goes_back_to_hires_with_runs_clear():
-    # A 2nd-badge run goes from a turn's tests back to its status column; the
-    # column is text and must be HIRES, with run()'s clear back on.
-    namespace, app = dev_app()
-    namespace["badge"].light_level = lambda: 32
-    badge = namespace["badge"]
-    with FastClock() as clock:
-        open_tool(namespace, 1)
-        frame(namespace, "A")           # I go first
-        frame(namespace, "A")           # start
-        for _ in range(80):             # into the noise second and calling
-            clock.us += 50000
-            frame(namespace)
-        assert app.run_begun and app.run.test_name is None
-        # As a turn's last test would have left it.
-        namespace["begin_signalling"]()
-        app.signalling = True
-        clock.us += 50000
-        screen = namespace["screen"]
-        screen.rects = []
-        drawn = frame(namespace)
-    assert badge.current_mode == namespace["HIRES"] | namespace["VSYNC"]
-    assert badge.default_clear == namespace["color"].black
-    assert not app.signalling
-    assert len(screen.rects) == 2 and "B - Cancel" in drawn
 
 
 # --- the alignment screen ---------------------------------------------------
@@ -2923,23 +1873,99 @@ def test_a_retry_lines_the_badges_up_again():
     assert app.screen == "transfer" and app.transfer.leader is True
 
 
-def test_the_2nd_badge_prompt_is_the_alignment_screen():
-    namespace, app = dev_app()
-    open_tool(namespace, 1)
-    frame(namespace, "A")                 # I go first
-    screen = namespace["screen"]
-    screen.rects = []
-    drawn = frame(namespace)
-    assert drawn[0] == "Dark room"
-    assert namespace["ALIGN_TEXT"] in drawn
-    assert any(r[1] <= screen.width // 2 < r[1] + r[3]
-               and r[4] == screen.height for r in screen.rects), screen.rects
 
 
-def test_the_probe_times_a_full_staircase_replay():
-    # M7's replay: every kept sample of a full buffer re-fed, after a fit.
-    namespace, app = dev_app()
-    out = namespace["probe_replay"]()
-    protocol = load_module("share_wifi", "protocol")
-    assert 0 < out["samples"] <= protocol.FLICKER_BUFFER, out
-    assert out["us"] >= 0
+# --- display: sections and pages, the app's own --------------------------------
+
+def sample_measurements():
+    return {
+        "second_badge": {"role": "first",
+                         "dark": {"ambient": 16,
+                                  "loopback_ring": {"error": "no sync symbol"}}},
+        "mirror": {"dark": {
+            "ambient": 32,
+            "levels": {"mid_share": 0.4, "high": 112, "span": 80, "low": 32,
+                       "mid": 64},
+            "backlight_curve": {"1.0": 112, "0.0": 16, "0.5": 64},
+            "flicker": {"1.0": {"verdict": "averages", "min": 96}},
+        }},
+    }
+
+
+def test_sections_are_titled_by_json_path_numbers_first_then_by_name():
+    namespace, app = app_with()
+    got = namespace["sections"](sample_measurements(), "", [])
+    assert [title for title, _ in got] == [
+        "mirror.dark", "mirror.dark.backlight_curve",
+        "mirror.dark.flicker.1.0", "mirror.dark.levels", "second_badge",
+        "second_badge.dark", "second_badge.dark.loopback_ring"]
+    by_title = dict(got)
+    assert by_title["mirror.dark"] == ["ambient: 32"]
+    assert by_title["mirror.dark.backlight_curve"] == [
+        "0.0: 16", "0.5: 64", "1.0: 112"]
+    assert by_title["mirror.dark.levels"] == [
+        "high: 112", "low: 32", "mid: 64", "mid_share: 0.4", "span: 80"]
+    assert by_title["mirror.dark.flicker.1.0"] == ["min: 96",
+                                                   'verdict: "averages"']
+    assert by_title["second_badge"] == ['role: "first"']
+
+
+def test_pages_split_long_sections_with_cont_titles():
+    namespace, app = app_with()
+    pages = namespace["measurement_pages"]
+    got = pages(sample_measurements(), 3, lambda line: [line])
+    titles = [title for title, _ in got]
+    assert titles[3:5] == ["mirror.dark.levels", "mirror.dark.levels (cont.)"]
+    assert got[3][1] == ["high: 112", "low: 32", "mid: 64"]
+    assert got[4][1] == ["mid_share: 0.4", "span: 80"]
+    flat = [line for _, lines in got for line in lines]
+    assert flat == [line for _, lines in namespace["sections"](
+        sample_measurements(), "", []) for line in lines]
+    assert pages({}, 5, lambda line: [line]) == []
+
+
+def test_wrapped_lines_keep_their_rows_together_on_a_page():
+    namespace, app = app_with()
+
+    def wrap(line):
+        return [(word, i > 0) for i, word in enumerate(line.split(" "))]
+    got = namespace["measurement_pages"](
+        {"s": {"a": "x", "b": "one two three", "c": "y"}}, 4, wrap)
+    assert got == [
+        ("s", [("a:", False), ('"x"', True)]),
+        ("s (cont.)", [("b:", False), ('"one', True), ("two", True),
+                       ('three"', True)]),
+        ("s (cont.)", [("c:", False), ('"y"', True)])]
+
+
+def test_a_line_longer_than_a_page_is_split_across_pages():
+    namespace, app = app_with()
+    got = namespace["measurement_pages"](
+        {"s": {"a": "1 2 3 4 5 6 7", "b": "z"}, "t": {"c": 1}}, 3,
+        lambda line: line.split(" "))
+    assert [title for title, _ in got] == ["s", "s (cont.)", "s (cont.)",
+                                           "s (cont.)", "t"]
+    assert got[2][1] == ["6", '7"']
+    assert got[3][1] == ["b:", '"z"']
+
+
+def test_every_shown_line_reads_back_as_the_value_it_shows():
+    # The display is for typing a file back in by hand: every line's value is
+    # JSON, and the paths and lines rebuild the file exactly.
+    import json
+    namespace, app = app_with()
+    data = sample_measurements()
+    data["mirror"]["dark"]["flicker"]["0.74"] = {"sd": 6.2, "verdict": "x y"}
+    got = namespace["measurement_pages"](data, 4, lambda line: [line])
+    rebuilt = {}
+    for title, lines in got:
+        node, rest, src = rebuilt, title.replace(" (cont.)", ""), data
+        while rest:
+            key = next(k for k in sorted(src, key=len, reverse=True)
+                       if rest == k or rest.startswith(k + "."))
+            node, src, rest = node.setdefault(key, {}), src[key], \
+                rest[len(key) + 1:]
+        for line in lines:
+            key, value = line.split(": ", 1)
+            node[key] = json.loads(value)
+    assert rebuilt == data

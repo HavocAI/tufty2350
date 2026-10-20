@@ -9,8 +9,11 @@ firmware/apps/<app>/  one app -- __init__.py, icon.png, its assets
 modules/              the firmware's own Python and C modules
 tests/                host-only: the harness and runner, shared by every app
   <app>/              one app's tests, and any tools only it needs
-.agents/              notes for agents: tasks/, context/ and
-  docs/               reference notes; start at .agents/docs/README.md
+.agents/              notes for agents; start at .agents/README.md
+  docs/               the badge and the test harness: reference notes
+  optical_data_transfer/  the protocol: spec, reasons, tests, data
+  share_wifi/         the app: its spec and the briefing
+  tasks/              one file per piece of work; the protocol's in tasks/optical_data_transfer/
 ```
 
 **Tests mirror the apps**, in `tests/<app>/` with the same name as
@@ -38,7 +41,7 @@ Every one of those is a bug already shipped to hardware.
 **Read [.agents/docs/badgeware-patterns.md](.agents/docs/badgeware-patterns.md) before writing
 badge code.** It is the how-to: app skeleton, loop shapes, menus, scrolling, text
 layout, blocking calls, and the traps that have already cost us time. The rest of
-[.agents/docs/](.agents/docs/) is reference — start at [.agents/docs/README.md](.agents/docs/README.md), which says
+[.agents/docs/](.agents/docs) is reference — start at [.agents/docs/README.md](.agents/docs/README.md), which says
 which file answers which question and how confident each claim is.
 The API is small but unusual, and guessing at it wastes a hardware round-trip.
 Official docs: <https://badgewa.re/docs>. If you learn something those files don't
@@ -47,7 +50,7 @@ cover, or that contradicts them, update them in the same change.
 ## Two firmwares: the badge runs v2, this repo is v3
 
 **The badge on the desk runs v2.0.2** -- `BW-1.27.0, on 2026-04-10`, read off
-it by Dev Mode's *probe frame timing* (`frame_probe.firmware.version`).
+it by the `frame_probe` subtool (`frame_probe.firmware.version`).
 **This repo's firmware source** -- [modules/](modules/), [board/](board/) -- is
 **v3.0.2-era**, upstream through 2026-08-17, and **the emulator** at
 <https://try.badgewa.re> runs current upstream, v3.x. Neither is evidence
@@ -59,7 +62,7 @@ were believed "wrong" when they were only v2:
 
 | Marker | Means |
 |---|---|
-| **[measured-v2]** | measured on the badge running v2: every frame time, allocation cost and hardware run in `.agents/docs/hardware-measurement-*.json` |
+| **[measured-v2]** | measured on the badge running v2: every frame time, allocation cost and hardware run, summarised in `.agents/optical_data_transfer/data.md` |
 | **[verified-v2]** | seen to happen, or not, on the badge running v2 |
 | **[measured-v3]**, **[verified-v3]** | the same on hardware running v3 -- nothing yet |
 | **[measured-all]**, **[verified-all]** | measured or seen on the v2 badge, but a physical property -- the sensor, the panel, the light between them -- so it holds whatever the firmware |
@@ -82,7 +85,8 @@ from the v2.0.2 source (commit `db958ce`). What is known to differ:
 | `display.set_framerate` | absent **[measured-v2]** | present |
 | GC block size | 16 bytes: a 4-item tuple costs **65-145 µs** to allocate, varying run to run, a 2-item one 2.9 **[measured-v2]** | 32 bytes (2026-07-31); a 4-item tuple fits one block. Unmeasured |
 | `MICROPY_GC_NO_SCAN`, `MICROPY_HW_VM_IN_RAM` | no | yes (2026-06-20): ~20% faster interpreter |
-| `display.backlight(v)` | PWM duty `v^2.8`, **no floor**: the backlight is dark below about 0.45, and a mirror run read 0.0-0.4 as off **[measured-v2]**; the backlight scheme's middle, 0.80, is ~54% duty | a floor at 12.5% duty (2026-08-08), though 0 is still off **[source-v3]**; 0.80 is ~59%. The driver does not light below roughly 11% duty on either |
+| System clock | **200 MHz** **[measured-v2]** (`machine.freq()`): the backlight's PWM is 3,052 Hz, a 328 µs period | 250 MHz (2026-06-20): 3,815 Hz, 262 µs **[source-v3]** |
+| `display.backlight(v)` | PWM duty `v^2.8`, **no floor**: the backlight is dark below about 0.45, and a mirror run read 0.0-0.4 as off **[measured-v2]**; the backlight scheme's middle, 0.80, is ~54% duty | a floor at 12.5% duty (2026-08-08), though 0 is still off **[source-v3]**; 0.80 is ~59%. The driver does not light below roughly 11% duty on either **[source-v3]**; this badge's measured 7-9% (`channel`, 2026-10-09f) **[measured-all]** |
 | Alignment constants (`CENTER`, `MIDDLE`, ...) | **absent** under both spellings: both raised on the first frame **[verified-v2]** | present, hoisted into `builtins` (2026-07-29) |
 | `screen.text(rect)` layout | the older text path | native layout in `screen.text` (2026-07-29) |
 | Spritesheets | neither `spritesheet` nor `image.spritesheet` **[verified-v2]**; but the Python **`SpriteSheet(path, cols, rows)`** and `AnimatedSprite` globals exist **[source-v2]**, untried on the badge | `image.spritesheet(cols, rows)` (v3.0.0, 2026-08-07) |
@@ -98,13 +102,17 @@ Physical facts do not depend on the firmware and were measured on this badge:
 the sensor's 12-bit ADC, its position, the panel's settle time, how much
 light reaches it. How fast the badge draws, allocates and presents does.
 
-**If the badge is updated to v3**, re-run Dev Mode's *probe frame timing* and
-the mirror tool before trusting any timing figure here: the refresh, the fill
-and allocation costs, and everything derived from them -- the 60Hz rows of the
-protocol's tables, the simulator's `--v2` profile -- were all measured on v2.
-Two badges on different firmware must still interoperate: calibration agrees
-the starting rung from both badges' frame-rate classes, so a 60Hz and a 90Hz
-badge meet on the slower one's (see "Agreeing a rung" in the protocol).
+**If the badge is updated to v3**, re-run the `frame_probe` and `mirror`
+subtools before trusting any timing figure here: the refresh, the fill
+and allocation costs, and everything derived from them -- the 60Hz figures in
+`data.md`, the simulator's `--v2` profile -- were all measured on v2.
+Two badges on different firmware must still interoperate: frame rate no
+longer sets a rung -- nothing is presented in a transfer -- and calibration
+agrees the pair's light -- the Follower decides, the Leader adopts (see
+section 9.6 of the protocol spec). Every supported firmware, v2.0.2 and
+later, reads through the DMA ring, and a badge whose ring is refused does
+not transfer (since 2026-10-11). In simulation a v2/v3 pair delivers 144 of
+144 in every row [simulation; v3's curve source-v3, unmeasured].
 
 ## Apps
 
@@ -117,254 +125,132 @@ Pimoroni set plus other team apps; see [README.md](README.md).
   — so almost every network renders as `Unknown (4194308)`. **[source-v3]** It is
   also the one app the simulator cannot run, because there is no `network`
   module there.
-- `share_wifi` — shares credentials between badges over the screen and light
-  sensor. Seven files: `protocol.py` is the wire format and state machine, pure
-  Python with no badge globals and no knowledge of WiFi; `reader.py` is how a
-  transfer reads the sensor, as times and means, pure too; `measure.py` is Dev
-  Mode's measurement engine, `probe.py` its frame timing probe and
-  `flicker.py` its room-flicker capture, all pure in the same way;
-  `__init__.py` is the shell around them — drawing, buttons, storage,
-  connecting; and `fastadc.py`, badge-only, drives the RP2350's ADC and DMA
-  registers: the DMA ring a transfer reads through, its viper kernels, and
-  the probe's captures.
+- `share_wifi` — shares credentials between badges with light: one badge
+  steps its backlight behind a white screen, the other reads its light
+  sensor through a DMA ring. Its `README.md` is the overview for people;
+  the app is the proof of concept for the **optical data transfer
+  protocol**, which carries a list of byte fields of any length and knows
+  nothing of WiFi. **The protocol is complete** (the user, 2026-10-19);
+  **files are the goal**, and the file layer is next. **New to it? Start at [.agents/README.md](.agents/README.md)
+  and the briefing, [.agents/share_wifi/state.md](.agents/share_wifi/state.md).**
 
-  It completes a transfer end to end **in simulation**: `python3
-  tests/share_wifi/simulator.py` runs both badges through the production
-  readers and asserts the link invariants on every tick rather than at the
-  end; `tests/share_wifi/sweep.py` sweeps it over 8 seeds x 6 scenarios x 3
-  payloads — a WPA2 credential, an open one with an empty key, and the
-  longest a credential can be. With the sensor as measured, an **EXACT** pair
-  (both reading by DMA ring) delivers **144 of 144 in every row** — dark,
-  lit, flickering, three times the light, slow sensors, slow reads, three
-  times the work — at a median **7.5 s in the dark on 16 ms and 5.5 s lit on
-  8 ms**, against 15.3 and 10.6 s before. A **POLLED** pair (no ring) takes
-  11.1 and 7.3 s and delivers 144 in most rows, as do mixed pairs in all;
-  "before" is HEAD as of 2026-10-06 run in its own simulator over the same
-  rows. One row is under it: POLLED under a once-a-cycle 60 Hz light, 138
-  against 142, data-phase framing failures that move with the unmeasured
-  staircase-replay stall. The first round of this change lost more, and
-  blamed F-B1 for it wrongly -- see "What simulation says" in the protocol. The app shell also launches and walks every screen in
-  the Badgeware simulator without raising — but that is the API working, not
-  the optics.
+  Nine Python files. Pure, with no badge globals, tested under CPython:
+  `protocol.py` (the wire format and state machine), `reader.py` (how a
+  transfer reads the sensor, as times and means), `fastblock.py` (the fast
+  block's codec, a viper kernel that is plain Python under CPython),
+  `devlink.py` (the USB dev link's wire format, imported by the host program
+  too) and `devserver.py` (its command server). Badge-only, registers and
+  firmware calls with their logic handed in: `fastadc.py` (the ADC and DMA
+  behind the ring), `fasttx.py` (a fast block played on the backlight by
+  DMA paced on the PWM wrap) and `usbport.py` (the USB serial). `__init__.py`
+  is the shell: drawing, buttons, storage, connecting, the transfer loop,
+  and Dev Mode's three items.
 
-  **A transfer reads through a reader, and the protocol is called once a
-  slot.** Where the firmware allows, `fastadc.Ring` has the ADC free-run at
-  50 kHz into a 32 KB DMA ring for the whole transfer — 327 ms of readings,
-  each timed by its index — read through PSRAM's uncached alias by viper
-  kernels; `reader.RingReader` gives the protocol times and means. It is
-  made and verified once a launch, on the first transfer; anything it
-  cannot confirm leaves the launch on `reader.PolledReader`, which bins
-  `light_level()` readings whenever the protocol has nothing due.
-  `do_transfer()` waits for `transfer.due_us()`, shows `field_at(now)`, then
-  calls `work(now)`, which decides every slot whose window has closed from
-  the median of its flicker-corrected parts; it collects garbage only when
-  the protocol sets `collect_due`. `finish_transfer()` and `on_exit()` stop
-  the ring. A pair's tier (EXACT or POLLED) and light (LIT or dark) travel
-  in the Follower's staircase, which the Leader adopts; they set the start
-  rung — 8/16 ms EXACT, 16/32 POLLED — and nothing else. The phase lock
-  finds the peer's edge after the fact, in the reader's history. See
-  "Reading" in the protocol, which has the stress sweeps, every unmeasured
-  assumption with its Dev Mode measurement, and where it fails. The 2 ms
-  sample loop it replaced ("reading continuously", 2026-10-05) is described
-  there too: why each reading's cost mattered — a protocol call about a ms
-  on the badge [measured-v2], the unix port no guide to it.
+  **Where it stands.** In simulation every scenario delivers: the 24-row
+  sweep 144 of 144 a row over 8 seeds, the twelve hard rows 1296 of 1296
+  over 72; a credential takes 1.4 s lit, 1.7-1.8 in flicker, 2.1 dark.
+  On hardware (v2), **one badge facing a mirror** has run every piece a
+  transfer uses -- the ring, slot-rate symbols, fast blocks through the
+  protocol's own code -- and decoded them. **No transfer between two
+  badges has run: there is no second badge.** The figures, and what each
+  decision rests on, are in
+  [.agents/optical_data_transfer/data.md](.agents/optical_data_transfer/data.md).
 
-  **Breaking in** stays: a Follower that loses the block shows high, and the
-  Leader, which reads while it transmits, stops at once and resends after
-  repeating its last verdict. **Mains flicker** is fitted in calibration —
-  the region, 50 or 60 Hz, and the light's shape, from a window the peer is
-  known dark in, where each badge's fit stall lands — then every part is
-  corrected from a table and the mains' drift tracked by a phase lock (see
-  "Mains flicker is fitted" in the protocol). Before any fit, a POLLED
-  Follower in the handshake drops a coarse sample its own present cut short
-  (`HANDSHAKE_GAP_MS`).
+  **How a transfer works**, in brief (the spec has it all):
+  - **Signals on the backlight alone**, behind a white screen drawn once;
+    nothing signals in pixels. Data levels 0.5 / 0.82 / 1.0, beacons 0 / 1.0
+    (`LEVEL_SCHEMES`).
+  - **Reads through the DMA ring**: the ADC free-runs at 50 kHz into 32 KB,
+    327 ms of readings; the protocol decides each slot after the fact. A
+    badge whose ring cannot be made or verified refuses to transfer; there
+    is no polled fallback.
+  - **Handshake**: the Leader's Announce (14 ms halves), the Follower's one
+    staircase, whose repetitions carry the pair's light (the Follower
+    decides, the Leader adopts); each badge fits the room's mains flicker
+    in the shared gap and corrects every reading after; the Leader holds
+    its first block back in flicker.
+  - **Payload: fast blocks only** (since 2026-10-18): 2-level PAM at 2-6
+    PWM periods a symbol (F0-F3), each block framed and answered at the
+    slot rate (8 ms lit, 16 dark, down to 32). No slot-symbol payload, no
+    breaking in, and a badge without the fast pacer cannot share.
+  - **Not backward compatible**: both badges need the same build;
+    share_wifi is unreleased.
 
-  **F-B1, open:** a Follower in `STEP_VERDICT` cannot match the Leader's
-  Data Sync Error, whose tail is shorter than the pattern it looks for, so a
-  demotion the Leader starts can split the rungs. It turns a CRC failure
-  into a split: 2 of 576 POLLED runs in one sweep, none in the last, and
-  none once fixed in simulation. Fix it next.
+  **Every measurement tool lives off the badge**, in
+  `tests/share_wifi/devtests/`: the subtools `mirror`, `second_badge`,
+  `frame_probe`, `room_flicker`, `fast_loopback`, `files` and `reset`, over
+  the libraries in `devtests/lib/` (`measure.py`, `probe.py`, `flicker.py`
+  pure; `fastloop.py`; `toolkit.py`). They reach the badge over the dev
+  link, never in the app; uploaded ones with `MENU` entries also run from
+  Dev Mode, untethered.
 
-  The screen transmits on **the whole screen, at `LORES`, with nothing else
-  drawn**, `run()`'s clear switched off and the field redrawn only when it
-  changes; the case lights say what is happening. It used to be two edge bands
-  with a column of text between them, and on the v2 badge that screen took
-  three 60Hz refreshes a frame -- drawing, not the panel write, was the cost. The
-  whole screen also settles where the sensor is: it sits about 1mm outside the
-  *right* edge and reads a patch near itself, and two badges facing each other
-  are mirrored, so whichever edge it is near is now the field. See "Screen as a
-  transmitter" in the protocol.
+  **Dev Mode**, revealed by holding C for 5 s on the main screen, has
+  *Display Saved Measurements*, *Clear Saved Measurements* (the file and
+  every stored tool) and *USB Dev Link*, then the uploaded tools' entries.
+  B on the main menu leaves the app.
 
-  **One data scheme, the backlight**, in `LEVEL_SCHEMES` in `protocol.py`:
-  white pixels for every symbol, and `display.backlight()` per symbol — 0.5
-  for low (dim, not off, which keeps the sensor faintly lit and cut the dark
-  room's edge delay from 1.2-1.9 ms to 0.3 on the badge), 0.82 for the
-  middle (57% PWM duty on the badge's v2, whose backlight has no floor; 61%
-  on v3 — see the table above), 1.0 for high. *Fields*, levels in the
-  pixels, now draws only the beacons; the fields staircase and the choice
-  between schemes went (see "Why the fields staircase went" in the
-  protocol).
+  **The USB dev link** lets a computer drive the badge over the cable.
+  `tests/share_wifi/devlink_host.py OUTDIR` (needs pyserial: `sudo apt
+  install python3-serial`, or pip in a venv; run it as `sg dialout -c
+  "..."`) lists and runs the subtools and two instant built-ins
+  (`measurements`, `clear`), uploads with `new` (`--lib` for a library;
+  `sync` sends the whole tree), deletes with `remove`, and saves what they
+  send as `OUTDIR/<subtest>.<timestamp>.<ext>`. Given a command after
+  OUTDIR it runs that one and exits 0 or non-zero, for scripts.
+  - While the link is open, Ctrl-C is off, so mpremote cannot interrupt the
+    app; B gives the port back. A run is armed with a hard cancel: B's IRQ
+    injects Ctrl-C through dupterm, and the host's raw 0x03 does it too.
+  - No USB write and no ADC read is allowed while the DMA ring runs.
+  - Timing figures never come from inside an open link session:
+    collections double there.
+  - **With no hands**: the badge plugged in with its menu running,
+    `tests/usbrun.py` resets it over the REPL, puts this tree's share_wifi
+    in `/runs/` and launches it with `builtins.DEV_AUTORUN = "link"`;
+    `tests/share_wifi/autorun_host.py OUTDIR "run mirror dark" ...` syncs
+    the subtools and runs each command. It cannot change the light, the
+    mirror, or the number of badges.
+  - The v2 checklist passed on 2026-10-08/09 **[verified-v2]**; still
+    **[unverified]**: unplugging during a run other than `files`'s, and the
+    RP2350 errata. The how-to and checklist: "The USB dev link" in
+    `.agents/docs/testing.md`; the wire format: the app spec.
 
-  Beware what `tests/share_wifi/simulator.py` takes for granted. It once
-  modelled a middle field at 45% of the swing while the app sent `color.grey`,
-  7% of it, and every scenario passed. It assumes the sensor *averages* the
-  backlight's ~3.8kHz PWM, which the second hardware run **[measured-v2]** at
-  every duty from 0.25 to 1.0. It models the badge as measured — v2's 60 Hz
-  presents, the panel's dead time, the backlight at the next PWM wrap, a
-  sensor whose speed is set by the light on it, fitted to `backlight_step` —
-  and charges every pass, decided slot, collection and flicker fit a cost
-  that blinds a POLLED badge; those costs are guesses until Dev Mode M3 and
-  M7 measure them. `--optics=mirror|aligned|overlap` gives it the measured
-  sensor: 16-count steps, Gaussian noise, an 80-count swing or the swing a
-  second badge is predicted to give (see
-  [.agents/docs/optical-coupling.md](.agents/docs/optical-coupling.md)).
-  `--polled` and `--mixed` choose the readers, `--v3` and `--slow-panel` the
-  timing. The levels are pinned in the spec and checked against the app,
-  the protocol's table and the simulator.
+  **The simulator.** `tests/share_wifi/simulator.py` runs both badges'
+  production code on one timeline against a model of the measured
+  hardware, asserting the link invariants on every tick;
+  `tests/share_wifi/sweep.py ROW...` sweeps it, a row 8 seeds x 6 scenarios
+  x 3 payloads. Beware what it takes for granted: that the sensor averages
+  the PWM (measured), a sensor model fitted to the mirror, a peer's swing
+  predicted rather than measured, and the costs measured on v2. A pass
+  means "agrees with the model". The app shell also walks every screen in
+  the Badgeware emulator without raising -- the API working, not the optics.
 
-  **Calibration is one backlight staircase each way, and the Follower
-  decides the pair.** Each staircase carries its badge's tier in its order
-  and its light in its repetitions — 2 for LIT, 3 for dark; the Follower's
-  carries the *pair's*, which the Leader adopts, so a misread can make the
-  pair slower or faster but cannot split it. The frame-rate classes (FAST,
-  SLOW) went: no badge's frames bound its sampling now. See "The flags" and
-  "Agreeing a rung" in the protocol.
+  **The swing is thin**: the backlight's whole swing, off to full, is
+  64-112 counts on a mirror -- four to seven ADC steps -- with 2-10 counts
+  of noise a reading, so calibration measures each level's noise and needs
+  every gap `GAP_SIGMAS` (4) standard deviations wide.
 
-  The epoch calibration derives is only an estimate on the badge that *measured*
-  the staircase rather than transmitting it, so receivers do not depend on it:
-  they phase-lock onto the peer's real first edge out of black at the start of
-  every message. See "Phase locking" in the spec.
+  A credential is three fields -- SSID, key, security -- so an open network
+  can be shared with no password and a WEP key is not mistaken for a
+  corrupt WPA one. **The badge cannot join a WEP network**: the cyw43
+  driver rejects the auth type before touching the radio, so connecting is
+  refused up front with "WEP networks not supported" while sharing and
+  storing still work; the refusal is probed, not hardcoded. At launch the
+  app seeds its config file with the badge's own network, from `secrets`:
+  the driver has no getter for a station PSK, so the network a badge is
+  *currently* on cannot be recovered. Every judgement about what a field
+  may contain belongs to the caller: `valid_credential()` in `__init__.py`
+  is where WiFi's limits live.
 
-  **It has now been measured on hardware (v2), and the swing is thin.** Mirror
-  runs put the panel's whole black-to-white swing at **64-96 counts -- four to
-  six ADC steps** -- with a standard deviation of 2-10 counts per reading. A
-  fixed floor of 192 counts, `MIN_CONTRAST`, once refused all of it, on a
-  reading of the noise as its peak-to-peak spread (32) rather than its
-  standard deviation. It is gone: calibration measures each level's noise on
-  the link and needs each gap to be `GAP_SIGMAS` (4) standard deviations wide
-  -- see "Separability" in the protocol. The middle field,
-  by contrast, is vindicated -- 0.400 of the swing, exactly where it was
-  designed to land. A second run (2026-10-03, Dev Mode) agrees, and gives the
-  backlight scheme the same swing: no help. See "What the measurement found"
-  in the protocol, and the two `.agents/docs/hardware-measurement-*.json`
-  files.
-
-  The debug menu that produced those numbers has been removed. What it did,
-  and the three things learned building it, are under "How the constants were
-  measured" in the spec.
-
-  **Dev Mode** replaces it: hidden at launch, revealed by C on the main
-  screen, it runs a fixed schedule of tests -- levels, noise, gamma, backlight
-  curve, flicker, settling, backlight step, a mirror loopback (with a dim-low
-  variant), frame timing --
-  in a dark and then
-  a lit room,
-  against a mirror or a second badge, and saves the results to
-  `/state/measurements.json`. The screens are in `__init__.py`; the schedule
-  and every calculation are in `measure.py`, tested under CPython by
-  `tests/share_wifi/test_measure.py` against a simulated panel. The mirror
-  tool and the probe below have run on the badge; the 2nd-badge tool has not.
-  It also measures `averaging` -- whether averaging readings resolves finer
-  than an ADC step -- and an `eye` diagram of two- and three-level symbols at
-  50-100 ms, with the badges held on the alignment line every transfer now
-  starts with: the other badge's edge on a line down the middle of the
-  screen, so its screen covers this one's sensor.
-  `backlight_step` times a change made by the backlight alone, on white
-  pixels: `display.backlight()` is a PWM duty, live at once **[source-v2]**,
-  so it skips both the present's ~19 ms and the panel's 16-24 ms settle, and
-  what is left is the sensor's own response. Its first run (2026-10-05c) put
-  that at **about 1.0-1.3 ms to 90% in a lit room and up to 7.8 ms in the dark**:
-  the phototransistor is slower the less light it has. So the backlight
-  scheme, which now keeps its pixels white for every symbol, low included,
-  is no longer bound by the panel at all. Its capture runs around the call,
-  not after a present. `loopback`, mirror only, sends a symbol block on the
-  badge's own backlight and decodes the reflection with the transfer's own
-  continuous receiver at 50 down to 16 ms: the first hardware check of the
-  continuous path, and a measurement of the edge delay it assumes.
-  Two mirror tests run the same through the **DMA ring**:
-  `backlight_step_ring` (M4) times every transition the backlight scheme
-  makes at 20 µs resolution, and `loopback_ring` (M5) decodes a block with
-  the real EXACT receiver at 16 down to 6 ms -- neither has run yet.
-  **measure room flicker** is a tool of its own: A takes a measurement of
-  about 30 s, as many as wanted, B saves them all under `room_flicker` -- the
-  strongest frequency from 20 Hz to 1 kHz and its size in counts, the
-  amplitude at every harmonic the filter fits (1-4 x 50 and 60 Hz), the
-  transfer's own `FlickerFilter` fit on the capture with the flicker left
-  before and after correction, and the mains' drift from 80 more windows,
-  in mHz **against the badge's own clock** -- because mains flicker would be
-  noise inside the lit room's 8 ms slots -- and `window_residual` (M6), the
-  flicker the fit leaves in an 8 ms rung's window. `flicker.py` is its pure module.
-  *clear saved measurements* deletes the file. The probe's
-  `flicker_filter` step times the filter itself.
-  See "Dev Mode" in
-  [.agents/docs/share_wifi_spec.md](.agents/docs/share_wifi_spec.md), whose
-  "Known gaps" are open decisions.
-
-  Dev Mode's **probe frame timing** found why the first mirror run measured
-  54 ms frames where 11 ms was expected: the badge's v2 firmware runs the
-  panel at 60Hz, and a HIRES screen that filled twice and drew bands and text
-  took three refreshes. It times the panel's refresh, a frame's write, each
-  part of a signalling and a status frame, how fast the sensor can be read
-  with nothing presented (`reads`: what a receiver holding its screen static
-  would get), allocation and garbage collection, and saves them under
-  `frame_probe`. Its first `reads` run (2026-10-05b) put such a listener at
-  2,166 readings a second -- about 40 in a 50 ms slot's read window, against
-  about one while presenting every frame -- which is why a transfer now reads
-  continuously. `reads.transfer` times a pass of the real listen loop, the
-  read rate the simulator's 0.43 ms assumes -- 380 µs on 2026-10-06.
-  `fast_reads` reads the sensor straight from the ADC, through `fastadc.py`:
-  by viper, and by DMA at 500k and 100k a second, each giving its rate and
-  how the noise falls when 1-256 readings are averaged -- how short a slot
-  could be. Its first run (2026-10-06a): viper reads at 359k a second,
-  2.8 µs, and averaging 64 readings brings the noise to about a count, so
-  noise no longer limits a slot -- the sensor's settle does. In the same
-  run `reads.transfer` got *slower*, 705 µs a pass against 380, and the
-  next, with `reads.detail` timing it, showed why: a protocol call per
-  reading costs a ms. `reads.transfer` is now a pass of the transfer loop
-  on the polled reader, and `reads.detail` the parts of its work. The
-  `ring` step (M3) runs the real EXACT listener through the ring for 2 s,
-  quiet and presenting, and `firmware` (M1) records what the ring needs;
-  neither has run yet. Every
-  Dev Mode tool and the probe also record the chip's temperature,
-  `temperature_c`, at each test. It works on v2, and ruled itself out as why
-  the panel's edges were slower in some runs. See "probe frame timing" in the spec
-  and "What the hardware runs at" in
-  [.agents/docs/badgeware-hardware.md](.agents/docs/badgeware-hardware.md).
-
-  **A framing failure costs one rung, not the transfer.** A Follower that loses
-  framing part way through a block now waits for `RESEND_QUIET_SLOTS` of black
-  -- the Leader does not listen while it transmits -- before sending its one
-  Data Sync Error, so one failure is one request and one demotion. Answering at
-  once used to land inside the block still going out, demote the Follower on
-  its own, and walk the two down the ladder a rung apart until both gave up
-  with `ERR_LOST_PEER` at about 306 s. `tests/share_wifi/test_recovery.py`
-  covers that, the empty payload (now one empty block rather than an
-  `IndexError`), and the CRC retry budget a demotion the Follower asks for
-  must restore.
-
-  A credential is three fields -- SSID, key, security -- so an open network can
-  be shared with no password and a WEP key is not mistaken for a corrupt WPA
-  one. **The badge cannot join a WEP network**: the cyw43 driver rejects the
-  auth type before touching the radio and has no code to install a WEP key, so
-  connecting is refused up front with "WEP networks not supported" while
-  sharing and storing still work. That refusal is probed, not hardcoded.
-  `protocol.py` did not change to carry the security field: it takes a list of
-  byte fields of any length and has never cared how many there are.
-
-  At launch it seeds the config file with the badge's own network, from
-  `secrets`, so a badge that has never received a credential still has one to
-  share. That is the only readable source: the CYW43 driver's `config()` has no
-  getter for a station PSK, so the network a badge is *currently* on cannot be
-  recovered. See "This badge's own network" in
-  [.agents/docs/share_wifi_spec.md](.agents/docs/share_wifi_spec.md).
-
-  The protocol is specified in
-  [.agents/docs/optical-data-transfer-protocol.md](.agents/docs/optical-data-transfer-protocol.md);
-  keep the two in step when either changes. It carries a list of byte fields of
-  any length, and is named for what it does, not for its first user. Every
-  judgement about what a field should contain — including how long it may be —
-  belongs to the caller; `valid_credential()` in `__init__.py` is where WiFi's
-  own limits live.
+  **The documents** ([.agents/README.md](.agents/README.md) indexes them):
+  the protocol in [.agents/optical_data_transfer/](.agents/optical_data_transfer)
+  -- `spec.md` **the authority**, `context.md` its reasons, `tests.md` its
+  checks (the three link to nothing outside themselves, so an agent with
+  only `main` can work from them), `data.md` the evidence,
+  `invariants.md` what the simulator asserts; the app in
+  [.agents/share_wifi/](.agents/share_wifi) -- `app-spec.md` and the
+  briefing `state.md`. Keep the spec and the code in step when either
+  changes, and add new evidence to `data.md` in the section it bears on,
+  dated, with its marker.
 
 - `rampage_loop` — plays a boat video on a loop. It is a separate, later app
   from the `rampage` that several notes below refer to; that one, with its
@@ -535,10 +421,25 @@ defensively, treat a missing font as "keep the default" rather than a crash.
 `@micropython.native` or `@micropython.viper` before restructuring anything.
 On v2 firmware **[measured-v2]** a 2-item tuple costs 2.9 µs and a 4-item one
 65-145 µs, depending on the run: anything bigger than one 16-byte GC block
-rescans the heap's allocation table. A `gc.collect()` costs 16-64 ms -- a
-slot or more. v3's 32-byte blocks move that threshold, not the cost, and
-are unmeasured. And never call `gc.mem_alloc()` in a timed path -- it walks
-the whole table, ~110 ms on v2.
+rescans the heap's allocation table. A `gc.collect()` costs 10-81 ms -- a
+slot or more -- 0.31 ms + 0.049 ms per KB live + 0.00708 ms per KB up to
+the highest live block (2026-10-13, [measured-v2]), which is wherever the
+app loaded, since v2's `launch()` does not collect first: share_wifi 17 ms
+from a clean heap, 57 with 6 MB of garbage below it. v3's 32-byte blocks move that threshold, not the cost, and
+are unmeasured. And never call `gc.mem_alloc()` or `gc.mem_free()` in a timed path: both
+are the same `gc_info()` walk of the whole table **[source-v2]**, ~110 ms on v2
+-- `mem_free()` as dear as `mem_alloc()`. **A call can allocate too**: a
+Python function whose frame -- locals plus stack -- is over 11 words gets
+it from the heap on every call, and frees it after (`VM_MAX_STATE_ON_STACK`,
+`py/objfun.c`; pystack off). Read in the pimoroni/micropython fork at
+`f173bb7b6`, older than both pins (bw-1.27.0, bw-1.28.0-3), not at either:
+that the pins keep it is **[inferred-v2]** **[inferred-v3]**, and on the
+badge it is **[unverified]** until M7 shows the cost. That was why share_wifi's `correct()` cost
+0.43-0.73 ms **[inferred-v2]**; keep per-sample functions small, and see
+`tests/share_wifi/test_flicker_frames.py` for counting a call's bytes
+under the unix port. Import what only one mode uses
+inside that mode: share_wifi's dev link loads its modules when the link
+opens, not at launch.
 
 **The frame rate is the firmware's, and a frame is whole refreshes.**
 **[measured-v2]** The badge on the desk is v2 (`BW-1.27.0`, 2026-04-10): no
@@ -598,7 +499,6 @@ with the conventional numbering. `wifi_scanner` still maps 0-5, which is why it
 labels nearly everything `Unknown (4194308)`.
 
 **`badge.mode()` rebinds `screen`.** **[source-v3]** **[verified-v2]** --
-`share_wifi` switches to `LORES` and back on the badge:
 changing mode assigns a new `builtins.screen` over the new framebuffer. Anything holding its own reference
 keeps drawing into a buffer nobody presents — read the global each time. The
 firmware boots `LORES | VSYNC`, so an app wanting hires has to say so.
@@ -644,28 +544,35 @@ Anything with a wire format, a parser or a state machine belongs in its own
 module that never mentions `badge`, `screen` or `color`. It can then be imported
 and tested under plain CPython, with none of the stub machinery. Where such a
 module genuinely needs something only the badge knows, inject it — `Transfer`
-takes `frame_ms=lambda: badge.ticks_delta` rather than reaching for it.
+takes its `reader` rather than reaching for the sensor.
 
 `firmware/apps/share_wifi/protocol.py` is the worked example, and
 `tests/share_wifi/test_module_boundary.py` asserts the separation holds.
-`measure.py` beside it is the second: it takes `light=badge.light_level` and
-`ticks_us=time.ticks_us`, and `tests/share_wifi/test_measure.py` checks it
-references no badge globals. `probe.py` takes even the present, the clear and
-the collector as hooks, and `tests/share_wifi/test_probe.py` checks the same. So
-does `flicker.py`, which takes the sensor and the clock, in
-`tests/share_wifi/test_flicker.py`. `fastadc.py` is the exception, and
-deliberately: it is registers and nothing else, and the arithmetic on what
-it reads is `probe.fast_stats()`.
+The dev link's libraries, in `tests/share_wifi/devtests/lib/`, keep the
+rule too: `measure.py` takes its reader, backlight and clock, `probe.py`
+even the present, the clear and the collector as hooks, `flicker.py` the
+sensor and the clock, and `test_measure.py`, `test_probe.py` and
+`test_flicker.py` check each references no badge globals. `devserver.py` takes the USB port and
+the badge as hooks, and `devlink.py`, the wire format, is imported by the
+host program as it stands; `tests/share_wifi/test_module_boundary.py` checks
+both. `fastadc.py`, `fasttx.py` and `usbport.py` are the exceptions, and
+deliberately: registers and firmware calls and nothing else, with
+`machine.mem32`
+and the DMA channel handed to fasttx and every usbport dependency handed in,
+so their logic is tested under CPython (`test_fasttx.py`,
+`test_usbport.py`). `fastblock.py` is pure: `test_module_boundary.py`.
 
 ## Picking up an in-flight task
 
-Briefs for work in progress live in [.agents/](.agents/), one file per task, with
-any context they need beside them. They are disposable: when a task lands, its
-brief is deleted and anything durable moves into `.agents/docs/` or here.
+Briefs for work in progress live in [.agents/tasks/](.agents/tasks), one file per
+task. They are disposable: when a task lands, its brief is deleted and anything
+durable moves into the `.agents/` folder it belongs to, or here.
 
-Nothing is currently open. [.agents/context/optical-link-invariants.md](.agents/context/optical-link-invariants.md)
-outlives its task: it is what `tests/share_wifi/simulator.py` asserts, and it is
-the right place to start if you change anything about the optical link.
+Open tasks, their owners (several need a human at the badge) and what each
+waits on are indexed in [.agents/tasks/README.md](.agents/tasks/README.md).
+[.agents/optical_data_transfer/invariants.md](.agents/optical_data_transfer/invariants.md)
+is what `tests/share_wifi/simulator.py` asserts, and it is the right place to
+start if you change anything about the optical link.
 
 ## Testing without a badge
 

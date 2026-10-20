@@ -52,24 +52,23 @@ def test_protocol_imports_in_a_bare_interpreter():
     result = subprocess.run(
         [sys.executable, "-B", "-c",
          "import sys; sys.path.insert(0, %r); import protocol; "
-         "print(protocol.crc16(b'123456789'))"
+         "print(protocol.fast_stream([b'123456789']).hex())"
          % os.path.join(APPS, "share_wifi")],
         capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
-    assert result.stdout.strip() == str(0x29B1)
+    assert result.stdout.strip() == "0109313233343536373839"
 
 
 def test_the_reader_is_injected_not_imported():
     # The one thing the protocol cannot do by itself is read the sensor. A
-    # reader arrives as an argument -- the ring's or light_level()'s -- and
-    # the protocol never reaches for fastadc, machine or the badge.
+    # reader arrives as an argument -- the ring's -- and the protocol never
+    # reaches for fastadc, machine or the badge.
     protocol = load_module("share_wifi", "protocol")
     source = open(PROTOCOL).read()
     for name in ("fastadc", "import machine", "rp2."):
         assert name not in source, name
 
     class Reader:
-        exact = True
         asked = []
 
         def newest_us(self):
@@ -78,13 +77,60 @@ def test_the_reader_is_injected_not_imported():
 
     transfer = protocol.Transfer(True, (b"net", b"password1"), Reader())
     transfer.work(1000)
-    assert transfer.exact and Reader.asked, "work() should ask the reader"
+    assert transfer.reader is not None and Reader.asked, \
+        "work() should ask the reader"
 
 
 def test_reader_references_no_badge_globals():
     _, read = loaded_names(os.path.join(APPS, "share_wifi", "reader.py"))
     leaked = sorted(read & BADGE_GLOBALS)
     assert not leaked, "reader.py reaches for the badge: %s" % leaked
+
+
+def test_the_dev_link_modules_reference_no_badge_globals():
+    # devlink.py is the wire format the host imports too; devserver.py the
+    # command server, handed the port and the badge. Neither may reach for
+    # either. usbport.py is the badge-only exception, like fastadc.py.
+    for module in ("devlink.py", "devserver.py", "usbport.py"):
+        _, read = loaded_names(os.path.join(APPS, "share_wifi", module))
+        leaked = sorted(read & BADGE_GLOBALS)
+        assert not leaked, "%s reaches for the badge: %s" % (module, leaked)
+
+
+def test_the_dev_link_modules_import_in_a_bare_interpreter():
+    result = subprocess.run(
+        [sys.executable, "-B", "-c",
+         "import sys; sys.path.insert(0, %r); import devlink, devserver, "
+         "usbport; print(devlink.PROTO)" % os.path.join(APPS, "share_wifi")],
+        capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "1"
+
+
+def test_the_fast_block_modules_reference_no_badge_globals():
+    # fastblock.py is the fast block's wire format and decoder, as pure as
+    # protocol.py; fasttx.py touches registers, but through what it is
+    # handed, like usbport.py.
+    for module in ("fastblock.py", "fasttx.py"):
+        _, read = loaded_names(os.path.join(APPS, "share_wifi", module))
+        leaked = sorted(read & BADGE_GLOBALS)
+        assert not leaked, "%s reaches for the badge: %s" % (module, leaked)
+        source = open(os.path.join(APPS, "share_wifi", module)).read()
+        for name in ("import machine", "import rp2", "import fastadc"):
+            assert name not in source, (module, name)
+
+
+def test_the_fast_block_modules_import_in_a_bare_interpreter():
+    # Bare CPython: fastblock's viper kernel runs there as Python, through
+    # its own stubs, with no fakeviper.
+    result = subprocess.run(
+        [sys.executable, "-B", "-c",
+         "import sys; sys.path.insert(0, %r); import fastblock, fasttx; "
+         "print(fastblock.common_div(200000000)[0], len(fastblock.encode("
+         "1, b'')))" % os.path.join(APPS, "share_wifi")],
+        capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "16 141"
 
 
 def test_reader_imports_in_a_bare_interpreter():
@@ -103,7 +149,7 @@ def test_app_shell_still_exposes_the_protocol():
     from harness import load_app
     app = load_app("share_wifi")
     protocol = load_module("share_wifi", "protocol")
-    for name in ("Transfer", "parse_payload", "OK", "ERR_NO_PEER"):
+    for name in ("Transfer", "OK", "ERR_NO_PEER"):
         assert name in app, "%s missing from the app namespace" % name
         assert app[name] is getattr(protocol, name)
 
@@ -130,8 +176,10 @@ NOT_BUILTIN = {"wifi", "secrets", "ntptime", "network", "machine", "time", "gc",
                "json", "math", "random", "os", "sys"}
 
 # Names deliberately probed inside a try/except NameError, to cope with firmware
-# differences. They are expected NOT to exist; referencing them is safe.
-PROBED = {"rom_font"}
+# differences -- or, DEV_AUTORUN, set only by a host launching the app over
+# the REPL (tests/usbrun.py). Usually absent; referencing them
+# is safe.
+PROBED = {"rom_font", "DEV_AUTORUN"}
 
 
 def test_app_imports_everything_that_is_not_a_builtin():
@@ -186,7 +234,8 @@ def test_protocol_knows_nothing_about_wifi():
 def test_payload_is_an_arbitrary_list_of_byte_fields():
     protocol = load_module("share_wifi", "protocol")
     for fields in ([b"one"], [b"a", b"b"], [b"a", b"b", b"c"], [b"", b"x"]):
-        assert protocol.parse_payload(protocol.build_tokens(*fields)) == fields
+        assert protocol.parse_fast_stream(protocol.fast_stream(fields)) \
+            == fields
 
 
 def test_the_app_owns_credential_validation():

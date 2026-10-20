@@ -29,19 +29,19 @@ def phases_reached(link):
 
 
 def test_discovery_and_calibration_complete():
-    # Announce -> peer present -> both staircases -> shared epoch -> data.
-    link = run(settle_ms=8, noise=80, start_skew_ms=1500)
+    # Announce -> the Follower's staircase -> shared gap -> data.
+    link = run(noise=80, start_skew_ms=1500)
     reached = phases_reached(link)
     for phase, name in ((protocol.PHASE_ANNOUNCE, "announce"),
-                        (protocol.PHASE_PRESENT, "peer present"),
-                        (protocol.PHASE_CAL_SEND, "calibration send"),
-                        (protocol.PHASE_CAL_RECV, "calibration receive"),
+                        (protocol.PHASE_LISTEN, "listen"),
+                        (protocol.PHASE_CAL_SEND, "the staircase"),
+                        (protocol.PHASE_CAL_GAP, "the shared gap"),
                         (protocol.PHASE_DATA, "data")):
         assert phase in reached, "never reached %s" % name
 
 
 def test_both_badges_derive_usable_thresholds():
-    link = run(settle_ms=8, noise=80, start_skew_ms=1500)
+    link = run(noise=80, start_skew_ms=1500)
     for side in (link.leader.transfer, link.follower.transfer):
         levels = side.levels
         assert levels is not None, "calibration produced no levels"
@@ -49,16 +49,16 @@ def test_both_badges_derive_usable_thresholds():
         assert levels.black < levels.grey < levels.white
 
 
-def test_the_follower_measures_the_staircase_not_the_silence_after_it():
-    # The staircase alternates every PLATEAU_MS, which to the pre-calibration
-    # detector looks like another beacon. Waiting for the beacon to "disappear"
-    # waited until the staircase had finished, and the Follower then calibrated
-    # against 512 samples of ambient.
-    link = run(settle_ms=8, noise=80, start_skew_ms=0)
-    reader = link.follower.transfer.reader_cal
+def test_the_leader_measures_the_staircase_not_the_silence_around_it():
+    # The Leader reads while it announces, over its last LEADER_CAL_LIMIT
+    # samples: what it measured must be the Follower's staircase, not the
+    # room before it.
+    link = run(noise=80, start_skew_ms=0)
+    reader = link.leader.transfer.reader_cal
     span = max(reader.values) - min(reader.values)
     assert span >= protocol.MIN_SWING, \
-        "follower saw a span of %d: it measured silence, not the staircase" % span
+        "leader saw a span of %d: it measured silence, not the staircase" % span
+    assert len(reader.values) <= protocol.LEADER_CAL_LIMIT
 
 
 def test_the_reader_does_not_go_blind_when_its_buffer_fills():
@@ -91,20 +91,19 @@ def test_epochs_are_close_enough_to_decode():
 
     The Leader derives the shared epoch by DETECTING the end of the Follower's
     staircase; the Follower knows it exactly, having transmitted it. Detection
-    lags by the panel's settling time plus a frame, which measured ~18ms -- half
-    a slot at the rung in use then. A receiver sampling the back half of its own
-    slot landed on the transmitter's transition and nothing decoded.
+    lags, and a lag of half a slot put a receiver sampling the back half of
+    its own slot on the transmitter's transition, where nothing decoded.
 
     The fix is not a better estimate of that instant but refusing to depend on
     it: a receiver phase-locks onto the peer's first edge out of black at the
-    start of every message. See "Phase locking" in the protocol spec.
+    start of every message. See section 10.4 of the protocol spec.
 
     Asserted across seeds because a single seed proved almost nothing here --
     seed 1 passed while half the others failed, at more than one point during
     this work.
     """
     for seed in range(1, 9):
-        link = run(settle_ms=8, noise=80, start_skew_ms=0, seed=seed)
+        link = run(noise=80, start_skew_ms=0, seed=seed)
         leader, follower = link.leader.transfer, link.follower.transfer
         assert leader.levels is not None and follower.levels is not None, \
             "seed %d: calibration did not complete" % seed
@@ -138,18 +137,18 @@ def test_no_invariant_is_violated_carrying_a_multi_block_payload():
     # The worst-case credential: a 32-byte field and a 63-byte one, which cross
     # a block boundary. Multi-block is where two previous attempts broke.
     worst = [b"A" * 32, b"k" * 63]
-    for name in ("datasheet", "realistic", "slow panel"):
+    for name in ("datasheet", "realistic", "late start"):
         link = simulator.build(protocol, worst, seed=1, **simulator.SCENARIOS[name])
         link.run(400)
         assert link.violation is None, "%s:\n%s" % (name, link.violation)
-        assert protocol.parse_payload(link.follower.transfer.received) == worst, \
+        assert link.follower.transfer.received == worst, \
             "%s: payload did not arrive intact" % name
 
 
 def test_the_checker_actually_fails_when_an_invariant_breaks():
     # A checker that cannot fail is worse than none, because the suite then
     # reports its silence as evidence. Break I2 by hand and watch it fire.
-    link = simulator.build(protocol, PAYLOAD, settle_ms=8, noise=80)
+    link = simulator.build(protocol, PAYLOAD, noise=80)
     link.run(60)
     leader, follower = link.leader.transfer, link.follower.transfer
     assert leader.phase == protocol.PHASE_DATA or leader.result, "never reached data"
@@ -175,14 +174,30 @@ def test_the_checker_actually_fails_when_an_invariant_breaks():
 def test_the_checker_catches_a_false_success():
     # I7, the one that matters most: a Leader reporting OK over a Follower that
     # holds nothing means a badge claiming to have shared a credential it did not.
-    link = simulator.build(protocol, PAYLOAD, settle_ms=8, noise=80)
+    link = simulator.build(protocol, PAYLOAD, noise=80)
     leader, follower = link.leader.transfer, link.follower.transfer
     checker = simulator.Invariants(protocol, leader, follower, PAYLOAD)
     leader.result = protocol.OK
-    follower.received = []
+    follower.received = None
     try:
         checker.check(1234)
     except simulator.InvariantError as broken:
         assert "I7" in str(broken), broken
         return
     raise AssertionError("I7 went unreported with the follower holding nothing")
+
+
+def test_long_collections_keep_the_grids_on_a_multi_block_payload():
+    # At the 65-81 ms collections of 2026-10-08 and -09 (GC_MS_HW1) I2
+    # tripped in 5 of these 9 runs while the simulator priced every
+    # amount() of a steady filter as a fitted one (~2.9 ms a slot too
+    # much); priced by path (2026-10-09b), none does.
+    worst = [b"A" * 32, b"k" * 63]
+    for name in ("datasheet", "realistic", "late start"):
+        for seed in (1, 2, 3):
+            link = simulator.build(protocol, worst, seed=seed,
+                                   gc_ms=simulator.GC_MS_HW1,
+                                   **simulator.SCENARIOS[name])
+            link.run(400)
+            assert link.follower.transfer.received == worst, (name, seed)
+            assert link.violation is None, (name, seed, link.violation)

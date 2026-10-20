@@ -1,11 +1,12 @@
-"""reader.py: the ring reader's clock, index and queries, and the polled one.
+"""reader.py: the ring reader's clock, index and queries, and the step() shim's.
 
 A RingReader runs here over a ListRing that a fake clock fills, as the DMA
 fills fastadc.Ring on the badge -- the same class the simulator runs. See
-"Reading" in the protocol.
+section 6 of the protocol spec.
 """
 
 from harness import load_module
+import held
 
 R = load_module("share_wifi", "reader")
 
@@ -30,7 +31,7 @@ class Clock:
 
 def ring_reader(value=lambda i: 7, samples=4096, period=20, per_entry=1,
                 usable_us=None):
-    ring = R.ListRing(samples, period)
+    ring = held.ListRing(samples, period)
     clock = Clock(ring, value, period=period)
     reader = R.RingReader(ring, clock, per_entry=per_entry,
                           usable_us=usable_us)
@@ -41,10 +42,26 @@ def ring_reader(value=lambda i: 7, samples=4096, period=20, per_entry=1,
 def test_a_ring_must_be_a_power_of_two():
     for bad in (1000, 3280):
         try:
-            R.ListRing(bad, 20)
+            held.ListRing(bad, 20)
         except AssertionError:
             continue
         raise AssertionError("%d accepted" % bad)
+
+
+def test_a_ring_shorter_than_its_list_loses_what_the_badge_would():
+    # The simulator's ring holds more entries than the badge's 327.68 ms:
+    # with `length`, each push overwrites the entry that far back, so a
+    # read the badge's ring could not serve finds a newer reading instead.
+    ring = held.ListRing(16, 100, length=12)
+    for value in range(1, 21):          # index i holds i + 1
+        ring.push(value)
+    kept = [ring.buf[i & ring.mask] for i in range(8, 20)]
+    assert kept == list(range(9, 21)), "the 12 newest are intact"
+    assert ring.buf[7 & ring.mask] == 20, "index 7 is gone: a newer reading"
+    plain = held.ListRing(16, 100)
+    for value in range(1, 21):
+        plain.push(value)
+    assert plain.buf[7 & plain.mask] == 8, "without it, kept as long as the list"
 
 
 def test_the_clock_starts_at_zero_and_never_wraps():
@@ -147,51 +164,41 @@ def test_a_fresh_anchor_is_compared_not_adopted():
     assert abs(reader.anchor - anchor) <= 40
 
 
-# --- the polled reader ----------------------------------------------------------
+# --- the step() shim's reader -----------------------------------------------
 
-def test_polled_bins_hold_their_readings_and_gaps_hold_none():
-    reader = R.PolledReader()
+def test_a_held_reader_keeps_each_value_whole_until_the_next():
+    reader = held.HeldReader()
     reader.start()
-    for t in range(0, 4000, 100):
-        reader.add(t, 100)
-    for t in range(6000, 8000, 100):     # 2 ms blind between
-        reader.add(t, 200)
+    for t in range(0, 4000, 1000):
+        reader.add(t, 101)               # not a multiple of 16: kept whole
+    reader.add(4000, 203)
+    reader.add(8000, 203)
     out = [0] * 4
     reader.parts(0, 8000, 4, out)
-    assert out == [100, 100, -1, 200], out
+    # The 101 holds until 4 ms, the 203 from there.
+    assert out == [101, 101, 203, 203], out
     times = [0] * 4
     reader.parts(0, 8000, 4, out, times)
-    assert 0 <= times[0] < 2000 and 6000 <= times[3] < 8000
+    assert times == [1000, 3000, 5000, 7000], times
+    assert reader.newest_us() == 8000
 
 
-def test_a_polled_rise_after_a_blind_gap_is_not_believed():
-    reader = R.PolledReader()
+def test_a_held_readers_rise_is_where_the_value_changed():
+    reader = held.HeldReader()
     reader.start()
-    for t in range(0, 5000, 100):
-        reader.add(t, 50)
-    # The rise fell in a 10 ms gap -- a present, or worse a collection.
-    for t in range(15000, 20000, 100):
-        reader.add(t, 200)
-    assert reader.rise(0, 20000, [100] * 100, 100, 1000) == -1
-    # A loop reading every 2 ms is not blind: its rises are believed.
-    reader.start()
-    for t in range(0, 20000, 2000):
+    for t in range(0, 20000, 1000):
         reader.add(t, 50 if t < 10000 else 200)
-    crossing = reader.rise(0, 20000, [100] * 100, 100, 1000)
-    assert 8000 <= crossing <= 10000, crossing
-    reader.start()
-    for t in range(0, 10000, 100):
-        reader.add(t, 50 if t < 5000 else 200)
-    crossing = reader.rise(0, 10000, [100] * 100, 100, 1000)
-    assert 4800 <= crossing <= 5100, crossing
+    crossing = reader.rise(0, 20000, [100] * 200, 200, 100)
+    assert 9000 <= crossing <= 10100, crossing
+    assert reader.check()
 
 
-def test_the_polled_reader_drops_what_it_can_no_longer_hold():
-    reader = R.PolledReader(bins=16, bin_us=250)
+def test_a_held_reader_drops_what_its_ring_can_no_longer_hold():
+    reader = held.HeldReader()
     reader.start()
-    for t in range(0, 10000, 100):
+    for t in range(0, 1000000, 1000):
         reader.add(t, 100)
-    assert reader.oldest_us() == (reader.head - 15) * 250
     out = [0]
     reader.parts(0, 1000, 1, out)
     assert out == [-1]
+    assert reader.oldest_us() > 500000

@@ -1,18 +1,31 @@
-"""The LIT class, the staircase, and breaking in.
+"""The LIT class, the staircase, the Leader's lead-in, and mains flicker.
 
-See "Reading" and "Breaking in" in the protocol. The unit tests drive
+See sections 6 and 14.1 of the protocol spec. The unit tests drive
 Transfers directly, one reading at a time through step(); the end-to-end ones
 run the simulator.
 """
 
+import math
 import simulator as sim
 from harness import load_module
+from held import HeldTransfer
 
 P = load_module("share_wifi", "protocol")
 
 
+def flicker_size(f):
+    """The largest flicker amplitude a filter holds, in counts."""
+    if f.harmonics is not None:
+        return max([math.sqrt(a * a + b * b) for a, b in f.harmonics] + [0.0])
+    return max(math.sqrt(f.amp[2 * i] ** 2 + f.amp[2 * i + 1] ** 2)
+               for i in range(len(f.amp) // 2))
+
+# The rung the unit tests run on: 32 ms, four reads a ms of step() each way.
+RUNG = P.SLOT_LADDER.index(32)
+
+
 def continuous(leader, scheme=P.SCHEME_BACKLIGHT, payload=(b"net", b"key1")):
-    t = P.Transfer(leader, payload if leader else None)
+    t = HeldTransfer(leader, payload if leader else None)
     t.scheme = scheme
     return t
 
@@ -31,58 +44,60 @@ def test_a_badge_is_lit_on_four_adc_steps_of_black():
     assert not t.is_lit(None)
 
 
-def test_lit_sends_two_repetitions_and_dark_three():
-    t = continuous(True)
-    t.lit = True
-    assert t.cal_reps() == P.CAL_REPS_LIT == 2
-    t.lit = False
-    assert t.cal_reps() == P.CAL_REPS == 3
-    # The Follower's staircase carries the pair's light, not its own.
+def test_lit_sends_one_repetition_and_dark_two():
+    # The Follower's staircase -- the only one -- carries the pair's light.
     f = continuous(False)
-    f.lit, f.pair_lit = True, False
-    assert f.cal_reps() == P.CAL_REPS
+    f.pair_lit = True
+    assert f.cal_reps() == P.CAL_REPS_FAST_LIT == 1
+    f.pair_lit = False
+    assert f.cal_reps() == P.CAL_REPS_FAST == 2
 
 
-def test_the_pair_starts_on_its_tier_and_light():
+def test_the_pair_starts_on_its_light():
     t = continuous(True)
-    for exact, lit, rung in ((True, True, 8), (True, False, 16),
-                             (False, True, 16), (False, False, 32)):
-        t.pair_exact, t.pair_lit = exact, lit
-        assert P.SLOT_LADDER[t.start_index()] == rung, (exact, lit)
+    for lit, rung in ((True, 8), (False, 16)):
+        t.pair_lit = lit
+        assert P.SLOT_LADDER[t.start_index()] == rung, lit
 
 
 def test_a_lit_staircase_reads_back_as_lit_and_a_dark_one_does_not():
-    for reps, lit in ((P.CAL_REPS_LIT, True), (P.CAL_REPS, False)):
+    for reps, lit in ((P.CAL_REPS_FAST_LIT, True), (P.CAL_REPS_FAST, False)):
         values = []
-        for t in range(0, P.staircase_ms(reps), P.CAL_SAMPLE_MS):
-            symbol = P.staircase_field(t, P.ASCENDING, reps)
+        for t in range(0, P.staircase_ms(reps, P.CAL_OPEN_FAST_MS,
+                                         P.PLATEAU_FAST_MS,
+                                         P.CAL_CLOSE_FAST_MS),
+                       P.FINE_MS):
+            symbol = P.staircase_field(t, P.STAIRCASE, reps,
+                                       P.CAL_OPEN_FAST_MS, P.PLATEAU_FAST_MS)
             values.append({P.LOW: 32, P.MID: 64, P.HIGH: 112}[symbol])
-        highs = P.staircase_steps(values, levels())[2]
-        assert (highs <= P.LIT_STEPS_MAX) == lit, reps
+        highs = P.staircase_highs(values, levels())
+        assert (highs <= P.LIT_STEPS_MAX_FAST) == lit, reps
 
 
-def test_staircases_step_in_40ms():
-    assert P.PLATEAU_MS == 40
-    # The Leader's: its long opening gap, 3 x 3 x 40, the closing gap.
-    assert P.staircase_ms(P.CAL_REPS, P.CAL_OPEN_LEADER_MS) == 1010
-    assert P.staircase_ms(P.CAL_REPS_LIT, P.CAL_OPEN_MS) == 740
+def test_the_staircase_steps_in_20ms():
+    assert P.PLATEAU_FAST_MS == 20
+    # The Follower's: its opening, 1 or 2 x 3 x 20, and the shared gap.
+    assert P.staircase_ms(P.CAL_REPS_FAST_LIT, P.CAL_OPEN_FAST_MS,
+                          P.PLATEAU_FAST_MS, P.CAL_GAP_FAST_MS) == 210
+    assert P.staircase_ms(P.CAL_REPS_FAST, P.CAL_OPEN_FAST_MS,
+                          P.PLATEAU_FAST_MS, P.CAL_GAP_FAST_MS) == 270
 
 
-def test_the_leader_judges_its_light_from_the_followers_beacon():
+def test_the_follower_judges_its_light_from_the_announce():
     detector = P.BeaconDetector()
     for i in range(80):
         detector.push(i * 8, 80 if (i * 8 // 400) % 2 == 0 else 160)
-    assert detector.low() == 80
+    assert detector.low() == 80 and detector.high() == 160
 
 
-# --- breaking in ---------------------------------------------------------------
+# --- the Leader's lead-in ---------------------------------------------------------
 
 def sending_leader():
     """A continuous Leader part way through sending its first block."""
     t = continuous(True)
     t.levels = levels()
     t.now = 0
-    t.start_data(0, P.BACKLIGHT_INDEX)
+    t.start_data(0, RUNG)
     return t
 
 
@@ -92,115 +107,6 @@ def feed(t, start, end, value, step=1):
     for now in range(start, end, step):
         field = t.step(now, value)
     return field
-
-
-def test_a_leader_hears_two_slots_of_high_while_it_sends_and_stops():
-    t = sending_leader()
-    duration = t.clock.duration // 1000
-    feed(t, 1, 6 * duration, 32)            # the Follower dark: sending on
-    assert t.tx and t.sub == t.STEP_BLOCK
-    feed(t, 6 * duration, 6 * duration + duration, 112)   # one slot: not yet
-    assert t.tx, "stopped on a single slot of high"
-    field = None
-    for now in range(7 * duration, 10 * duration):
-        field = t.step(now, 112)
-        if t.breaks:
-            break
-    # Stopped, listening for what the Follower sends next.
-    assert not t.tx and t.sub == t.STEP_CRC and not t.crc_started
-    assert field == P.LOW and t.breaks == 1
-
-
-def test_a_leader_takes_no_break_from_noise_or_a_middle_level():
-    t = sending_leader()
-    duration = t.clock.duration // 1000
-    feed(t, 1, 20 * duration, 64)           # the Follower at its middle
-    assert t.sub == t.STEP_BLOCK and t.breaks == 0
-
-
-def test_a_follower_that_loses_framing_breaks_and_then_asks_slower():
-    t = continuous(False)
-    t.levels = levels()
-    t.now = 0
-    t.start_data(0, P.BACKLIGHT_INDEX)
-    duration = t.clock.duration // 1000
-    t.in_block = True
-    t.frame_error()
-    assert t.breaking and t.breaks == 1
-    # High while the Leader is still lit...
-    assert feed(t, 1, 3 * duration, 112) == P.HIGH
-    assert t.breaking
-    # ...and once it has gone dark for BREAK_ACK_SLOTS, the Sync Error.
-    feed(t, 3 * duration, 6 * duration, 32)
-    assert not t.breaking and t.pending_slow_down
-    assert "".join(t.tx) == P.SYNC_ERROR
-
-
-def test_an_unanswered_break_waits_the_block_out_instead():
-    t = continuous(False)
-    t.levels = levels()
-    t.now = 0
-    t.start_data(0, P.BACKLIGHT_INDEX)
-    duration = t.clock.duration // 1000
-    t.frame_error()
-    feed(t, 1, (P.BREAK_MAX_SLOTS + 2) * duration, 112, step=2)
-    assert not t.breaking and t.want_resend
-
-
-def test_a_resend_repeats_the_last_verdict_first():
-    t = sending_leader()
-    t.last_verdict = P.CRC_GOOD
-    t.send_block(P.SYNC_LEAD_IN)
-    sent = "".join(t.tx).strip(" ")
-    assert sent.startswith(P.CRC_GOOD.strip(" ")), sent
-    assert P.BEGIN_BLOCK in sent
-    # Not on a first sending, which has no verdict to repeat.
-    t.send_block()
-    assert "".join(t.tx).strip(" ").startswith(P.BEGIN_BLOCK.strip(" "))
-
-
-def test_a_follower_holding_a_block_settles_it_from_a_repeated_verdict():
-    for verdict, accepted in ((P.CRC_GOOD, True), (P.CRC_BAD, False)):
-        t = continuous(False)
-        t.sub = t.STEP_BLOCK
-        t.pending_tokens = [1, 2, 3]
-        t.pending_block = True
-        for symbol in verdict:
-            t.rx.append(symbol)
-            t.collect_block()
-        assert not t.pending_block and not t.pending_tokens
-        assert (t.received == [1, 2, 3]) == accepted, verdict
-
-
-def test_a_follower_holding_a_block_will_not_take_a_new_one():
-    t = continuous(False)
-    t.sub = t.STEP_BLOCK
-    t.pending_tokens = [1, 2, 3]
-    t.pending_block = True
-    t.now = 0
-    t.levels = levels()
-    t.start_data(0, P.BACKLIGHT_INDEX)
-    t.pending_tokens = [1, 2, 3]
-    t.pending_block = True
-    for symbol in P.BEGIN_BLOCK:
-        t.rx.append(symbol)
-        t.collect_block()
-    assert not t.in_block and t.breaking, "a held block would be overwritten"
-    assert t.pending_tokens == [1, 2, 3]
-
-
-def test_a_follower_that_missed_its_verdict_breaks():
-    t = continuous(False)
-    t.sub = t.STEP_VERDICT
-    t.now = 0
-    t.levels = levels()
-    t.start_data(0, P.BACKLIGHT_INDEX)
-    t.sub = t.STEP_VERDICT
-    t.verdict_lit = 0
-    for _ in range(P.VERDICT_LOST_SYMBOLS + 1):
-        t.rx.append(P.HIGH)
-        t.follower_rx()
-    assert t.breaking
 
 
 # --- end to end -------------------------------------------------------------
@@ -226,41 +132,6 @@ def test_a_lit_room_runs_on_8ms_and_a_dark_one_on_16():
             assert leader.lit == link.follower.transfer.lit == (room > 0)
 
 
-def test_a_break_rescues_a_block_lost_part_way():
-    # A Follower whose readings go wrong part way through a block -- here
-    # one slot read black part way through a byte, as a hand passing over
-    # the sensor would -- loses framing, breaks in, and the Leader stops the block there rather
-    # than send the rest: both demote and the block is sent again. The
-    # stress rows that once broke in on their own (POLLED, reads every 2 ms,
-    # three times the work) no longer lose framing in simulation since
-    # POLLED windows merge their parts, so the loss is put there by hand.
-    delivered = 0
-    for seed in (1, 2, 3):
-        link = sim.build_loop(P, sim.WORST, seed=seed,
-                              contrast=sim.SWING_MIRROR,
-                              **dict(sim.SCENARIOS["realistic"],
-                                     **dict(sim.LOOP_V2,
-                                            **sim.LOOP_SENSOR_V2)))
-        follower = link.follower.transfer
-        real = follower.window_value
-        decided = [0]
-
-        def window_value(k, real=real, follower=follower, decided=decided):
-            value = real(k)
-            if (follower.sub == follower.STEP_BLOCK and follower.in_block
-                    and len(follower.bits) >= 3):
-                decided[0] += 1
-                if decided[0] == 60:
-                    return follower.levels.black     # black mid-byte
-            return value
-        follower.window_value = window_value
-        link.run(300)
-        assert follower.breaks >= 1, seed
-        assert link.leader.transfer.breaks >= 1, seed
-        delivered += link.leader.transfer.result == P.OK
-    assert delivered == 3, delivered
-
-
 # --- mains flicker ------------------------------------------------------------
 
 import math
@@ -280,7 +151,7 @@ def test_the_filter_learns_flicker_from_dark_slots_and_takes_it_off():
         t += 8000
         f.close(True)
     # A running average over 250 ms of dark, by 8 ms a slot: 99% there.
-    assert abs(f.size() - 22) < 2, f.size()
+    assert abs(flicker_size(f) - 22) < 2, flicker_size(f)
     errors = [abs(f.correct(t + k * 137, flickering(t + k * 137)) - 88)
               for k in range(200)]
     assert max(errors) <= 3, max(errors)
@@ -294,7 +165,7 @@ def test_the_filter_learns_nothing_from_lit_slots():
             t += 1000
             f.collect(t, flickering(t), 1000)
         f.close(False)
-    assert f.size() == 0.0
+    assert flicker_size(f) == 0.0
 
 
 def test_small_flicker_is_left_alone():
@@ -306,29 +177,22 @@ def test_small_flicker_is_left_alone():
 
 def test_the_data_phase_corrects_each_part_of_a_window():
     # Once a part, at its centre: the window's parts are what a slot is
-    # decided from.
+    # decided from, each the same span.
     t = continuous(False)
     t.levels = levels()
-    t.start_data(0, P.BACKLIGHT_INDEX)
+    t.start_data(0, RUNG)
     calls = []
-    t.flicker.correct = \
-        lambda now_us, value, span_us=0: calls.append((now_us, span_us)) \
-        or value
+    t.flicker.amounts = \
+        lambda times, n, span_us, out: calls.append((list(times[:n]), span_us))
     for ms in range(0, 40, 2):
         t.step(ms, 32)
-    # At the readings' own mean time, inside the window, in order. A
-    # reading every 2 ms leaves one in a part, so a polled window merges
-    # its parts to POLL_PART_READINGS each (merge_parts): fewer, longer.
     span = (t.w_close - t.w_open) // t.w_parts
-    n = t.parts_now
-    assert 0 < n < t.w_parts, (n, t.w_parts)
-    first = [now for now, _ in calls[:n]]
-    assert first == sorted(first), first
-    for now in first:
-        assert t.w_open <= now < t.w_close, first
-    # Each merged part is corrected over the span it covers: whole parts.
-    assert all(s % span == 0 and s >= span for _, s in calls[:n]), calls[:n]
-    assert sum(s for _, s in calls[:n]) <= span * t.w_parts
+    assert calls, "no window decided"
+    times, s = calls[0]
+    assert s == span and len(times) == t.w_parts == t.parts_now
+    assert times == sorted(times), times
+    for now in times:
+        assert t.w_open <= now < t.w_close, times
 
 
 def test_a_lit_room_with_47_percent_flicker_runs_on_8ms():
@@ -344,7 +208,7 @@ def test_a_lit_room_with_47_percent_flicker_runs_on_8ms():
         assert rung <= 10, (seed, rung)
         twenty += rung <= 8
         # The flicker is 22 counts; learnt within a few.
-        assert 15 < leader.flicker.size() < 26, leader.flicker.size()
+        assert 15 < flicker_size(leader.flicker) < 26, flicker_size(leader.flicker)
     assert delivered == 8 and twenty >= 6, (delivered, twenty)
 
 
@@ -359,13 +223,35 @@ def test_a_quiet_window_with_an_outlier_is_not_a_beacon():
         if i in (40, 85):
             value = 280                     # two outliers 360 ms apart
         detector.push(i * 8, value)
-    assert detector.half_period() is None
-    assert not detector.matches(P.PRESENT_HALF_MS)
+    for window in (None, 1000):
+        assert not detector.matches(P.ANNOUNCE_FAST_HALF_MS, window), window
 
 
 def test_a_real_beacon_still_matches():
     detector = P.BeaconDetector()
     for i in range(125):
-        t = i * 8
-        detector.push(t, 280 if (t // P.PRESENT_HALF_MS) % 2 else 200)
-    assert detector.matches(P.PRESENT_HALF_MS)
+        t = i * P.FINE_MS
+        detector.push(t, 280 if (t // P.ANNOUNCE_FAST_HALF_MS) % 2 else 200)
+    assert detector.matches(P.ANNOUNCE_FAST_HALF_MS)
+
+
+def test_after_a_stall_the_lead_in_watch_reads_only_its_last_slots():
+    # A collection of ten slots before the Leader's next pass: catching up
+    # on every one, each window read and corrected, ran past the next
+    # symbol's boundary. Only the last WATCH_SLOTS are read.
+    t = sending_leader()
+    duration = t.clock.duration // 1000
+    feed(t, 1, 3 * duration, 32)
+    assert t.tx and t.sub == t.STEP_BLOCK
+    stall_end = 13 * duration
+    for now in range(3 * duration, stall_end):
+        t.reader.add(now * 1000, 32)
+    read = []
+    window = t.window_value
+
+    def counted(k):
+        read.append(k)
+        return window(k)
+    t.window_value = counted
+    t.step(stall_end, 32)
+    assert 0 < len(read) <= P.WATCH_SLOTS, read

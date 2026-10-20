@@ -9,6 +9,7 @@ Not a test: helpers beside the tests are not named test_*.
 """
 
 import builtins
+import contextlib
 import importlib
 import os
 import sys
@@ -26,8 +27,9 @@ def _identity(value):
     return value
 
 
-def load_fastadc():
-    """fastadc, imported fresh with the stubs in place."""
+@contextlib.contextmanager
+def badge_modules():
+    """The stubs in place for the length of a `with`, then put back."""
     micropython = types.ModuleType("micropython")
     micropython.viper = _identity
     micropython.native = _identity
@@ -42,15 +44,23 @@ def load_fastadc():
         sys.modules[name] = module
     for name in ("ptr8", "ptr16", "ptr32", "uint"):
         setattr(builtins, name, _identity)
-    if APP not in sys.path:
-        sys.path.insert(0, APP)
     try:
-        sys.modules.pop("fastadc", None)
-        return importlib.import_module("fastadc")
+        yield
     finally:
-        sys.modules.pop("fastadc", None)
         for name, module in saved.items():
             if module is None:
                 sys.modules.pop(name, None)
             else:
                 sys.modules[name] = module
+
+
+def load_fastadc():
+    """fastadc, imported fresh with the stubs in place."""
+    if APP not in sys.path:
+        sys.path.insert(0, APP)
+    with badge_modules():
+        sys.modules.pop("fastadc", None)
+        try:
+            return importlib.import_module("fastadc")
+        finally:
+            sys.modules.pop("fastadc", None)

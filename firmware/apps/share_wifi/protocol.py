@@ -1,147 +1,69 @@
 """Optical Data Transfer Protocol: framing, timing and the state machine.
 
-Sends data between two badges using nothing but the screen and the light sensor.
-One badge displays flat fields at three light levels and the other reads them
-back with the light sensor. LEVEL_SCHEMES says how a transmitter may produce
-the three; a receiver needs no setting, because calibration measures whatever
-the peer actually sends.
+Sends a list of byte strings between two badges on the backlight alone,
+read back through the DMA ring: control in slots, the payload in fast
+blocks (fastblock.py). LEVEL_SCHEMES says which display.backlight()
+value each symbol is; calibration measures what actually arrives. What the
+fields mean, how many and how long, is the caller's business.
 
-A payload is a list of byte strings. The protocol carries them and nothing else:
-how many fields there should be, how long they may be and whether they are text
-all belong to the caller.
-
-Pure Python -- no `screen`, no `badge` -- so the wire format can be imported and
-tested under CPython. It reads the sensor through a reader (reader.py), which
-the caller builds and starts:
+Pure Python -- no `screen`, no `badge`. The caller builds and starts a
+reader (reader.py):
 
     transfer = Transfer(leader=True, payload=[b"first", b"second"],
                         reader=reader)
 
-and then, each pass of its loop, shows transfer.field_at(now), calls
-transfer.work(now), and waits until transfer.due_us().
+and each pass shows transfer.field_at(now), calls transfer.work(now), and
+waits until transfer.due_us().
 
-Specification: .agents/docs/optical-data-transfer-protocol.md
+Specification: .agents/optical_data_transfer/spec.md, the
+authority; every constant's reasons are in context.md beside it, and the
+evidence in data.md.
 """
 
 import math
 import time
+from array import array
 
-# Measured figures come from .agents/docs/hardware-measurement-*.json; the
-# reasoning behind each constant is in the spec. Markers such as [measured-all]
-# name the firmware a claim holds for: legend in .agents/docs/README.md.
-
-# light_level() is a 12-bit conversion in a 16-bit frame, so 16 counts is the
-# smallest difference the sensor can express. [measured-all]
+# 12-bit conversion in a 16-bit frame: 16 counts is one ADC step.
 SENSOR_STEP = 16
 
-# Whether a peer is there at all, before there are levels: a swing of at least
-# MIN_SWING, three ADC steps. It gates beacon detection and the staircase
-# reader, and is the least span calibration accepts. Noise on a held field
-# measured one or two steps peak to peak, so three is above it.
+# A peer is there at all: a swing of three ADC steps, over held noise.
 MIN_SWING = 3 * SENSOR_STEP
 
-# Whether calibrated levels can be told apart: each gap between adjacent
-# levels must be at least MIN_GAP, and at least GAP_SIGMAS times the noise of
-# the two levels either side of it -- the standard deviation of the staircase
-# samples between their thresholds, measured on this link, in this light. A
-# threshold sits half way across a gap, so GAP_SIGMAS / 2 standard deviations
-# from each level. QUANTISATION_SD floors the noise: a level whose readings
-# all land on one ADC code still has up to half a step of error in it.
-# See "Calibration" in the spec.
-MIN_GAP = 2 * SENSOR_STEP
+# Calibrated levels separate when each gap is at least MIN_GAP_EXACT and
+# GAP_SIGMAS of the noisier neighbour's noise, floored at QUANTISATION_SD
+# (spec 9.3).
+MIN_GAP_EXACT = SENSOR_STEP
 GAP_SIGMAS = 4
 QUANTISATION_SD = SENSOR_STEP / math.sqrt(12)
 
-# Settling budget for one pixel transition: the slowest 90% the badge has
-# measured, 24 ms, across nine fits of 16.1-24.1 ms in five mirror runs
-# [measured-all]. The datasheet's 16 ms round trip had suggested half that.
-LCD_SETTLE_MS = 24
-
-# The same for a symbol the backlight carries alone, on white pixels: no
-# liquid crystal moves, so what settles is the light sensor, which is slower
-# the less light it has -- 1.0-1.3 ms to 90% in a lit room, up to 7.8 ms from
-# off to the middle level in the dark [measured-all]. 10 rather than 8 for
-# margin: it puts the start on 32 ms rather than 25, which in simulation kept
-# every run against a sensor half as fast again as measured, where 25 lost 4
-# in 144, and three in four against one twice as slow, where 25 kept one in
-# fourteen. It costs about 1.5 s a transfer. Only a badge reading
-# continuously can use it: one that samples once a frame is still bound by
-# its frames.
-BACKLIGHT_SETTLE_MS = 10
-
-# The same in a lit room, where the sensor is fastest: 1.0-1.3 ms to 90% for
-# every backlight step [measured-all], with margin. Both badges must be LIT
-# for it -- see LIT_BLACK_COUNTS -- and it puts the start on 16 ms.
-BACKLIGHT_LIT_SETTLE_MS = 5
-
-# A continuous badge is LIT when the black it reads -- the room's light on
-# its sensor, the peer's screen dark -- is at least this: four ADC steps. The
-# mirror runs read 32 in the dark and 80-96 in a lit room [measured-all], and
-# the sensor's speed follows its light.
+# A badge is LIT when the black it reads is at least four ADC steps: the
+# sensor's speed follows its light.
 LIT_BLACK_COUNTS = 64
 
-# How much of that a continuous backlight badge treats as proven. The sensor's
-# speed rests on one mirror's measurements and slows with less light, so the
-# rungs BACKLIGHT_SETTLE_MS allows below this one are a gamble: CRC failures
-# there demote rather than end the transfer. 50 ms is where pixels ran before
-# their settle was measured.
-BACKLIGHT_PROVEN_MS = 50
-
 # Before the data phase the protocol pulls FINE_MS means from its reader
-# (reader.py), back to back, and pools them into coarse samples: COARSE_MS in
-# discovery, whose detectors were sized for about one sample a frame, and
-# CAL_SAMPLE_MS in calibration, so a 40 ms step holds STEP_SAMPLES of them
-# after the sensor settles. The data phase decides each slot from its window
-# directly -- see SlotWindow.
+# and pools them into coarse samples of the same length.
 FINE_MS = 2
 FINE_US = FINE_MS * 1000
-COARSE_MS = 8
-CAL_SAMPLE_MS = 4
-# A Follower in the handshake drops the coarse sample it is pooling when its
-# reader has had no readings for longer than this -- a POLLED reader blinded
-# by its own present, 7.8 ms or more -- unless that sample already follows a
-# drop. A coarse sample cut short by a present holds a few ms of readings,
-# which leave most of 120 Hz flicker in: at three times the lit room's light,
-# one such sample lifted BeaconDetector's midpoint over the Leader's rising
-# edge, and 30 of 144 failed. An EXACT reader is never blind.
-HANDSHAKE_GAP_MS = 7
 
-# Room lights flicker at twice the mains frequency: every LED light measured
-# did, at 120 Hz, by up to 47% of its light, and none at the mains frequency
-# itself by more than 2% of that [measured-all, 2026-10-06]. That is noise
-# inside a slot, and at the lit room's level it is bigger than an ADC step.
-# It is also steady -- locked to the mains -- so a continuous badge in the
-# data phase estimates it and takes it off each fine sample. Only from samples
-# it knows were the peer dark: the back half of each slot it decides LOW. Not
-# from every reading: beacons and staircases are periodic, 100 and 120 Hz are
-# harmonics of them, and an estimate from everything picked up 15% of the
-# swing where there was no flicker at all.
-#
-# Any whole number of Hz can be listed, and 50 and 60 -- the mains itself, a
-# light flickering once a cycle -- were tried and left out. No light measured
-# does it. In simulation such a light defeats calibration before this filter
-# runs: calibration's 8 ms samples are nearly one 120 Hz period, which
-# averages 120 Hz flicker away to 4%, and leave 66-76% of 50 or 60 Hz, so
-# 47% flicker at either delivered 0 of 144 with or without them. And learning
-# 50 Hz from 8 ms of a slot takes part of its own harmonic, 100 Hz: 126 of
-# 144 in a 100 Hz room, against 143 without.
+# The learner: room flicker at twice the mains, learnt only from samples
+# the peer was dark for -- beacons and staircases are periodic, and
+# learning from everything took 15% of the swing for flicker.
 FLICKER_HZ = (100, 120)
-# How much each dark slot moves the estimate, as the time it covers against
-# this: a few hundred ms of dark settles it.
+# A few hundred ms of dark settles the estimate.
 FLICKER_TAU_MS = 250
-# Only flicker at least this big, in counts, is taken off: a quarter of an
-# ADC step.
+# Smaller than this is not taken off, and a fit whose strongest harmonic
+# is smaller finds the room steady.
 FLICKER_MIN_COUNTS = 4
-# A dark slot teaches only if its back half held this many samples: a 16 ms
-# slot's holds two or three, one every ~3 ms with the protocol's call.
+# A flickering room's fit keeps every harmonic this big that clears its
+# error: a once-a-cycle light's third, dropped at 4, misread slots.
+FLICKER_KEEP_COUNTS = 2
+# A dark slot teaches only with this many samples.
 FLICKER_MIN_POINTS = 2
 
-# The filter's per-sample arithmetic is whole numbers from tables, never
-# math.sin: on the badge a float is a heap allocation and every operation
-# microseconds [measured-v2]. Sine is FLICKER_STEPS steps a period, scaled
-# by FLICKER_ONE: 1.1 degrees a step, and a whole number of us a step per Hz
-# (3125), so a time's step is exact. 64 steps, 5.6 degrees, did as well in
-# simulation; the table is cheap.
+# Whole numbers from tables on the hot path: a float is a heap allocation
+# on the badge. FLICKER_STEPS a period, scaled by FLICKER_ONE, a whole
+# number of us a step per Hz.
 FLICKER_STEPS = 320
 FLICKER_ONE = 1024
 # A sample's span, for the shrink below, in steps of this many us.
@@ -149,10 +71,9 @@ FLICKER_SPAN_US = 250
 _SINE = tuple(int(round(FLICKER_ONE * math.sin(2 * math.pi * i / FLICKER_STEPS)))
               for i in range(FLICKER_STEPS))
 _QUARTER = FLICKER_STEPS // 4
-# One second is a whole number of periods of every FLICKER_HZ, so a time's
-# phase is its microseconds into the second: step = us x hz x STEPS / 1e6,
-# and STEPS / 1e6 is 1 / 15625. (ticks_us wraps at 2**30 us, not a whole
-# second: one phase jump every 17.9 minutes.)
+# A second is whole periods of every frequency used, so a time's phase is
+# its microseconds into the second. (ticks_us wraps at 2**30: one phase jump
+# every 17.9 minutes.)
 _US_PER_STEP_HZ = 1000000 // FLICKER_STEPS
 # Span steps in a table: up to two samples' length.
 _SPAN_STEPS = 4 * FINE_MS * 1000 // FLICKER_SPAN_US + 1
@@ -161,8 +82,8 @@ _SPAN_LAST = _SPAN_STEPS - 1
 
 def _span_table(hz, grow):
     """A sample's mean shrinks a flicker by sin(x)/x, x = pi x span x hz:
-    per FLICKER_SPAN_US step of span up to two samples' length, that or its
-    inverse, scaled by FLICKER_ONE."""
+    per FLICKER_SPAN_US step of span, that or its inverse, scaled by
+    FLICKER_ONE."""
     out = []
     for k in range(_SPAN_STEPS):
         x = math.pi * k * FLICKER_SPAN_US * hz / 1000000.0
@@ -175,77 +96,40 @@ _SHRINK = tuple(_span_table(hz, False) for hz in FLICKER_HZ)
 _GROW = tuple(_span_table(hz, True) for hz in FLICKER_HZ)
 
 
-# The mains measured before calibration (option A): each badge fits the
-# room's flicker from FLICKER_FIT_MS of samples taken while its peer is
-# known dark -- the Follower from the Leader's opening gap, the Leader from
-# its own staircase, which the Follower watches dark -- as one cycle of a
-# mains in FLICKER_MAINS with FLICKER_HARMONICS harmonics. That gives the
-# region, the light's own shape, and a table to correct every sample with
-# from then on, calibration included. A window whose fit leaves more than
-# FLICKER_FIT_MAX_NOISE counts unexplained was not dark and steady, and the
-# filter learns as before; a fit whose largest harmonic is under
-# FLICKER_MIN_COUNTS is a steady room, and nothing is taken off.
+# The fit: each badge fits the room's flicker in the shared gap, its peer
+# dark, as one cycle of a mains in FLICKER_MAINS -- the region, the light's
+# shape, a correction table (spec 15). A window left noisier than
+# FLICKER_FIT_MAX_NOISE was not dark and steady, and the learner runs as
+# before.
 FLICKER_MAINS = (50, 60)
-FLICKER_HARMONICS = 4
-# The Leader's window: the last FLICKER_FIT_MS of its staircase's body, when
-# the Follower has long been dark, fitted as its closing gap begins -- where
-# it holds LOW, so the fit's stall costs nothing.
-FLICKER_FIT_MS = 160
-# The Follower's: the Leader's beacon last crossed its midpoint at c, so the
-# Leader went dark somewhere in [c, c + ANNOUNCE_HALF_MS], and reaches the
-# sensor dark by 43 ms later (present and panel) until its opening gap and
-# first step end. The window is [c + FLICKER_FOLLOWER_FIT_START_MS, + 100],
-# fitted at its end; the stall then ends inside the Leader's dark too --
-# for an EXACT Follower. A POLLED one is blind for the stall, and a stall
-# longer than about 180 ms ran into the Leader's first steps: it fits the
-# same window, from its kept samples, once it has read the staircase, and
-# reads the staircase again corrected [simulation, fit300 and work3].
-# 100 ms is five cycles of 50 Hz and six of 60.
-FLICKER_FOLLOWER_FIT_START_MS = 160
-FLICKER_FOLLOWER_FIT_MS = 100
+# Four harmonics first; six only if four leave too much unexplained: a
+# sharp-edged LED's 360 Hz. Six always fit the sensor's own distortion.
+# The steadiness check's threshold comes from the four.
+FLICKER_BASE_HARMONICS = 4
+FLICKER_HARMONICS = 6
 FLICKER_FIT_MAX_NOISE = 12
-# A fitted harmonic counts only this many of its standard errors above the
-# fit's noise. Without it, noise in 16-count steps fitted 8.5 counts of 50 Hz
-# in a dark room with no flicker at all.
+# A harmonic counts only this many standard errors clear of the noise.
 FLICKER_FIT_SIGMAS = 4
-# A harmonic is fitted only if the window's samples, averaged over their
-# spans, keep this much of it on average.
+# ... and only if the samples' spans keep this much of it.
 FLICKER_MIN_SEEN = 0.3
 # Refinements of the fit's projections, each on what the others leave.
 FLICKER_FIT_PASSES = 2
-# Fine samples kept for the fit and the Follower's replay: 1.28 s of them,
-# enough for a POLLED Follower to fit after the Leader's whole staircase
-# (about 0.95 s from the quiet it fits after) and replay it.
+# Fine samples kept for the Leader's fit and re-read of the staircase.
 FLICKER_BUFFER = 640
 
-# The mains drifts -- grids hold within about 0.02 Hz, which moves 120 Hz
-# flicker 14 degrees a second -- so the table's timing is tracked: a phase
-# lock on its offset, in steps, and the offset's rate. Each update is a
-# least-squares phase error from samples the peer was dark for: every
-# FLICKER_TRACK_POINTS while this badge sends its staircase or waits out the
-# gap, and the back half of each slot decided dark. FLICKER_TRACK_GAIN of
-# the error moves the offset. The rate is the slope of a line fitted to
-# the timing each update measured against time, forgetting
-# FLICKER_RATE_MEMORY of the past an update, and used once its points span
-# FLICKER_RATE_MIN_S: it carries the timing through calibration's
-# stretches with nothing dark to see. A rate stepped by each update's own
-# error, divided by the time since the last, was noise -- 30 times the
-# drift's rate, either sign -- since updates can come 24 ms apart.
+# The mains drifts, so the table's timing is phase-locked: every
+# FLICKER_TRACK_POINTS dark samples a least-squares phase error, of which
+# FLICKER_TRACK_GAIN moves the offset. The rate is a line through the
+# timings, forgetting FLICKER_RATE_MEMORY an update, used once its points
+# span FLICKER_RATE_MIN_S and FLICKER_RATE_MIN_UPDATES support it.
 FLICKER_TRACK_POINTS = 8
 FLICKER_TRACK_GAIN = 0.25
 FLICKER_RATE_MEMORY = 0.99
 FLICKER_RATE_MIN_S = 0.3
-# And once at least this many updates support it (their weight, lw): a line
-# through a handful of points a fraction of a second apart is mostly noise.
-# A POLLED Leader, its fit stall blinding most of its closing gap, learnt
-# -9.8 steps a second from 5.85 of them in a room with no drift at all, and
-# extrapolated it through an 8.6 s block. Until then the rate is 0.
 FLICKER_RATE_MIN_UPDATES = 10
-# The rate's bound, in steps a second: 0.1 Hz of mains drift, five times
-# what grids allow.
+# Steps a second: 0.1 Hz of drift, five times what grids allow.
 FLICKER_MAX_RATE = 32
-# A single update's error, in steps, is clipped to this: one noisy slot
-# cannot throw the lock.
+# One update's error is clipped to this, in steps.
 FLICKER_TRACK_MAX_STEPS = 16
 
 
@@ -267,65 +151,89 @@ def _span_step(span_us):
     return k if k < _SPAN_LAST else _SPAN_LAST
 
 
-class FlickerFilter:
-    """Mains flicker at each of FLICKER_HZ: learnt from dark slots a sample
-    at a time, taken off every fine sample.
+def _steady_rms():
+    """The rms a harmonic of FLICKER_MIN_COUNTS leaves in fine samples at
+    the least gain of any the fit would try: 1.87 counts."""
+    k = _span_step(FINE_US)
+    least = FLICKER_ONE
+    for mains in FLICKER_MAINS:
+        for h in range(1, FLICKER_BASE_HARMONICS + 1):
+            gain = _gains(mains, h)[k]
+            if FLICKER_MIN_SEEN * FLICKER_ONE <= gain < least:
+                least = gain
+    return FLICKER_MIN_COUNTS * least / FLICKER_ONE / math.sqrt(2)
 
-    Each frequency is a sine and a cosine part, in counts. Learning sums
-    each dark sample against the sine table, in whole numbers; a slot's
-    sums become an estimate once, when it is decided, and only that step
-    uses floats. Correcting is a table look-up and a multiply a frequency,
-    for the frequencies big enough to take off."""
+
+# A window whose rms about a line is under this is steady.
+FLICKER_STEADY_RMS = _steady_rms()
+
+
+def _line(ts, vs):
+    """The least-squares line through the samples, x in whole ms from the
+    middle one: (middle, slope, level)."""
+    n = len(ts)
+    middle = ts[n // 2]
+    sx = sy = sxx = sxy = 0
+    for k in range(n):
+        x = time.ticks_diff(ts[k], middle) // 1000
+        sx += x
+        sy += vs[k]
+        sxx += x * x
+        sxy += x * vs[k]
+    spread = n * sxx - sx * sx
+    slope = (n * sxy - sx * sy) / spread if spread else 0.0
+    return middle, slope, (sy - slope * sx) / n
+
+
+class FlickerFilter:
+    """Mains flicker, fitted once (fit()) or learnt from dark slots at
+    FLICKER_HZ, and taken off every sample.
+
+    The learner sums each dark sample against the sine table in whole
+    numbers; a slot's sums become an estimate once, when it is decided.
+    Correcting is a table look-up and a multiply a frequency."""
 
     def __init__(self):
         n = len(FLICKER_HZ)
         self.amp = [0.0] * (2 * n)      # sine, cosine amplitude per frequency
-        # The same, in quarter counts, and which frequencies are taken off:
-        # what correct() uses, refreshed when the estimate moves.
+        # In quarter counts, and which frequencies are taken off.
         self.amp4 = [0] * (2 * n)
         self.active = []
-        # The slot being collected: sums of value x sine/cosine and of sine
-        # and cosine, in table units; of value, less the slot's first, to
-        # keep the products small ints; the count and the time covered.
+        # The slot being learnt: sums of value x sine/cosine and of each, of
+        # value less the first, the count and the time covered.
         self.xs = [0] * (2 * n)
         self.basis = [0] * (2 * n)
         self.ref = 0
         self.sum = 0
         self.count = 0
         self.covered_us = 0
-        # Fitted before calibration (see FLICKER_FIT_MS): the mains, each
-        # harmonic's sine and cosine part in counts, and tables per span
-        # step of the flicker and its slope, in quarter counts. `steady`: the
-        # fit found nothing to take off.
+        # The fit: the mains, each harmonic's parts in counts, tables per
+        # span step; `steady`, nothing to take off.
         self.mains = 0
         self.harmonics = None
         self.steady = False
         self.base = None
         self.tables = {}
-        # What the last fit() saw, whatever it returned: why it refused
-        # ("few" samples, "unfit" -- no mains fitted, "dof" -- too few left
-        # over the harmonics, "noise", or None), the mains it preferred, the noise left,
-        # and each harmonic's size in counts before the significance test.
-        # For Dev Mode's room-flicker tool; the transfer does not read it.
+        # The table in use, and the span it is for.
+        self.span_us = None
+        self.wave = self.wave_slope = None
+        # What the last fit saw: why it refused ("few", "unfit", "dof",
+        # "noise", or None), the mains, the noise, each harmonic's size.
         self.fit_info = None
-        # The phase lock: the table's offset in thousandths of a step at
-        # anchor_us, its rate in thousandths of a step a second; the same as
-        # floats; and the tracker's sums for the points since its last
-        # update -- count, residual, slope, their products, in quarter counts.
+        # The phase lock: offset and rate in thousandths (and as floats),
+        # its anchor, and the tracker's sums since the last update.
         self.off_m = 0
         self.rate_m = 0
         self.offset = 0.0
         self.rate = 0.0
         self.anchor_us = None
         self.last_us = 0
-        # The rate's line: time since the fit in s, the timing measured, in
-        # steps and unwrapped; weighted sums of 1, t, m, t*t, t*m.
+        # The rate's line: weighted sums of 1, t, m, t*t, t*m.
         self.fit_us = 0
         self.lw = self.lt = self.lm = self.ltt = self.ltm = 0.0
         self.clear_track()
 
     def clear_track(self):
-        """Clears the tracker's sums toward the next phase-lock update."""
         self.tn = 0
         self.tr = self.td = self.trd = self.tdd = 0
 
@@ -342,48 +250,34 @@ class FlickerFilter:
                 active.append(i)
         self.active = active
 
-    @property
-    def fitted(self):
-        return self.harmonics is not None or self.steady
-
     def fit(self, ts, vs, spans):
-        """Fits the samples -- times in us, mean values, spans in us -- as
-        one cycle of each mains in FLICKER_MAINS with up to FLICKER_HARMONICS
-        harmonics on a straight line, and keeps the mains that explains
-        more. Returns what it found: "flicker", "steady" (nothing worth
-        taking off), or None -- too few samples, or a window that was not
-        steady, when the filter goes on learning as before.
+        """fit_with() FLICKER_BASE_HARMONICS, and FLICKER_HARMONICS if that
+        leaves too much unexplained."""
+        verdict = self.fit_with(ts, vs, spans, FLICKER_BASE_HARMONICS)
+        if verdict is None and self.fit_info["reason"] == "noise":
+            verdict = self.fit_with(ts, vs, spans, FLICKER_HARMONICS)
+        return verdict
 
-        Not a full least squares: over 100-200 ms the harmonics are near
-        independent, so each is projected on its own, in whole numbers from
-        the sine table, and the projections are refined FLICKER_FIT_PASSES
-        times on what the others leave. It runs in the middle of
-        calibration, where a stall stretches a staircase step."""
+    def fit_with(self, ts, vs, spans, count):
+        """Fits samples -- times in us, means, spans in us -- as one cycle of
+        each mains with up to `count` harmonics on a line, keeping the mains
+        that explains more: "flicker", "steady", or None (the learner goes
+        on). Each harmonic is projected on its own in whole numbers, refined
+        FLICKER_FIT_PASSES times: it runs mid-calibration, a stall."""
         n = len(ts)
         self.fit_info = {"reason": "few", "mains": None, "noise": None,
                          "sizes": None}
         if n < 12:
             return None
-        # The line: a sensor still settling from the last thing it saw,
-        # which the harmonics would otherwise take for 50 Hz.
-        middle = ts[n // 2]
-        sx = sy = sxx = sxy = 0
-        for k in range(n):
-            x = time.ticks_diff(ts[k], middle) // 1000
-            sx += x
-            sy += vs[k]
-            sxx += x * x
-            sxy += x * vs[k]
-        spread = n * sxx - sx * sx
-        slope = (n * sxy - sx * sy) / spread if spread else 0.0
-        level = (sy - slope * sx) / n
+        # The line: a sensor still settling, else taken for 50 Hz.
+        middle, slope, level = _line(ts, vs)
         flat = [0] * n
         for k in range(n):
             x = time.ticks_diff(ts[k], middle) // 1000
             flat[k] = int(round(vs[k] - level - slope * x))
         best = None
         for mains in FLICKER_MAINS:
-            found = self.fit_mains(ts, flat, spans, mains)
+            found = self.fit_mains(ts, flat, spans, mains, count)
             if found is not None and (best is None or found[0] < best[0]):
                 best = found
         info = self.fit_info
@@ -406,49 +300,62 @@ class FlickerFilter:
             info["reason"] = "noise"
             return None
         info["reason"] = None
-        # A harmonic counts if the samples saw it -- its amplitude as their
-        # spans shrank it -- FLICKER_FIT_SIGMAS of its standard error clear;
-        # one that does not is dropped rather than taken off.
+        # A harmonic as the samples saw it, FLICKER_FIT_SIGMAS of its error
+        # clear, or dropped.
         error = noise * math.sqrt(2.0 / n)
         kept = []
         strongest = 0.0
-        for h in range(FLICKER_HARMONICS):
+        for h in range(len(harmonics)):
             a, b = harmonics[h]
             size = sizes[h]
             if (size * seen[h] >= FLICKER_FIT_SIGMAS * error
-                    and size >= FLICKER_MIN_COUNTS):
+                    and size >= FLICKER_KEEP_COUNTS):
                 kept.append((a, b))
                 strongest = max(strongest, size)
             else:
                 kept.append((0.0, 0.0))
-        if not strongest:
+        if strongest < FLICKER_MIN_COUNTS:
             self.steady = True
             return "steady"
         self.mains = mains
         self.harmonics = kept
         self.base = None
         self.tables = {}
+        self.span_us = None
         self.anchor_us = ts[-1]
         self.fit_us = ts[-1]
         return "flicker"
 
-    def fit_mains(self, ts, flat, spans, mains):
-        """One mains' projections: (what is left unexplained, the mains, how
-        many harmonics were fitted, [(a, b) per harmonic in counts], how much
-        of each the samples saw). A harmonic whose samples' spans shrink it
-        below FLICKER_MIN_SEEN on average is left out: dividing by that
-        shrink magnified noise into flicker -- 25 times, for 240 Hz in
-        samples 4 ms long."""
+    def steady_window(self, ts, vs):
+        """Whether a window's rms about a line is under FLICKER_STEADY_RMS:
+        a window whose fit would find the room steady, without the fit's
+        stall."""
+        n = len(ts)
+        if n < 12:
+            return False
+        middle, slope, level = _line(ts, vs)
+        left = 0.0
+        for k in range(n):
+            r = vs[k] - level - slope * (time.ticks_diff(ts[k], middle)
+                                         // 1000)
+            left += r * r
+        return left < FLICKER_STEADY_RMS * FLICKER_STEADY_RMS * (n - 2)
+
+    def fit_mains(self, ts, flat, spans, mains, count=FLICKER_BASE_HARMONICS):
+        """One mains' projections: (unexplained, mains, harmonics fitted,
+        [(a, b) in counts], how much of each the samples saw). One the spans
+        shrink below FLICKER_MIN_SEEN is left out: dividing by the shrink
+        magnifies noise into flicker."""
         n = len(ts)
         left = flat[:]
-        # Per harmonic: each sample's sine and cosine, shrunk by its span,
-        # scaled by FLICKER_ONE; and what the fit takes off it so far.
+        # Per harmonic: each sample's sine and cosine, shrunk by its span;
+        # what the fit takes off it so far.
         sines = []
         cosines = []
         parts = []
-        seen = [0.0] * FLICKER_HARMONICS
+        seen = [0.0] * count
         used = []
-        for h in range(1, FLICKER_HARMONICS + 1):
+        for h in range(1, count + 1):
             gains = _gains(mains, h)
             total = 0
             for k in range(n):
@@ -469,6 +376,15 @@ class FlickerFilter:
             cosines.append(co)
             parts.append([0] * n)
         coeffs = [(0.0, 0.0)] * len(used)
+        # The line refitted each pass: over 100 ms a sine is not independent
+        # of a ramp.
+        middle = ts[n // 2]
+        xs = [time.ticks_diff(ts[k], middle) / 1000.0 for k in range(n)]
+        sx = sxx = 0.0
+        for k in range(n):
+            sx += xs[k]
+            sxx += xs[k] * xs[k]
+        spread = n * sxx - sx * sx
         for _ in range(FLICKER_FIT_PASSES):
             for u in range(len(used)):
                 si = sines[u]
@@ -494,10 +410,19 @@ class FlickerFilter:
                     new = int(round(a * si[k] + b * co[k]))
                     left[k] += part[k] - new
                     part[k] = new
+            if spread:
+                sy = sxy = 0.0
+                for k in range(n):
+                    sy += left[k]
+                    sxy += xs[k] * left[k]
+                slope = (n * sxy - sx * sy) / spread
+                level = (sy - slope * sx) / n
+                for k in range(n):
+                    left[k] -= int(round(level + slope * xs[k]))
         remaining = 0
         for k in range(n):
             remaining += left[k] * left[k]
-        harmonics = [(0.0, 0.0)] * FLICKER_HARMONICS
+        harmonics = [(0.0, 0.0)] * count
         for u in range(len(used)):
             a, b = coeffs[u]
             harmonics[used[u] - 1] = (a * FLICKER_ONE, b * FLICKER_ONE)
@@ -505,12 +430,19 @@ class FlickerFilter:
 
     def table(self, k):
         """The fitted flicker and its slope per step, in quarter counts, as
-        a sample of span step `k` sees them. Built once per span step, from
-        one base table per harmonic made once a fit, in whole numbers: a
-        span step costs a pass of FLICKER_STEPS, not trigonometry."""
+        a sample of span step `k` sees them. Built once per span step."""
         out = self.tables.get(k)
-        if out is not None:
-            return out
+        if out is None:
+            out = self.tables[k] = self.build_table(k)
+        return out
+
+    def use_span(self, span_us):
+        self.wave, self.wave_slope = self.table(_span_step(span_us))
+        self.span_us = span_us
+
+    def build_table(self, k):
+        """table(k), from one base table per harmonic made once a fit: a
+        span step costs a pass of FLICKER_STEPS, not trigonometry."""
         if self.base is None:
             self.base = []
             for h in range(1, len(self.harmonics) + 1):
@@ -535,27 +467,54 @@ class FlickerFilter:
         for i in range(FLICKER_STEPS):
             slope[i] = (flicker[(i + 1) % FLICKER_STEPS]
                         - flicker[i - 1]) // 2
-        out = (flicker, slope)
-        self.tables[k] = out
-        return out
+        return (flicker, slope)
 
     def step_at(self, now_us):
-        """Where `now_us` falls in the fitted table: the mains' step, moved
-        by the phase lock's offset and its rate since the anchor."""
-        base = (now_us % 1000000) * self.mains // _US_PER_STEP_HZ
+        """Where `now_us` falls in the fitted table, the phase lock applied:
+        shift_at() written out, a call less on the hot path."""
         elapsed_ms = time.ticks_diff(now_us, self.anchor_us) // 1000
         if elapsed_ms > 30000:
             elapsed_ms = 30000
-        shift = (self.off_m + elapsed_ms * self.rate_m // 1000) // 1000
-        return (base + shift) % FLICKER_STEPS
+        return ((now_us % 1000000) * self.mains // _US_PER_STEP_HZ
+                + (self.off_m + elapsed_ms * self.rate_m // 1000) // 1000
+                ) % FLICKER_STEPS
+
+    def shift_at(self, now_us):
+        """The phase lock's shift at `now_us`, in steps: monotonic, so equal
+        ends of a span hold it constant between."""
+        elapsed_ms = time.ticks_diff(now_us, self.anchor_us) // 1000
+        if elapsed_ms > 30000:
+            elapsed_ms = 30000
+        return (self.off_m + elapsed_ms * self.rate_m // 1000) // 1000
+
+    def amounts(self, times, n, span_us, out):
+        """out[j] = amount(times[j], span_us) for j < n, bit for bit, with
+        `times` ascending: a fitted filter looks its table and shift up
+        once a call, not once a time."""
+        if self.harmonics is None or n < 1:
+            for j in range(n):
+                out[j] = self.amount(times[j], span_us)
+            return
+        flicker, _ = self.table(_span_step(span_us))
+        shift = self.shift_at(times[0])
+        if shift != self.shift_at(times[n - 1]):
+            for j in range(n):
+                out[j] = (flicker[self.step_at(times[j])] + 2) // 4
+            return
+        mains = self.mains
+        for j in range(n):
+            out[j] = (flicker[((times[j] % 1000000) * mains
+                               // _US_PER_STEP_HZ + shift)
+                              % FLICKER_STEPS] + 2) // 4
 
     def track(self, now_us, value, span_us):
         """A sample the peer was dark for, toward the next phase-lock
         update: its residual against the table, and the table's slope."""
-        flicker, slope = self.table(_span_step(span_us))
+        if span_us != self.span_us:
+            self.use_span(span_us)
         i = self.step_at(now_us)
-        r = 4 * value - flicker[i]
-        d = slope[i]
+        r = 4 * value - self.wave[i]
+        d = self.wave_slope[i]
         self.tn += 1
         self.tr += r
         self.td += d
@@ -577,8 +536,7 @@ class FlickerFilter:
                 elif error < -FLICKER_TRACK_MAX_STEPS:
                     error = -FLICKER_TRACK_MAX_STEPS
                 now = self.last_us
-                # Where step_at() put the table now, and where the points
-                # say it is: unwrapped, so the line through them is too.
+                # Unwrapped, so the line through the points is too.
                 elapsed = time.ticks_diff(now, self.anchor_us) / 1000000.0
                 predicted = self.offset + self.rate * min(elapsed, 30.0)
                 measured = predicted + error
@@ -606,16 +564,24 @@ class FlickerFilter:
         self.clear_track()
 
     def amount(self, now_us, span_us=0):
-        """The flicker estimated at `now_us` in a mean over `span_us`, in
-        whole counts: what correct() takes off."""
+        """The flicker at `now_us` in a mean over `span_us`, whole counts.
+
+        This and the other per-sample calls keep their frames at 11 words
+        or fewer: a larger one is a heap allocation every call
+        (VM_MAX_STATE_ON_STACK; test_flicker_frames.py). The learner's paths
+        are separate functions so the fitted ones carry none of their
+        frame."""
         if self.harmonics is not None:
-            flicker, _ = self.table(_span_step(span_us))
-            return (flicker[self.step_at(now_us)] + 2) // 4
-        if self.steady:
+            if span_us != self.span_us:
+                self.use_span(span_us)
+            return (self.wave[self.step_at(now_us)] + 2) // 4
+        if self.steady or not self.active:
             return 0
+        return self.learnt(now_us, span_us)
+
+    def learnt(self, now_us, span_us):
+        """amount() from the learner's sines."""
         active = self.active
-        if not active:
-            return 0
         t = now_us % 1000000
         k = _span_step(span_us)
         amp4 = self.amp4
@@ -634,24 +600,23 @@ class FlickerFilter:
                                                and bool(self.active))
 
     def correct(self, now_us, value, span_us=0):
-        """`value` less the flicker estimated at `now_us`, as a whole count.
-        `value` is a mean over `span_us` centred there, which shrinks the
-        flicker by sin(x)/x: so is what is taken off."""
+        """`value`, a mean over `span_us` centred on `now_us`, less the
+        flicker there, as a whole count."""
         corrected = value - self.amount(now_us, span_us)
         return corrected if corrected > 0 else 0
 
     def collect(self, now_us, value, span_us):
-        """A mean raw reading over `span_us` centred on `now_us` -- a fine
-        sample's, from the back half of the slot in progress. The mean has
-        the flicker shrunk by sin(x)/x, so each point is scaled back up:
-        what is learnt is the flicker itself, and correct() shrinks it again
-        for the sample it corrects. Learnt shrunk, it was taken off shrunk
-        twice."""
+        """A raw mean over `span_us` at `now_us`, from a slot's dark part:
+        tracked if fitted, else learnt -- scaled back up by its span's
+        shrink, so correct() shrinks it only once."""
         if self.harmonics is not None:
             self.track(now_us, value, span_us)
-            return
-        if self.steady:
-            return
+        elif not self.steady:
+            self.learn(now_us, value, span_us)
+
+    def learn(self, now_us, value, span_us):
+        """collect() for the learner: the point's products with each sine
+        and cosine, toward close()."""
         if not self.count:
             self.ref = value
         x = value - self.ref
@@ -684,10 +649,8 @@ class FlickerFilter:
         n = self.count
         if dark and n >= FLICKER_MIN_POINTS:
             mean = self.sum / n
-            # Slowly, on purpose: weighting the first dark slots fully let a
-            # slot misjudged dark set a wrong estimate, which then corrupted
-            # the readings that taught it -- 0 of 3 delivered against 47%
-            # flicker, where this delivers 143 of 144.
+            # Slowly: a slot misjudged dark, weighted fully, set a wrong
+            # estimate that then corrupted the readings that taught it.
             weight = min(1.0, self.covered_us / (FLICKER_TAU_MS * 1000.0))
             scale = 2.0 / (n * FLICKER_ONE)
             for k in range(len(self.amp)):
@@ -701,314 +664,234 @@ class FlickerFilter:
             self.xs[k] = 0
             self.basis[k] = 0
 
-    def size(self):
-        """The largest flicker amplitude estimated, in counts."""
-        out = 0.0
-        if self.harmonics is not None:
-            for a, b in self.harmonics:
-                out = max(out, math.sqrt(a * a + b * b))
-            return out
-        for i in range(len(FLICKER_HZ)):
-            out = max(out, math.sqrt(self.amp[2 * i] ** 2
-                                     + self.amp[2 * i + 1] ** 2))
-        return out
 
+# How late a receiver sees a backlight edge after the transmitter's slot
+# boundary: its lateness, up to a PWM period, the sensor's climb, and a
+# transfer's own path [measured-v2]. A receiver's constant, not the wire's:
+# it places only this badge's grid. One lock's scatter is its message's.
+EDGE_LAG_EXACT_LIT_US = 950
+EDGE_LAG_EXACT_DARK_US = 1650
 
-# How late a receiver sees a backlight edge, against the peer's slot
-# boundary: up to one ~263 us PWM period for the new duty to take effect,
-# then the sensor's climb to T_low -- about 0 lit and 0.3 ms in the dark from
-# the dim low, 1.2-1.9 ms from off [measured-all]. In ms for Dev Mode's
-# polled loopback.
-BACKLIGHT_EDGE_LAG_MS = 1
-# The same, in µs, for the data phase's rise lock, by this badge's own light:
-# the 2026-10-06 loopback put the dim low's edge at ~0 lit and 0.3 ms dark
-# from the call, at 2 ms resolution [measured-all; unmeasured at sub-ms --
-# Dev Mode M4 backlight_step_ring, M5 loopback_ring].
-EDGE_LAG_LIT_US = 100
-EDGE_LAG_DARK_US = 300
-
-# How coarsely a continuous transmitter places a backlight symbol: the loop
-# changes it within a pass of the boundary, the duty takes up to a PWM period,
-# and `now` is whole ms. Stands in for a frame in the end-of-slot guard.
-BACKLIGHT_TX_MS = 3
-
-# The backlight's end-of-slot guard as a share of the slot, at least. Its
-# transmitter is precise, but the sensor is not: a rise out of black to the
-# dim middle level crosses T_low 3 ms later than one to high in the dark, and
-# more with less light, so a grid locked on one sits that far from the other
-# [inferred-all]. Proportional, so a demotion widens it.
+# The end-of-slot guard as a share of the slot, at least: a rise to the
+# middle crosses T_low later than one to high. Proportional, so a demotion
+# widens it.
 BACKLIGHT_GUARD_PERCENT = 15
 
-# A slot must be worth this many settle times. 2x permits 32ms rungs, which
-# simulation showed cannot carry a block.
-SETTLE_SLOTS = 3
+# Slowest first: the slot rungs control messages go at. A pair starts on 8
+# ms lit or 16 dark and only steps down, on a Data Sync Error; the payload
+# goes in fast blocks, whose own rungs step down on NAKs.
+SLOT_LADDER = (32, 25, 20, 16, 13, 10, 8)
 
-# How far short of a slot's end its samples stop counting, as a percentage of a
-# frame. The peer shows its next symbol on the first frame after its slot
-# begins, and our grid -- set from one edge per message -- can sit a few ms
-# late of the peer's, so the last few ms of a slot can already hold the next
-# symbol. 65 covers half a frame plus its jitter: 7ms at 11ms frames.
-END_GUARD_PERCENT = 65
-
-# Slowest first. A badge starts on the fastest rung its sampling and the
-# scheme's settle allow -- see rung_for() -- and only ever steps down. Rungs
-# below 50 ms are reachable only by a continuous badge on the backlight
-# scheme; for pixels, 3 x 24 ms puts the floor at 80. Rungs faster than a
-# scheme's floor are never started on: a rate too fast to carry a block is
-# also too fast to carry the pattern announcing the demotion, which leaves the
-# two badges a rung apart and deaf to each other.
-SLOT_LADDER = (250, 200, 160, 130, 100, 80, 65, 50, 40, 32, 25, 20, 16, 13,
-               10, 8)
-
-# Where an EXACT reader decides a slot: a window opening once the sensor has
-# settled and closing a guard short of the next boundary, in µs from the
-# slot's start.
+# Where a slot is decided, in us from its start:
 #   opens    max(settle, OPEN_PERCENT of the slot)
 #   closes   slot - max(guard, BACKLIGHT_GUARD_PERCENT of the slot)
-# Settle, by this badge's own light: the sensor's 90% in 1.0-1.5 ms lit and
-# up to 7.75 ms dark from off [measured-all], with margin; from the dim low
-# it is only faster [inferred-all; unmeasured -- M4 backlight_step_ring].
-# Guard: a rise to the middle crosses T_low later than one to high -- ~3 ms
-# from off in the dark [measured-all], less from the dim low [unmeasured --
-# M4] -- so a grid locked on one sits that far from the other.
+# Settle, by this badge's light: the transmitter's lateness, the sensor's 90%
+# from the dim low, an early lock [measured-v2]. Guard: a rise to the middle
+# crosses T_low later than one to high.
 SETTLE_LIT_US = 2500
-SETTLE_DARK_US = 10000
+SETTLE_DARK_US = 5000
 GUARD_LIT_US = 1000
 GUARD_DARK_US = 2000
 OPEN_PERCENT = 40
-# A window this long at least, or the rung is not one an EXACT pair starts
-# on: 100 readings at 50 kHz.
+# A window this long at least, or a pair does not start on the rung.
 WINDOW_MIN_US = 2000
-# No slot shorter than this: twice the worst per-slot work assumed on v2
-# [unmeasured -- M3 ring slot_work].
+# No slot shorter than this: twice a slot's worst work on v2.
 SLOT_MIN_MS = 6
-# A window is decided from the median of parts of it, each at most
-# PART_MAX_US -- inside the flicker filter's span table -- and between
-# PARTS_MIN and PARTS_MAX of them.
+# A window is the median of PARTS_MIN to PARTS_MAX parts, each at most
+# PART_MAX_US, inside the flicker's span table.
 PART_MAX_US = 4000
 PARTS_MIN = 5
 PARTS_MAX = 32
-# A POLLED part holds at least this many readings: parts are merged until
-# they do (merge_parts). At one reading every 2 ms a 2.24 ms part held one,
-# or none, and the median was of single readings where the old loop pooled.
-# Two, not three: in flicker with reads every 2 ms, three made parts so long
-# the window's median had few to choose from -- 109 of 144 against 126, and
-# 142 against 144 in the dark [simulation, lit47slow, veryslowread].
-POLL_PART_READINGS = 2
 
-# Rungs past the proven floor a transfer will gamble on. Zero: see SLOT_LADDER.
-OPTIMISTIC_RUNGS = 0
-
-# Beacon half periods. 250 and 400 until 2026-10: shorter, because every
-# reader now reads continuously, and a POLLED one sees a 100 ms half in 8 ms
-# coarse samples as it saw 250.
-ANNOUNCE_HALF_MS = 100   # Leader beacon half period
-PRESENT_HALF_MS = 160    # Follower beacon half period
+# The Announce: the backlight off and full at ANNOUNCE_FAST_HALF_MS halves,
+# matched over BEACON_FAST_HALVES of them within BEACON_TOLERANCE -- clear of
+# mains flicker's halves and a once-a-cycle light's. The Follower answers with
+# its staircase.
 BEACON_TOLERANCE = 0.20
+ANNOUNCE_FAST_HALF_MS = 14
+BEACON_FAST_HALVES = 6
 
-# One calibration for every pair: one staircase each way, in the backlight
-# scheme. Steps of PLATEAU_MS: settle up to 8 ms (dark, to the middle), then
-# STEP_SAMPLES of CAL_SAMPLE_MS held, with room to spare [inferred-all;
-# the POLLED sweep's choice among 40, 60 and 80]. Gaps: the Leader's opening
-# one long enough that the Follower's flicker fit, which it runs inside it,
-# ends there (CAL_OPEN_LEADER_MS); the Follower's shorter; closing gaps
-# found CAL_CLOSE_MS - 60 in, and longer than a beacon's quiet.
-PLATEAU_MS = 40
-CAL_REPS = 3
-CAL_OPEN_LEADER_MS = 400
-CAL_OPEN_MS = 250
-CAL_CLOSE_MS = 250
-# Times a badge reading its peer's staircase may find one that does not
-# separate and start reading again, before ERR_CONTRAST: see step_cal_recv.
+# Calibration: the Follower's staircase, sent the moment it detects the
+# Announce, sampled at FINE_MS; a step needs the sensor's settle
+# and MIN_HELD_FAST settled samples a level. Its repetitions are the light
+# flag: one LIT, two dark (spec 9.5).
+PLATEAU_FAST_MS = 20
+CAL_REPS_FAST = 2
+CAL_REPS_FAST_LIT = 1
+LIT_STEPS_MAX_FAST = 1
+MIN_HELD_FAST = 5
+CAL_FAST_MIN_SAMPLES = 24
+CAL_OPEN_FAST_MS = 40
+# The Leader reads the staircase while it announces, over its last
+# LEADER_CAL_LIMIT samples, finding the closing gap on a moving mean of one
+# 50 Hz cycle: no flicker is fitted yet.
+LEADER_CAL_LIMIT = 160
+LEADER_CAL_SMOOTH = 10
+# Refusals before both end ERR_CONTRAST: one may be hands still moving.
 CAL_RESTARTS = 1
-# When a POLLED Follower fits the flicker at the latest, in ms after the
-# quiet it saw: the Leader's opening gap began within ANNOUNCE_HALF_MS of
-# it, so its staircase has ended by then, lit or dark. See
-# FLICKER_FOLLOWER_FIT_START_MS.
-FLICKER_FOLLOWER_LATE_FIT_MS = (ANNOUNCE_HALF_MS + CAL_OPEN_LEADER_MS
-                                + CAL_REPS * 3 * PLATEAU_MS + 20)
-CAL_GAP_MS = CAL_CLOSE_MS       # the shared gap after calibration: the same
+# Closing gaps are found CAL_CLOSE_FAST_SPARE_MS before they end.
+CAL_CLOSE_FAST_MS = 70
+CAL_CLOSE_FAST_SPARE_MS = 20
+# The shared gap. The Leader, LEADER_SETTLE_MS in, fits the flicker on it
+# (less LEADER_FIT_SKIP_MS for the last fall) and re-reads the staircase
+# corrected. The Follower checks for steady from FOLLOWER_FIT_START_MS over
+# FOLLOWER_CHECK_MS, and fits over FLICKER_FAST_FIT_MS if not.
+CAL_GAP_FAST_MS = CAL_CLOSE_FAST_MS - CAL_CLOSE_FAST_SPARE_MS + 60
+LEADER_SETTLE_MS = 100
+LEADER_FIT_SKIP_MS = 10
+FOLLOWER_FIT_START_MS = 70
+FOLLOWER_CHECK_MS = 60
+FLICKER_FAST_FIT_MS = 100
+# In flicker the Leader holds its first block back to
+# CAL_GAP_FAST_FLICKER_MS after the gap began, while both lock onto the
+# flicker's drift; the epoch does not move. A Follower waits that and
+# FAST_START_GRACE_MS more before calling the Leader lost, and one that found
+# flicker takes no light for a lock until HOLD_MARGIN_SLOTS before it ends.
+CAL_GAP_FAST_FLICKER_MS = 500
+FAST_START_GRACE_MS = 100
+HOLD_MARGIN_SLOTS = 4
+# A Follower's provisional middle, until a Begin trains its levels.
+PROVISIONAL_GREY_PERCENT = 45
+# A phase lock's crossing must stay lit from LOCK_SKIP_US to LOCK_HOLD_US
+# after it: a flicker peak the fit left falls back.
+LOCK_SKIP_US = 500
+LOCK_HOLD_US = 3000
+# A Follower that demoted on its own measures the Leader's next message over
+# RATE_CHECK_SLOTS and moves to its rung, within RATE_MATCH_PERCENT: an error
+# the Leader never heard left the two a rung apart.
+RATE_CHECK_SLOTS = 7
+RATE_MATCH_PERCENT = 8
 
-# The staircase carries two flags, so neither needs a message of its own:
-# its order the reader tier -- REVERSED for EXACT -- and its repetitions the
-# light, CAL_REPS_LIT for LIT. A reader counting LIT_STEPS_MAX or fewer high
-# steps takes it for LIT. The Leader's carries its own; the Follower's the
-# pair's, which the Leader adopts: only the Follower decides. See "Agreeing a
-# rung" in the spec.
-CAL_REPS_LIT = 2
-LIT_STEPS_MAX = 2
+# The fast block (fastblock.py, spec 13.1): a burst of 2-level symbols, each
+# RUNGS[i] PWM periods, after the lead-in, FAST_BEGIN, the rung in
+# FAST_RUNG_BITS and FAST_GAP_SLOTS of low; answered ACK or NAK. Lit pairs
+# start on F0, dark on F1. FAST_TRIES NAKs step down a rung, and past F3 the
+# transfer ends ERR_CRC; FAST_UP_ACKS ACKs step back up, the wait doubling
+# after a failed step. The Follower finds the burst's rise within FAST_SEARCH_US, less its
+# edge lag, and decodes only once the burst is over -- a training outlasts
+# the ring. The Leader waits FAST_REPLY_MS past the longest burst.
+FAST_GAP_SLOTS = 2
+FAST_RUNG_BITS = 2
+FAST_START_LIT, FAST_START_DARK = 0, 1
+FAST_TRIES = 2
+FAST_UP_ACKS = 4
+FAST_SEARCH_US = 3000
+EDGE_LAG_FAST_LIT_US = 400
+EDGE_LAG_FAST_DARK_US = 750
+FAST_REPLY_MS = 800
+FAST_BIN_US = 100
+FAST_BINS = 12000
+# A staircase starts on a pass with less than this of the ring to work
+# through (see Transfer.enter)...
+CAL_CAUGHT_UP_US = 2 * FINE_US
+# ... or this long after the pass that entered it.
+CAL_PENDING_MAX_MS = 250
 
-# A transfer that runs this long ends: relative µs stay a small int.
+# A transfer this long ends: relative us stay a small int.
 TRANSFER_MAX_US = (1 << 30) - (1 << 26)
 
 ANNOUNCE_TIMEOUT_MS = 60000
 
-# Outer deadline on a single block, and the backstop for the ways of getting
-# stuck the other two budgets do not describe. Counted per block rather than
-# per transfer, so payload length stays the caller's business.
+# Per block, so payload length stays the caller's business.
 BLOCK_TIMEOUT_MS = 300000
 
 LOST_PEER_SLOTS = 16
-MAX_BLOCK_RETRIES = 2
 
-# Slots spent listening without the transfer advancing.
-#
-# LOST_PEER_SLOTS counts silence, and silence is not the only way a link dies:
-# a peer stuck on grey, or one whose grid no longer matches ours, decodes to
-# something every slot and resets the silence counter for ever. This second
-# budget counts progress instead -- advance() restarts it -- and exceeding it
-# is ERR_LOST_PEER.
+# Slots without progress: a peer stuck on grey decodes something every slot
+# and never counts as silent.
 STALL_SLOTS = 4 * LOST_PEER_SLOTS
 
-# Black slots a Follower waits out before asking for a block again, so the
-# request cannot land while the Leader is still transmitting. Longer than any
-# gap inside a block, where the only black is a single-slot Field Separator.
-# A framing failure waits for the same thing: the Leader is part way through a
-# block and listens to nothing until it has sent the rest.
+# Lit slots a fast-capable Follower decides framing nothing, after which
+# RESEND_QUIET_SLOTS of black ask for the block again: a fast block missed
+# at its Begin is too short for STALL_SLOTS.
+UNFRAMED_LIT_SLOTS = 16
+
+# Black a Follower waits out before asking again, so the request cannot land
+# while the Leader, deaf while it transmits, is still sending.
 RESEND_QUIET_SLOTS = 3
 
-# Complete is acknowledged rather than assumed: it is six slots with no lead-in
-# and the easiest message to miss, and a Leader that reported OK on transmitting
-# it could be wrong. The Leader repeats until answered; the Follower lingers
-# afterwards so it is still there to answer a repeat.
+# Complete is acknowledged, not assumed: the Leader repeats it until
+# answered, the Follower lingers to answer a repeat, and the repeat waits
+# out lit slots but no longer than COMPLETE_REPEAT_MAX_SLOTS.
 COMPLETE_RETRY_SLOTS = 12       # > len(COMPLETE_ACK) + 2
 MAX_COMPLETE_RETRIES = 3
 LINGER_SLOTS = 20               # > COMPLETE_RETRY_SLOTS, so a repeat is answered
+COMPLETE_REPEAT_MAX_SLOTS = LINGER_SLOTS - 2
 
-# Ceiling on transmissions of one block. MAX_BLOCK_RETRIES bounds CRC failures
-# but the sync-error path resets it, which otherwise leaves a demote-and-resend
-# loop bounded by nothing. Derived from the ladder so it cannot drift.
-MAX_BLOCK_ATTEMPTS = (MAX_BLOCK_RETRIES + 1) * len(SLOT_LADDER)
+# Transmissions of one block, NAKs and Data Sync Errors alike.
+MAX_BLOCK_ATTEMPTS = 48
 
-BLOCK_BYTES = 64
 RESYNC_LEAD_IN = 4    # black slots before each block, so a resend survives a rate change
 MAX_PATTERN = 16      # longest run of symbols any match looks back over
 
 
-# Breaking in. A continuous Leader reads while it transmits, so a continuous
-# Follower that has lost the block -- its framing, or the verdict on the last
-# one -- need not wait for it to end: it shows high and holds it. The Leader
-# takes BREAK_DETECT_SLOTS of high, while it sends a block, as a break, stops,
-# and listens. The Follower takes BREAK_ACK_SLOTS of dark as the Leader having
-# stopped, and sends the Data Sync Error it always would have: both demote on
-# that, as before, so a break cannot split the rungs. Unanswered after
-# BREAK_MAX_SLOTS, it waits the block out as before. A Follower in STEP_VERDICT
-# that has seen more than VERDICT_LOST_SYMBOLS lit symbols without a verdict
-# among them has missed it, and breaks too.
-BREAK_DETECT_SLOTS = 2
-BREAK_ACK_SLOTS = 2
-BREAK_MAX_SLOTS = 24
-VERDICT_LOST_SYMBOLS = 12
+# A Leader reads the slots of its own lead-in for the flicker; after a stall
+# only the last WATCH_SLOTS of them.
+WATCH_SLOTS = 2
 
-# Extra black before a block resent after a rate change. The Leader acts on a
-# Data Sync Error at its fourth symbol -- the leading black is discarded while
-# it waits for a reply to begin, so the first '_' starts one and the black after
-# it ends it -- so the peer is still transmitting the other five at the old
-# rate while the resend's lead-in goes out. They eat it, and the receiver never
-# gets the silence it needs to phase-lock. A whole pattern's worth at the new
-# rate more than covers the remainder sent at the old one.
+# Black before a block resent after a rate change: the Follower is still
+# sending the rest of its Data Sync Error at the old rate.
 SYNC_LEAD_IN = 9
 
 
 # --- symbols ----------------------------------------------------------------
-# '-' high, binary 1
-# '_' middle, binary 0
-# ' ' low, black, a break. Never appears inside payload data, which is what
-#     makes every control pattern unforgeable by the payload.
+# '-' high, 1; '_' middle, 0; ' ' low, black. A control pattern is told
+# apart by the blacks inside it.
 
 HIGH = "-"
 MID = "_"
 LOW = " "
 
-BEGIN_BLOCK = "-_ -_ -_ "
-END_BLOCK = "_- _- _- "
 CRC_GOOD = "-- -- -- "
 CRC_BAD = "__ __ __ "
 SYNC_ERROR = "  _  _  _"
 COMPLETE = "- - - "
+# A fast block's Begin: high, middle and low three times, to train on.
+FAST_BEGIN = "-_ -_ _- "
 
 
 # --- light levels -----------------------------------------------------------
-# How a transmitter produces each symbol: (pixels, backlight). Pixels are
-# "black", "white" or an (r, g, b) tuple -- black and white being the panel's
-# full rgb(0, 0, 0) and rgb(255, 255, 255), not the Tufty palette's tinted
-# color.black and color.white; backlight is the display.backlight()
-# value set with the field. A receiver never needs to know which scheme is in
-# use -- calibration measures the levels that actually arrive -- but the
-# scheme is still a joint decision: calibration chooses one, and from then on
-# both badges transmit in it. See "Light levels and symbols" and "Choosing a
-# scheme" in the spec.
-
-# The original: pixels carry the level, the backlight is held at full. The
-# middle field is 68% of white per channel, chosen to hold across gamma
-# 1.0-2.5. Against the tinted palette white it was rgb(151, 162, 146) and
-# measured at 0.400 of the swing [measured-all]; against full white it is a
-# neutral rgb(173, 173, 173), the same share of the swing [inferred-all]. The
-# default.
-SCHEME_FIELDS = "fields"
-
-# The backlight carries the level, and the pixels are white at every level,
-# low included: low is the backlight off, which is as dark as black pixels
-# (bleed reads the same, [measured-all]) and leaves the pixels alone, so the
-# scheme is carried by display.backlight() alone -- a PWM duty, live at once,
-# with no present and no liquid crystal settle in the way ([source-v2]; 0 is
-# off on v3 too, despite its duty floor [source-v3]).
-#
-# Low is dim, not off: 0.5, 14% duty on v2, just above the backlight
-# driver's ~11% threshold [source-v3], so the sensor stays faintly lit and a
-# rise starts from a little current rather than none. On the badge it cut
-# the dark room's edge delay from 1.2-1.9 ms to 0.3, and read under one ADC
-# step above off, so it costs no gap [measured-all, 2026-10-06]. The middle
-# is 0.82 to match: 57% duty on v2 [source-v2], 61% on v3 [source-v3]. It
-# was 0.74, which six mirror runs read only two ADC steps above black, then
-# 0.80. 0.25 and 0.33 failed calibration every time in simulation.
-# It only works if the light sensor averages the ~3.8kHz PWM rather than
-# following it, which the badge's does [measured-v2]. Every transfer now
-# calibrates and sends on it; the fields scheme is kept for the beacons and
-# Dev Mode's tests. A badge whose sensor followed the PWM would fail
-# calibration with ERR_CONTRAST rather than fall back.
+# Every symbol is a display.backlight() value behind a white screen drawn
+# once: a PWM duty, live at once. A receiver never needs to know the table;
+# calibration measures what arrives (spec 4). The data's low is dim, not
+# off, which keeps the sensor faintly lit and fast. It works only because
+# the sensor averages the PWM [measured-v2].
 SCHEME_BACKLIGHT = "backlight"
 
-MID_FIELD_RGB = (173, 173, 173)
+# The beacons': full and off, the darkest the screen gets.
+SCHEME_BEACON = "beacon"
+BEACON_LOW_BACKLIGHT = 0.0
+
 MID_BACKLIGHT = 0.82
 LOW_BACKLIGHT = 0.5
 
+# display.backlight() per symbol, per table.
 LEVEL_SCHEMES = {
-    SCHEME_FIELDS: {
-        HIGH: ("white", 1.0),
-        MID: (MID_FIELD_RGB, 1.0),
-        LOW: ("black", 1.0),
-    },
-    SCHEME_BACKLIGHT: {
-        HIGH: ("white", 1.0),
-        MID: ("white", MID_BACKLIGHT),
-        LOW: ("white", LOW_BACKLIGHT),
-    },
+    SCHEME_BACKLIGHT: {HIGH: 1.0, MID: MID_BACKLIGHT, LOW: LOW_BACKLIGHT},
+    SCHEME_BEACON: {HIGH: 1.0, MID: MID_BACKLIGHT, LOW: BEACON_LOW_BACKLIGHT},
 }
 
 
-# A square wave against a resting level. The two beacons are told apart by
-# period alone, since before calibration there are no thresholds to tell levels
-# apart by.
-def beacon_field(elapsed, half_ms, low=MID):
-    return HIGH if (elapsed // half_ms) % 2 else low
+# A square wave against black, told apart by period alone: before
+# calibration there are no thresholds.
+def beacon_field(elapsed, half_ms):
+    return HIGH if (elapsed // half_ms) % 2 else LOW
 
-# The Follower's answer to Complete, and the only thing that lets the Leader
+# The Follower's answer to Complete, the only thing that lets the Leader
 # report OK.
 COMPLETE_ACK = "__- __- "
 
 
-# A pattern's trailing black is a separator rather than information, and it is
-# the hardest symbol to read: it follows white, so it is the panel's full swing,
-# and the peer can still be part way down it when sampling opens. Receivers
-# match without it. They stay unforgeable because of the black INSIDE them.
-#
-# Begin Block is deliberately absent: its trailing black is the boundary with
-# the payload, and matching a slot early would take it for a Field Separator.
+# Receivers match without a pattern's trailing black, the hardest symbol to
+# read; the black inside keeps them unforgeable.
 CRC_GOOD_TAIL = CRC_GOOD.rstrip(LOW)
 CRC_BAD_TAIL = CRC_BAD.rstrip(LOW)
 COMPLETE_TAIL = COMPLETE.rstrip(LOW)
 COMPLETE_ACK_TAIL = COMPLETE_ACK.rstrip(LOW)
+# The Leader takes the Ack less its first symbol: it follows Complete by one
+# silent slot, and a slow sensor's first middle comes too late. Still
+# unforgeable: only the Ack has a black after "-" between lit symbols.
+COMPLETE_ACK_LATE_TAIL = COMPLETE_ACK_TAIL[1:]
 SYNC_ERROR_TAIL = SYNC_ERROR.rstrip(LOW)
 
 
@@ -1021,31 +904,17 @@ ERR_LOST_PEER = "ERR_LOST_PEER"
 ERR_CRC = "ERR_CRC"
 ERR_DECODE = "ERR_DECODE"
 ERR_CANCELLED = "ERR_CANCELLED"
-
-
-# --- CRC-16/CCITT-FALSE -----------------------------------------------------
-# poly 0x1021, init 0xFFFF, no reflection, no final XOR.
-
-def crc16(data):
-    crc = 0xFFFF
-    for byte in data:
-        crc ^= byte << 8
-        for _ in range(8):
-            if crc & 0x8000:
-                crc = ((crc << 1) ^ 0x1021) & 0xFFFF
-            else:
-                crc = (crc << 1) & 0xFFFF
-    return crc
-
+ERR_RING = "ERR_RING"
 
 
 # --- beacon detection -------------------------------------------------------
 
-# Detects the two pre-calibration beacons. Before calibration there are no
-# thresholds, so presence is relative -- a swing of MIN_SWING or more -- and
-# the two beacons are told apart by period alone, never by brightness.
+# A swing of MIN_SWING or more, told apart by period; its black over
+# BEACON_WINDOW_MS.
+BEACON_WINDOW_MS = 1000
+
+
 class BeaconDetector:
-    WINDOW_MS = 1000
     CAPACITY = 128
 
     def __init__(self):
@@ -1066,15 +935,14 @@ class BeaconDetector:
         if self.count < self.CAPACITY:
             self.count += 1
 
-    # Indices of the samples inside the window, oldest first, and their
-    # range in `lo` and `hi`. Fills a preallocated list rather than building a
-    # new one every frame.
-    def _fill_window(self):
+    # The samples inside the window, oldest first, into a preallocated
+    # list; their range in `lo` and `hi`.
+    def _fill_window(self, window_ms=BEACON_WINDOW_MS):
         newest = self.times[(self.head - 1) % self.CAPACITY]
         found = lo = hi = 0
         for i in range(self.count):
             idx = (self.head - 1 - i) % self.CAPACITY
-            if time.ticks_diff(newest, self.times[idx]) > self.WINDOW_MS:
+            if time.ticks_diff(newest, self.times[idx]) > window_ms:
                 break
             self.window[found] = idx
             value = self.values[idx]
@@ -1090,9 +958,12 @@ class BeaconDetector:
                 self.window[found - 1 - i], self.window[i]
         return found
 
-    # Returns the measured half period in ms, or None if there is no beacon.
-    def half_period(self):
-        count = self._fill_window()
+    def half_period(self, window_ms, regular_ms):
+        """The half period in ms over the last `window_ms`, or None. Every
+        interval between crossings within half of `regular_ms`, and three
+        crossings at least: noise read every 8-16 ms once averaged to a
+        beacon's half."""
+        count = self._fill_window(window_ms)
         if count < 8:
             return None
 
@@ -1100,10 +971,8 @@ class BeaconDetector:
             return None
 
         mid = (self.lo + self.hi) // 2
-        # A beacon spends about half its time either side of its middle. A
-        # quiet window with an outlier in it has the swing but not that:
-        # without this, a few such crossings once averaged to a beacon's half
-        # period, and a Leader "found" a Follower that had not started.
+        # About half the time either side of the middle: a quiet window with
+        # an outlier has the swing but not that.
         high = 0
         for i in range(count):
             if self.values[self.window[i]] >= mid:
@@ -1117,49 +986,43 @@ class BeaconDetector:
             idx = self.window[i]
             now_above = self.values[idx] >= mid
             if now_above != above:
+                t = self.times[idx]
                 if first is None:
-                    first = self.times[idx]
-                last = self.times[idx]
+                    first = t
+                elif abs(time.ticks_diff(t, last)
+                         - regular_ms) * 2 > regular_ms:
+                    return None
+                last = t
                 crossings += 1
                 above = now_above
-        if crossings < 2:
+        if crossings < 3:
             return None
         return time.ticks_diff(last, first) // (crossings - 1)
 
-    # Milliseconds since the last midpoint crossing, or since the window began
-    # if nothing has crossed. A beacon crosses constantly; a held field does not.
-    def quiet_ms(self, now):
-        count = self._fill_window()
-        if count < 4:
-            return 0
-        if self.hi - self.lo < MIN_SWING:
-            return time.ticks_diff(now, self.times[self.window[0]])
-        mid = (self.lo + self.hi) // 2
-        above = self.values[self.window[0]] >= mid
-        last = self.times[self.window[0]]
-        for i in range(1, count):
-            idx = self.window[i]
-            now_above = self.values[idx] >= mid
-            if now_above != above:
-                last = self.times[idx]
-                above = now_above
-        return time.ticks_diff(now, last)
-
     def low(self):
-        """The beacon's black -- the room's light on the sensor -- or None if
-        the window is empty: the median of the readings in the darker half of
-        the window's range. Not the darkest reading, which one outlier
-        decides."""
+        """The beacon's black, or None: the median of the window's darker
+        half, not its darkest reading, which one outlier decides."""
+        return self._half(False)
+
+    def high(self):
+        """The beacon's full: the median of the brighter half, or None."""
+        return self._half(True)
+
+    def _half(self, upper):
         count = self._fill_window()
         if not count:
             return None
         mid = (self.lo + self.hi) // 2
-        dark = sorted(self.values[self.window[i]] for i in range(count)
-                      if self.values[self.window[i]] <= mid)
-        return dark[len(dark) // 2]
+        half = sorted(self.values[self.window[i]] for i in range(count)
+                      if (self.values[self.window[i]] > mid) == upper)
+        return half[len(half) // 2] if half else None
 
-    def matches(self, target_ms):
-        measured = self.half_period()
+    def matches(self, target_ms, window_ms=None):
+        """Whether the last `window_ms` -- BEACON_FAST_HALVES halves if None
+        -- hold a beacon of half period `target_ms`, crossing regularly."""
+        if window_ms is None:
+            window_ms = BEACON_FAST_HALVES * target_ms
+        measured = self.half_period(window_ms, target_ms)
         if measured is None:
             return False
         return abs(measured - target_ms) <= target_ms * BEACON_TOLERANCE
@@ -1177,8 +1040,7 @@ class Levels:
         self.t_high = 0
         self.band = 0
         self.last = MID
-        # Each level's noise on this link, from calibration (standard
-        # deviation, counts).
+        # Each level's noise on this link, from calibration (sd, counts).
         self.noise_black = 0.0
         self.noise_grey = 0.0
         self.noise_white = 0.0
@@ -1189,10 +1051,13 @@ class Levels:
         self.t_high = (grey + white) // 2
         self.band = (white - black) * 5 // 100
 
-    # Hysteresis: a sample inside a band keeps the level decided last time.
     def classify(self, value):
-        if abs(value - self.t_low) <= self.band or abs(value - self.t_high) <= self.band:
-            return self.last
+        # Hysteresis, but a band holds a level only against the threshold
+        # beside it: a value at T_high is never low.
+        last = self.last
+        if abs(value - self.t_low) <= self.band and last != HIGH or \
+                abs(value - self.t_high) <= self.band and last != LOW:
+            return last
         if value < self.t_low:
             self.last = LOW
         elif value < self.t_high:
@@ -1202,51 +1067,35 @@ class Levels:
         return self.last
 
 
-# The staircase: CAL_REPS passes of low, middle and high, bracketed by
-# longer black gaps. Self identifying without thresholds, because it is the only
-# signal that steps monotonically through three levels, and its closing gap is a
-# shared time reference both badges can find.
-def staircase_ms(reps=CAL_REPS, open_ms=CAL_OPEN_MS):
-    return open_ms + reps * 3 * PLATEAU_MS + CAL_CLOSE_MS
+# The staircase: `reps` passes of three levels between longer black gaps.
+# It identifies itself -- nothing else steps through three levels -- and its
+# closing gap is a time both badges can find.
+def staircase_ms(reps, open_ms, plateau_ms, close_ms):
+    return open_ms + reps * 3 * plateau_ms + close_ms
 
 
-# A Follower's DARK staircase.
-STAIRCASE_MS = staircase_ms()
+# Its order: low, high, middle. The levels come from the samples'
+# distribution, which order does not change.
+STAIRCASE = (LOW, HIGH, MID)
 
-
-# The order of the three steps carries one flag, which is how calibration
-# chooses a light-level scheme without a message of its own: the levels are
-# read from the distribution of samples, which order does not change, and once
-# they are known the order can be read back out of the same samples. What the
-# flag is the reader tier: REVERSED for EXACT -- see "Agreeing a rung".
-ASCENDING = (LOW, MID, HIGH)
-REVERSED = (LOW, HIGH, MID)
-
-# Samples a level must hold to count as a step rather than a transition passing
-# through it. A step is PLATEAU_MS, ten CAL_SAMPLE_MS samples; the sensor's
-# settle is one or two.
+# Samples a level holds to count as a step rather than a transition.
 STEP_SAMPLES = 3
 
 
-def staircase_field(elapsed, order=ASCENDING, reps=CAL_REPS,
-                    open_ms=CAL_OPEN_MS):
+def staircase_field(elapsed, order, reps, open_ms, plateau_ms):
     if elapsed < open_ms:
         return LOW
     body = elapsed - open_ms
-    if body >= reps * 3 * PLATEAU_MS:
+    if body >= reps * 3 * plateau_ms:
         return LOW
-    return order[(body // PLATEAU_MS) % 3]
+    return order[(body // plateau_ms) % 3]
 
 
-def staircase_steps(values, levels):
-    """(middle-to-high, high-to-middle, high) steps in a measured staircase.
-
-    A step is a level held for STEP_SAMPLES samples; anything shorter is a
-    transition passing through. Each repetition has one high step, in either
-    order.
-    """
-    rising = falling = highs = held = 0
-    current = previous = None
+def staircase_highs(values, levels):
+    """High steps in a measured staircase -- its repetitions, the light
+    flag: a step is a level held STEP_SAMPLES samples."""
+    highs = held = 0
+    current = None
     for value in values:
         if value < levels.t_low:
             level = LOW
@@ -1258,15 +1107,9 @@ def staircase_steps(values, levels):
             held += 1
         else:
             current, held = level, 1
-        if held == STEP_SAMPLES:
-            if previous == MID and level == HIGH:
-                rising += 1
-            elif previous == HIGH and level == MID:
-                falling += 1
-            if level == HIGH:
-                highs += 1
-            previous = level
-    return rising, falling, highs
+        if held == STEP_SAMPLES and level == HIGH:
+            highs += 1
+    return highs
 
 
 def quantile(sorted_values, fraction):
@@ -1274,22 +1117,11 @@ def quantile(sorted_values, fraction):
     return sorted_values[min(index, len(sorted_values) - 1)]
 
 
-# A level needs this many settled samples before its noise means anything.
-MIN_HELD_SAMPLES = 8
-
-
-def held_spreads(values, t_low, t_high):
-    """Each level's noise from a staircase: (black, grey, white) standard
-    deviations, or None if a level has fewer than MIN_HELD_SAMPLES settled
-    samples.
-
-    `values` in the order they were read. A sample counts only once the
-    reading has stayed in its level's class -- below `t_low`, between, above
-    `t_high` -- for STEP_SAMPLES readings: a transition passing through, or
-    a panel still settling just after one, would otherwise count as noise,
-    and on a 24 ms panel at 8 ms frames it swamps the real thing. Welford's
-    running variance, so float32 holds its precision.
-    """
+def held_spreads(values, t_low, t_high, min_held=MIN_HELD_FAST):
+    """Each level's noise from a staircase, (black, grey, white) sds, or
+    None if a level has fewer than `min_held` settled samples: a sample
+    counts once STEP_SAMPLES in a row share its level. Welford's, so
+    float32 keeps its precision."""
     n = [0, 0, 0]
     mean = [0.0, 0.0, 0.0]
     m2 = [0.0, 0.0, 0.0]
@@ -1305,49 +1137,49 @@ def held_spreads(values, t_low, t_high):
         delta = v - mean[level]
         mean[level] += delta / n[level]
         m2[level] += delta * (v - mean[level])
-    if min(n) < MIN_HELD_SAMPLES:
+    if min(n) < min_held:
         return None
     return (math.sqrt(m2[0] / n[0]), math.sqrt(m2[1] / n[1]),
             math.sqrt(m2[2] / n[2]))
 
 
-def gap_separable(gap, noise_a, noise_b):
-    """Whether two adjacent levels `gap` apart, with these noises, can be told
-    apart: MIN_GAP, and GAP_SIGMAS of the noisier side's noise."""
+def gap_separable(gap, noise_a, noise_b, min_gap=MIN_GAP_EXACT):
+    """Whether two levels `gap` apart, with these noises, can be told apart."""
     noise = max(noise_a, noise_b, QUANTISATION_SD)
-    return gap >= MIN_GAP and gap >= GAP_SIGMAS * noise
+    return gap >= min_gap and gap >= GAP_SIGMAS * noise
 
 
-# Measures a staircase without knowing when it started. Aligning to plateau
-# boundaries is impossible before thresholds exist, so it keeps every sample and
-# reads the levels out of their distribution -- percentiles rather than equal
-# thirds, since how much leading black is captured depends on when it started.
+# Reads a staircase without knowing when it started: every sample kept, the
+# levels read from their distribution by percentiles.
 class StaircaseReader:
     LIMIT = 512
-    # Dark samples kept before the first rise when the levels are read: the
-    # gaps are long against 40 ms steps, and all of them would put the held
-    # high level under the 0.90 quantile.
+    # Dark samples kept before the first rise: all of the gaps would push
+    # the high level under the 0.90 quantile.
     LEAD_KEEP = 12
 
-    def __init__(self):
+    def __init__(self, limit=None, smooth=0):
+        self.close_found_ms = CAL_CLOSE_FAST_MS - CAL_CLOSE_FAST_SPARE_MS
+        self.limit = limit or self.LIMIT
+        # Samples the closing gap is found on the mean of (a Leader's).
+        self.smooth = smooth
+        self.recent = []
+        self.recent_at = []
+        self.smoothed = []
         self.values = []
         self.low_since = None
         self.low_run = 0
         self.high_run = 0
         self.ended_at = None
         self.body_end = None
-        # The last two samples fed, and when the newer was taken: each is
-        # kept as the median of itself and its neighbours, one sample late.
+        # The last two samples fed, for a median of three, one sample late.
         self.older = self.newer = None
         self.newer_at = 0
 
     def feed(self, now, value):
         if self.ended_at is not None:
             return True
-        # A median of three: one outlier -- a sample corrected wrongly, or
-        # cut short -- made `min()` below the darkest level for the rest of
-        # the staircase, and the closing gap then never read as dark. The
-        # median is the middle sample's, so it is timed by it.
+        # A median of three: one outlier made min() too dark for the rest of
+        # the staircase, and the closing gap never read dark.
         older, newer = self.older, self.newer
         self.older = newer
         self.newer = value
@@ -1363,31 +1195,56 @@ class StaircaseReader:
         value = newer if value > newer else (older if value < older
                                              else value)
         now = at
-        # A rolling buffer, not a hard stop. Freezing at LIMIT meant a reader
-        # that started early filled up with ambient and never saw the staircase
-        # at all -- min and max stayed equal and calibration always failed.
+        # Rolling, not frozen at LIMIT: an early start would fill with the
+        # room and never see the staircase.
         self.values.append(value)
-        if len(self.values) > self.LIMIT:
+        if len(self.values) > self.limit:
             del self.values[0]
-        if len(self.values) < 24:
+        if len(self.values) < CAL_FAST_MIN_SAMPLES:
             return False
 
+        if self.smooth:
+            recent = self.recent
+            recent.append(value)
+            self.recent_at.append(now)
+            if len(recent) > self.smooth:
+                del recent[0]
+                del self.recent_at[0]
+            value = sum(recent) // len(recent)
+            # The means' swing, not the raw: a once-a-cycle light's cycle
+            # averages away, a 20 ms step does not.
+            smoothed = self.smoothed
+            if len(recent) == self.smooth:
+                smoothed.append(value)
+                if len(smoothed) > self.limit:
+                    del smoothed[0]
+            if not smoothed or max(smoothed) - min(smoothed) < MIN_SWING:
+                return False
         lo = min(self.values)
         hi = max(self.values)
         if hi - lo < MIN_SWING:
             return False
+        line = lo + (hi - lo) // 3
+        start = now
+        if self.smooth:
+            # The trailing run's first raw sample under the line, or half
+            # the window back if flicker leaves none.
+            start = time.ticks_add(now, -self.smooth * FINE_MS // 2)
+            recent = self.recent
+            i = len(recent) - 1
+            while i >= 0 and recent[i] <= line:
+                start = self.recent_at[i]
+                i -= 1
 
-        # The closing gap: a sustained return to the darkest level ends it, and
-        # its leading edge is the reference both badges time the clock from.
-        # One sample over the line does not end the run: in 4 ms samples of
-        # a few readings each -- a POLLED badge under stress -- noise put
-        # one there often enough that the closing gap was never found.
-        if value <= lo + (hi - lo) // 3:
+        # The closing gap: a sustained return to the darkest level; its
+        # leading edge is the shared reference. One sample over the line does
+        # not end the run.
+        if value <= line:
             self.low_run += 1 + self.high_run
             self.high_run = 0
             if self.low_since is None:
-                self.low_since = now
-            elif time.ticks_diff(now, self.low_since) >= CAL_CLOSE_MS - 60:
+                self.low_since = start
+            elif time.ticks_diff(now, self.low_since) >= self.close_found_ms:
                 self.ended_at = self.low_since
                 self.body_end = len(self.values) - self.low_run
                 return True
@@ -1400,8 +1257,8 @@ class StaircaseReader:
         return False
 
     def body(self):
-        """The staircase's samples: from LEAD_KEEP before its first rise to
-        its closing gap -- the gaps only dilute the levels."""
+        """The staircase's samples, LEAD_KEEP before its first rise to its
+        closing gap: the gaps only dilute the levels."""
         values = self.values
         end = len(values) if self.body_end is None else self.body_end
         if not values:
@@ -1416,7 +1273,7 @@ class StaircaseReader:
     def levels(self):
         """The three levels, or None if they cannot be separated."""
         values = self.body()
-        if len(values) < 32:
+        if len(values) < CAL_FAST_MIN_SAMPLES:
             return None
         ordered = sorted(values)
         black = quantile(ordered, 0.10)
@@ -1425,16 +1282,9 @@ class StaircaseReader:
         if span < MIN_SWING:
             return None
 
-        # The middle cluster, isolated by value rather than by count, so uneven
-        # amounts of captured black do not drag the estimate around.
-        #
-        # From everything an eighth of the swing clear of either end, and only
-        # then held to the quarter rule. Taken from the middle half, as it once
-        # was, the rule could never fail: whatever landed there had its median
-        # inside the middle half by construction. An eighth so that black and
-        # white stay out of the band and a middle level anywhere in it is
-        # counted whole; one between an eighth and a quarter from an end is
-        # then measured where it is, and fails.
+        # The middle cluster by value, from everything an eighth of the swing
+        # clear of either end, then held to the quarter rule -- from the
+        # middle half the rule could never fail.
         lo = black + span // 8
         hi = black + 7 * span // 8
         middle = [v for v in ordered if lo <= v <= hi]
@@ -1444,12 +1294,8 @@ class StaircaseReader:
             return None
         grey = middle[len(middle) // 2]
 
-        # Nearer an end than an eighth -- color.grey is 7% of the swing -- the
-        # middle step falls outside the band, and what is left in it is the
-        # panel's transitions passing through, whose median can sit anywhere.
-        # A step is held as long as the high one, a transition for a frame or
-        # two, so a middle level is real only if about as many samples as the
-        # top end holds sit close around it.
+        # A middle step is held as long as the high one, a transition a sample
+        # or two: real only if about as many samples sit around it.
         near = span // 8
         held = sum(1 for v in middle if grey - near <= v <= grey + near)
         if held * 2 < above:
@@ -1460,8 +1306,7 @@ class StaircaseReader:
             return None
         out = Levels()
         out.fit(black, grey, white)
-        # Noise per level, from the samples settled in it -- this link's, in
-        # this light -- and each gap against the noisier side.
+        # Each gap against the noisier side's noise, on this link.
         spreads = held_spreads(values, out.t_low, out.t_high)
         if spreads is None:
             return None
@@ -1474,88 +1319,19 @@ class StaircaseReader:
 
 
 
-# --- payload ----------------------------------------------------------------
-# A payload is a list of byte strings, joined by a black slot. No envelope: the
-# separator is a symbol payload data can never contain, so it costs one slot per
-# boundary instead of a length prefix's eight.
-#
-# The protocol attaches no meaning to the fields. It does not know how many
-# there should be, how long they may be, or whether they are text. That is the
-# application's business -- see valid_credential() in __init__.py.
-
-SEPARATOR = -1   # token standing in for the Field Separator
-
-
-def build_tokens(*fields):
-    tokens = []
-    for i, field in enumerate(fields):
-        if i:
-            tokens.append(SEPARATOR)
-        tokens.extend(field)
-    return tokens
-
-
-# Blocks are transport only: up to BLOCK_BYTES byte tokens each. The separator
-# rides along and does not count toward the limit.
-def split_blocks(tokens):
-    blocks = []
-    current = []
-    count = 0
-    for token in tokens:
-        if token == SEPARATOR:
-            current.append(token)
-            continue
-        if count == BLOCK_BYTES:
-            blocks.append(current)
-            current = []
-            count = 0
-        current.append(token)
-        count += 1
-    if current:
-        blocks.append(current)
-    return blocks
-
-
-# The separator contributes a 0x00 to the CRC at its position but is never
-# transmitted as a byte. Without it a dropped separator passes CRC and only
-# surfaces later as a decode failure, reporting the wrong error.
-def block_crc(tokens):
-    return crc16(bytes(0 if t == SEPARATOR else t for t in tokens))
-
-
-def block_symbols(tokens):
-    out = []
-    for token in tokens:
-        if token == SEPARATOR:
-            out.append(LOW)
-        else:
-            out.extend(bits_symbols(token, 8))  # most significant bit first
-    return out
-
-
 def bits_symbols(value, width):
+    """`value`'s `width` bits as symbols, most significant first."""
     return [HIGH if (value >> shift) & 1 else MID
             for shift in range(width - 1, -1, -1)]
 
 
-def symbols_bits(symbols):
-    value = 0
-    for symbol in symbols:
-        value = (value << 1) | (1 if symbol == HIGH else 0)
-    return value
-
-
-
 # --- slot clock -------------------------------------------------------------
-# Slots are measured against a clock, never badge.ticks: badge.ticks is a
-# per-frame snapshot that cannot resolve anything shorter than a frame. A
-# transfer's clock counts µs (`scale` 1000); Dev Mode's ms (`scale` 1).
+# In us, never badge.ticks, a per-frame snapshot.
 
 class SlotClock:
-    def __init__(self, scale=1):
-        self.scale = scale
+    def __init__(self):
         self.epoch = 0
-        self.duration = SLOT_LADDER[0] * scale
+        self.duration = SLOT_LADDER[0] * 1000
         self.index = 0
 
     def start(self, now, ladder_index):
@@ -1563,12 +1339,12 @@ class SlotClock:
         self.set_index(ladder_index)
 
     def slow_down(self):
-        # Index 0 is the slowest rung, so stepping slower means stepping down.
+        # Index 0 is the slowest rung.
         self.set_index(self.index - 1)
 
     def set_index(self, index):
         self.index = max(0, min(len(SLOT_LADDER) - 1, index))
-        self.duration = SLOT_LADDER[self.index] * self.scale
+        self.duration = SLOT_LADDER[self.index] * 1000
 
     def start_of(self, number):
         return time.ticks_add(self.epoch, number * self.duration)
@@ -1576,8 +1352,14 @@ class SlotClock:
     def number(self, now):
         return time.ticks_diff(now, self.epoch) // self.duration
 
-    def offset(self, now):
-        return time.ticks_diff(now, self.epoch) % self.duration
+
+
+def _median3(a, b, c):
+    if a > b:
+        a, b = b, a
+    if b > c:
+        b = c
+    return a if a > b else b
 
 
 def _insert_sorted(buf, count, value):
@@ -1590,36 +1372,22 @@ def _insert_sorted(buf, count, value):
 
 
 # --- transfer engine --------------------------------------------------------
-# The caller reads the sensor through a reader (reader.py) and, each pass of
-# its loop: shows field_at(now), calls work(now), and waits for due_us().
-# Times are µs since the transfer began, from the reader's own clock.
+# Each pass: show field_at(now), call work(now), wait for due_us(). Times
+# are us since the transfer began, on the reader's clock.
 
-PHASE_ANNOUNCE = 0
-PHASE_PRESENT = 1
-PHASE_CAL_SEND = 2
-PHASE_CAL_RECV = 3
-PHASE_CAL_GAP = 4
-PHASE_DATA = 5
-PHASE_DONE = 6
+PHASE_ANNOUNCE = 0     # Leader: announces, reads for the staircase
+PHASE_LISTEN = 1       # Follower: holds black until it sees the Announce
+PHASE_CAL_SEND = 2     # Follower: sends its staircase
+PHASE_CAL_GAP = 3      # both: the shared gap, until the epoch
+PHASE_DATA = 4
+PHASE_DONE = 5
 
-# A loop that waits for a time pumps a little past it, so the readings the
-# work is waiting for are complete.
+# A wait pumps a little past its time, so the readings are complete.
 DUE_MARGIN_US = 100
 
 
-def rung_for(sample_ms, settle_ms):
-    """The fastest rung a POLLED receiver can meet: at least 2.5 samples of
-    `sample_ms` a slot, and SETTLE_SLOTS settle times."""
-    best = 0
-    for i, duration in enumerate(SLOT_LADDER):
-        if duration >= sample_ms * 2.5 and duration >= settle_ms * SETTLE_SLOTS:
-            best = i
-    return best
-
-
 def exact_window(duration_us, settle_us, guard_us):
-    """Where an EXACT reader decides a slot: (open, close) in µs from its
-    start. See OPEN_PERCENT."""
+    """Where a slot is decided: (open, close) in us from its start."""
     opens = max(settle_us, duration_us * OPEN_PERCENT // 100)
     closes = duration_us - max(guard_us, duration_us * BACKLIGHT_GUARD_PERCENT
                                // 100)
@@ -1627,11 +1395,8 @@ def exact_window(duration_us, settle_us, guard_us):
 
 
 def exact_index(settle_us, guard_us):
-    """The fastest rung an EXACT pair can start on: a window of at least
-    WINDOW_MIN_US, and no slot under SLOT_MIN_MS -- on it and on every
-    slower rung. Scanned slowest first and stopped at the first that fails,
-    so a margin that dipped and came back further down the ladder could
-    never pick a rung past the dip."""
+    """The fastest rung a pair can start on: a window of WINDOW_MIN_US and
+    no slot under SLOT_MIN_MS, on it and every slower rung."""
     best = 0
     for i, duration in enumerate(SLOT_LADDER):
         opens, closes = exact_window(duration * 1000, settle_us, guard_us)
@@ -1641,52 +1406,66 @@ def exact_index(settle_us, guard_us):
     return best
 
 
-# Where a pair starts: by the Follower's flags, EXACT or POLLED and LIT or
-# not. A POLLED pair keeps the rungs the read loop had before the ring:
-# 2.5 FINE_MS samples and three backlight settles.
-BACKLIGHT_INDEX = rung_for(FINE_MS, BACKLIGHT_SETTLE_MS)
-BACKLIGHT_LIT_INDEX = rung_for(FINE_MS, BACKLIGHT_LIT_SETTLE_MS)
-EXACT_INDEX = exact_index(SETTLE_DARK_US, GUARD_DARK_US)
+# Where a pair starts, by the light flag. Dark pairs stay on 16 ms until a
+# peer's light is measured: 10 ms holds on the measured sensor, not one 2x
+# slower.
+EXACT_DARK_START_MS = 16
+EXACT_INDEX = min(exact_index(SETTLE_DARK_US, GUARD_DARK_US),
+                  SLOT_LADDER.index(EXACT_DARK_START_MS))
 EXACT_LIT_INDEX = exact_index(SETTLE_LIT_US, GUARD_LIT_US)
-# Every rung faster than this is a gamble: a bad CRC there demotes.
-PROVEN_INDEX = SLOT_LADDER.index(BACKLIGHT_PROVEN_MS)
 
 
 class Transfer:
     """One transfer, Leader or Follower. `reader` is how this badge reads its
-    sensor -- a RingReader (EXACT) or a PolledReader (POLLED) -- started by
-    the caller; without one, a PolledReader the step() shim feeds."""
+    sensor -- a RingReader over the DMA ring -- started by the caller;
+    `fast` the fast block's module, which every transfer needs (a listener
+    that only decides slots, as Dev Mode's tests run one, can do
+    without)."""
 
-    def __init__(self, leader, payload=None, reader=None):
+    def __init__(self, leader, payload=None, reader=None, fast=None):
         self.leader = leader
         self.payload = payload
-        if reader is None:
-            # Imported here: protocol.py stays importable on its own.
-            from reader import PolledReader
-            reader = PolledReader()
-            reader.start()
+        self.fast = fast
+        self.fast_data = b""        # Leader: the payload's fast_stream()
+        self.fast_chunk = 0         # ... the first chunk not yet ACKed
+        self.fast_rung = 0          # ... the rung, an index into RUNGS
+        self.fast_top = 0           # ... the pair's start rung, its best
+        self.fast_acks = 0          # ... ACKs in a row on this rung
+        self.fast_up_after = FAST_UP_ACKS   # ... ACKs before stepping up
+        self.fast_trial = False     # ... on a rung just stepped up to
+        self.fast_block_len = 0     # ... the block on air's length
+        self.fast_bits = None       # Follower: the rung's bits, reading
+        self.fast_symbols = None    # the block being sent, encoded
+        self.fast_pending = False   # its burst follows the queue
+        self.fast_burst = None      # (start us, symbols, periods): shell
+        self.fast_start = self.fast_end = 0
+        self.fast_trainings = 0     # decoder trainings, for the simulator
+        self.fast_retunes = 0       # ... and retunes
+        self.fast_bins_fed = 0      # ... and bins fed to it
+        self.fast_chunks = {}       # Follower: chunk -> bytes received
+        self.fast_expect = 0        # Follower: when the burst is due, us
+        self.fast_b0 = None         # ... the time of its first bin
+        self.fast_have = 0          # ... bins pulled so far
+        self.fast_anchor = None
+        self.fast_nak_at = None
+        self.fast_fed = False       # ... the decoder fed: the burst is over
+        self.fast_periods = 0
+        self.decoder = None
+        self.fast_bins = None
+        if fast is not None and not leader:
+            self.decoder = fast.Decoder()
+            self.fast_bins = array("H", bytes(2 * FAST_BINS))
         self.reader = reader
-        self.exact = reader.exact
-        # Readings come one at a time and sparsely, through step(): the
-        # tests' shim, never the app. It changes two things, and only
-        # those: every fine sample is a whole coarse sample -- a reading
-        # a frame is one sample a frame, as the detectors were sized for --
-        # and an empty fine sample is no gap to drop a coarse sample over.
-        # test_calibration_exact.py checks both paths read a staircase alike.
-        self.sparse = False
-        # Fine samples pulled so far, and the coarse one being pooled:
-        # count, sum, and the sum of their times after `coarse_base`.
+        # Fine samples pulled so far, and the coarse one being pooled.
         self.fine_end = FINE_US
         self.one_v = [0]
         self.one_t = [0]
         self.fine_t = self.fine_v = 0
-        self.empty_run = 0
         self.coarse_n = self.coarse_sum = self.coarse_tsum = 0
         self.coarse_base = None
         self.coarse_t = self.coarse_v = 0
-        self.coarse_dropped = False
-        # The last FLICKER_BUFFER raw fine samples before the data phase, for
-        # the flicker's fit: time and span in us, value, time in ms. A ring.
+        # The last FLICKER_BUFFER raw fine samples before the data phase, a
+        # ring for the fit: time and span in us, value, time in ms.
         self.fit_t = [0] * FLICKER_BUFFER
         self.fit_v = [0] * FLICKER_BUFFER
         self.fit_s = [0] * FLICKER_BUFFER
@@ -1694,166 +1473,162 @@ class Transfer:
         self.fit_n = 0
         self.fit_result = None      # what fit() found, once it has run
         self.fit_tried = False
+        # Whether the fit ran -- the stall -- or only the steady check: the
+        # simulator's cost model.
+        self.fit_ran = False
+        self.fit_checked = False
+        self.fit_checks = 0         # steadiness checks made, retries too
         self.track_points = 0
-        self.quiet_at = None        # Follower: the Leader's last beacon crossing
-        self.field = LOW        # what the pre-data phases last decided
         self.flicker = FlickerFilter()
-        # Breaking in: the Follower's state while it holds high, the Leader's
-        # watch for one while it transmits, and the verdict a resend repeats.
-        self.breaking = False
-        self.break_since = 0
-        self.break_dark = 0
-        self.high_slots = 0
-        self.watched = 0
-        self.verdict_lit = 0
-        self.last_verdict = None
-        self.breaks = 0         # breaks made (Follower) or heard (Leader)
-        # The scheme the field is to be shown in: fields for the beacons,
-        # the backlight from this badge's staircase on.
-        self.scheme = SCHEME_FIELDS
-        # The flags the staircases carry: this badge's light and the peer's
-        # tier and light, read off its staircase; the pair's, which the
-        # Follower decides and the Leader adopts.
+        self.watched = 0        # Leader: the next lead-in slot to read
+        # The table the field is shown in: the beacons', then the data's.
+        self.scheme = SCHEME_BEACON
+        # This badge's light, and the pair's: the Follower's, adopted.
         self.lit = False
-        self.peer_exact = False
-        self.peer_lit = False
-        self.pair_exact = False
         self.pair_lit = False
+        # The Leader's fit found flicker: it holds its first block back.
+        self.pair_flicker = False
+        # A staircase entered, to be timed from the next pass: see enter().
+        self.cal_pending = False
+        self.pending_since = 0
+        self.start_grace = 0        # slots a Follower waits at first
         self.result = None
-        self.progress = ""
         self.detector = BeaconDetector()
-        self.clock = SlotClock(1000)
+        self.clock = SlotClock()
         self.levels = None
         self.started = 0
         self.phase_started = 0
-        self.blocks = []
         self.tx = []            # symbols still to transmit
         self.tx_slot = None     # the slot the first goes out on, once known
-        # When the slot whose decision queued them ended, in us: a time, not
-        # a slot number, so a demotion between cannot move it.
+        # When the slot whose decision queued them ended, in us: a time, so
+        # a demotion between cannot move it.
         self.tx_after_us = 0
         self.deciding = None    # the slot being decided, while it is
         self.deciding_end = 0   # ... and when it ends, in us
         self.rx = []            # symbols decided this phase
-        self.reader_cal = StaircaseReader()
-        self.pending_tokens = []
-        self.expected_crc = 0
-        self.saw_announce = False
+        self.reader_cal = StaircaseReader(LEADER_CAL_LIMIT if leader else None,
+                                          LEADER_CAL_SMOOTH if leader else 0)
+        # The last nine decided slots' values, a ring: begin_levels().
+        self.rx_values = [0] * 9
+        self.rx_n = 0
+        self.fit_due = None     # Follower: when its gap fit starts, us
+        self.cal_ended = 0      # Leader: where it found the closing gap, ms
+        self.tx_anchor = None   # Leader: hold slots its first block may trim
+        self.hold_until = 0     # Follower: no light for a lock before, us
+        self.cal_refusals = 0   # staircases the Leader refused
+        # Follower: after demoting on its own, measure the Leader's next
+        # message's rate; the crossing it locked on.
+        self.verify_rate = False
+        self.rate_from = None
+        self.rate_heals = 0
+        # Follower: until its first Begin, whether the Leader announces
+        # again (watch_for_announce()), and since when.
+        self.watch_announce = False
+        self.announce_since = None
+        self.announce_swing = None  # Follower: the Announce's, as detected
         self.finishing = False
         self.epoch = 0
         self.now = 0            # ms
+        self.pass_ms = 0        # ms: the time work() was called with
         self.now_us = 0
-        # Asked of the caller: a collection, at the top of its next pass and
+        # Asked of the caller: a collection at the top of its next pass,
         # never inside a call here.
         self.collect_due = False
-        self.collect_owed = False
-        self.cal_restarts = 0
         self.replayed = 0       # samples replay_staircase() re-fed
         self.idle_grace = 0
+        self.first_grace = 0    # Follower: slots more, until a Begin frames
         self.collected = False
         # What each work() did, for the simulator's cost model.
         self.work_slots = 0
         self.work_samples = 0
-        # The data phase's window, per rung: open and close in µs from a
-        # slot's start, how many parts, and buffers for them.
+        # The data phase's window, per rung, and buffers for its parts.
         self.w_open = self.w_close = self.w_parts = 0
-        self.valid_parts = 0
+        self.part_max = -1
         self.part_raw = [0] * PARTS_MAX
         self.part_time = [0] * PARTS_MAX
         self.part_sorted = [0] * PARTS_MAX
-        self.part_count = [0] * PARTS_MAX
         self.part_span = [0] * PARTS_MAX
+        self.part_amount = [0] * PARTS_MAX
         self.parts_now = 0
         self.thr = [0] * 128
+        self.thr_t = [0] * 128
         self.clear_data(0)
-        self.phase = PHASE_ANNOUNCE if leader else PHASE_PRESENT
-        # No bytes at all is still one block, an empty one: it is what tells
-        # the Follower the payload is a single empty field, and a Leader with
-        # no block to send would have nothing to wait for an answer to.
-        if leader:
-            self.blocks = split_blocks(build_tokens(*(payload or ()))) or [[]]
+        self.phase = PHASE_ANNOUNCE if leader else PHASE_LISTEN
 
     # -- helpers
 
     def enter(self, phase, now):
+        # A staircase starts on the first pass not catching up on the ring:
+        # every sample worked through holds the field, which once cost a
+        # Follower its whole high step. See CAL_CAUGHT_UP_US.
+        self.cal_pending = phase == PHASE_CAL_SEND
+        self.pending_since = self.pass_ms
         self.phase = phase
         self.phase_started = now
         self.rx = []
         self.tx = []
         self.detector.reset()
-        if phase == PHASE_CAL_RECV:
-            self.reader_cal = StaircaseReader()
-        # Points collected toward a flicker update belong to the phase they
-        # were read in: the peer may not be dark in the next.
+        # Flicker points belong to the phase they were read in.
         self.flicker.close(False)
         self.track_points = 0
 
     def fail(self, code):
+        if code == ERR_LOST_PEER and self.watch_announce and self.cal_refusals:
+            # Refused before, then neither a Begin nor the Announce: the
+            # Leader gave up on the contrast.
+            code = ERR_CONTRAST
         self.result = code
         self.phase = PHASE_DONE
 
     def elapsed(self, now):
         return time.ticks_diff(now, self.phase_started)
 
-    # The transfer got somewhere. Restarts the stall budget -- see work_data.
+    # The transfer got somewhere: restarts the stall budgets.
     def advance(self):
         self.stall_slots = 0
+        self.unframed = 0
+        self.dark_run = 0
 
     # Queue symbols. The first goes out on the slot after the one after the
-    # slot whose decision queued them -- one silent slot, as a reply has
-    # always had -- or later if this badge was held up meanwhile: fixed on
-    # the first field_at() after, so a collection between delays the message
-    # whole rather than eating its lead-in.
+    # slot whose decision queued them -- or later if this badge was held up:
+    # fixed on the next field_at(), so a collection delays the message whole.
     def send(self, symbols):
-        if self.collect_owed:
-            # A collection owed since the last accepted block: now, while
-            # this badge is about to transmit and need read nothing. The
-            # reply gap rule delays the message whole past it.
-            self.collect_owed = False
-            self.collect_due = True
         self.tx = list(symbols)
         self.tx_slot = None
         self.tx_after_us = self.deciding_end if self.deciding is not None \
             else self.now_us
         self.watched = self.clock.number(self.now_us)
-        self.high_slots = 0
         self.advance()          # having something to say is progress
 
     # -- the entry points
 
-    def step(self, now, light):
-        """For a caller with one reading at a time -- the tests: `light` read
-        at `now` ms. Returns the field to show."""
-        self.sparse = True
-        t = now * 1000
-        self.reader.add(t, light)
-        self.work(t)
-        return self.field_at(t)
-
     def field_at(self, t):
-        """The field to show at `t` µs: cheap, so the caller can change it
+        """The field to show at `t` us: cheap, so the caller can change it
         on time before doing any work."""
         phase = self.phase
         if phase == PHASE_DATA:
             return self.data_field(t)
         now = t // 1000
         if phase == PHASE_ANNOUNCE:
-            return beacon_field(self.elapsed(now), ANNOUNCE_HALF_MS, LOW)
-        if phase == PHASE_PRESENT:
-            if not self.saw_announce or self.quiet_at is not None:
-                return LOW
-            return beacon_field(self.elapsed(now), PRESENT_HALF_MS, LOW)
+            return beacon_field(self.elapsed(now), ANNOUNCE_FAST_HALF_MS)
         if phase == PHASE_CAL_SEND:
-            return staircase_field(self.elapsed(now), self.cal_order(),
-                                   self.cal_reps(), self.cal_open())
+            if self.cal_pending:
+                return LOW
+            return staircase_field(self.elapsed(now), STAIRCASE,
+                                   self.cal_reps(), CAL_OPEN_FAST_MS,
+                                   PLATEAU_FAST_MS)
         return LOW
 
     def due_us(self):
         """When the caller next has anything to do: a slot boundary while
         transmitting, else the next window or fine sample to complete."""
         if self.phase == PHASE_DATA:
-            if self.tx or self.breaking:
-                if self.tx and self.tx_slot is None:
+            if self.sub == self.STEP_FAST and not self.tx:
+                if self.fast_burst is not None:
+                    return self.fast_burst[0]
+                return self.fast_end + DUE_MARGIN_US
+            if self.tx:
+                if self.tx_slot is None:
                     return self.now_us
                 return self.clock.start_of(
                     self.clock.number(self.now_us) + 1)
@@ -1862,16 +1637,24 @@ class Transfer:
         return self.fine_end + DUE_MARGIN_US
 
     def work(self, t):
-        """Everything due by `t` µs: the fine samples complete before the
-        data phase, the slots complete after it, oldest first."""
+        """Everything due by `t` us: the fine samples before the data phase,
+        the slots after it, oldest first."""
         self.now_us = t
-        self.now = t // 1000
+        self.now = self.pass_ms = t // 1000
         self.work_slots = self.work_samples = 0
         if self.phase == PHASE_DONE:
             return
         if t > TRANSFER_MAX_US:
             self.fail(ERR_LOST_PEER)
             return
+        if self.cal_pending and (
+                time.ticks_diff(self.reader.newest_us(), self.fine_end)
+                < CAL_CAUGHT_UP_US
+                or time.ticks_diff(self.pass_ms, self.pending_since)
+                > CAL_PENDING_MAX_MS):
+            # Caught up, or never will be: CAL_PENDING_MAX_MS late at most.
+            self.cal_pending = False
+            self.phase_started = self.pass_ms
         if self.phase != PHASE_DATA:
             reader = self.reader
             newest = reader.newest_us()
@@ -1880,12 +1663,6 @@ class Transfer:
             while (self.fine_end <= newest and self.phase != PHASE_DATA
                    and self.phase != PHASE_DONE):
                 start = self.fine_end - FINE_US
-                # The flicker is taken at its readings' mean time -- a
-                # POLLED sample may hold readings from only part of its
-                # span -- and the coarse stream at the nominal centre:
-                # stamped by its readings, the staircase's coarse samples
-                # bunched after each blind stretch, and POLLED calibration
-                # failed more under heavy work [simulation, work3].
                 reader.parts(start, self.fine_end, 1, one, when)
                 self.fine_end += FINE_US
                 self.work_samples += 1
@@ -1896,61 +1673,41 @@ class Transfer:
             self.work_data(t)
 
     def take_fine(self, t_us, value, read_us=None):
-        """A fine sample: FINE_MS of readings centred on `t_us`, their mean,
-        or -1 if there were none; `read_us` the readings' mean time, for
-        the flicker (the centre if not given)."""
+        """A fine sample: the mean of FINE_MS of readings centred on `t_us`,
+        or -1 for none (an overrun), skipped; `read_us` the readings' mean
+        time, for the flicker."""
         if value < 0:
-            # Blind: a POLLED badge presenting, or a ring overrun. A Follower
-            # in the handshake drops the coarse sample it is pooling once
-            # that lasts HANDSHAKE_GAP_MS -- unless it already follows one.
-            self.empty_run += 1
-            if (self.phase == PHASE_PRESENT and not self.sparse
-                    and not self.coarse_dropped
-                    and self.empty_run * FINE_MS > HANDSHAKE_GAP_MS):
-                self.coarse_n = self.coarse_sum = self.coarse_tsum = 0
-                self.coarse_base = None
-                self.coarse_dropped = True
             return
-        self.empty_run = 0
         t = t_us // 1000
         self.now = t
         self.now_us = t_us
         self.fine_t = t
         self.fine_v = value
         self.filter_sample(t_us if read_us is None else read_us, FINE_US)
-        # Corrected, so calibration's samples are too, once the flicker has
-        # been fitted.
+        # Corrected, once the flicker is fitted.
         if self.pool_coarse(t, self.fine_v):
-            self.coarse_dropped = False
             self.decide(self.coarse_t, self.coarse_v)
 
     def decide(self, t, value):
         if self.phase == PHASE_ANNOUNCE:
-            self.field = self.step_announce(t, value)
-        elif self.phase == PHASE_PRESENT:
-            self.field = self.step_present(t, value)
+            self.step_announce(t, value)
+        elif self.phase == PHASE_LISTEN:
+            self.step_listen(t, value)
         elif self.phase == PHASE_CAL_SEND:
-            self.field = self.step_cal_send(t, value)
-        elif self.phase == PHASE_CAL_RECV:
-            self.field = self.step_cal_recv(t, value)
+            self.step_cal_send(t, value)
         elif self.phase == PHASE_CAL_GAP:
-            self.field = self.step_cal_gap(t, value)
-
-    def coarse_ms(self):
-        if self.phase in (PHASE_ANNOUNCE, PHASE_PRESENT):
-            return COARSE_MS
-        return CAL_SAMPLE_MS
+            self.step_cal_gap(t, value)
 
     def pool_coarse(self, t, value):
-        """Adds a fine sample to the coarse stream. Returns whether it
-        finished a sample, now in coarse_t/coarse_v."""
+        """Adds a fine sample to the coarse stream; True if that finished a
+        sample, now in coarse_t/coarse_v."""
         if self.coarse_base is None:
             self.coarse_base = t
         dt = time.ticks_diff(t, self.coarse_base)
         self.coarse_n += 1
         self.coarse_sum += value
         self.coarse_tsum += dt
-        if dt >= self.coarse_ms() or self.sparse:
+        if dt >= FINE_MS:
             n = self.coarse_n
             self.coarse_t = time.ticks_add(self.coarse_base,
                                            self.coarse_tsum // n)
@@ -1961,9 +1718,9 @@ class Transfer:
         return False
 
     def filter_sample(self, t_us, span_us):
-        """The flicker, for the fine sample just taken, a mean over `span_us`
-        centred on `t_us`: kept for the fit, and once the fit has a table,
-        corrected, and tracked while the peer is known dark."""
+        """The fine sample just taken, a mean over `span_us` at `t_us`: kept
+        for the fit and, once fitted, corrected -- and tracked while the
+        peer is known dark."""
         raw = self.fine_v
         flicker = self.flicker
         i = self.fit_n % FLICKER_BUFFER
@@ -1982,30 +1739,23 @@ class Transfer:
             self.fine_v = flicker.correct(t_us, raw, span_us)
 
     def peer_dark(self):
-        """Whether the peer is known to be dark before the data phase: it
-        is listening while this badge sends its staircase -- the Leader's
-        from its opening gap's end, by when the Follower has seen it and
-        gone dark -- and both are in the shared gap."""
-        if self.phase == PHASE_CAL_GAP:
-            return True
-        if self.phase != PHASE_CAL_SEND:
-            return False
-        return (not self.leader or
-                self.elapsed(self.now) >= CAL_OPEN_LEADER_MS)
+        """The peer is known dark before the data phase only for the Leader
+        in the shared gap; the Follower tracks in the data phase."""
+        return self.leader and self.phase == PHASE_CAL_GAP
 
-    def fit_flicker(self, window_ms=FLICKER_FIT_MS, end_us=None):
-        """Fits the flicker, once, from the `window_ms` of kept samples
-        ending at `end_us` (the newest, if None) -- taken while the peer was
-        dark. A window the fit refuses is tried again at half the length."""
+    def fit_flicker(self, window_ms, end_us=None):
+        """Fits the flicker, once, on the `window_ms` of kept samples ending
+        at `end_us` (the newest if None); a refused window is tried again
+        at half the length."""
         self.fit_tried = True
         self.fit_result = self.fit_window(window_ms, end_us)
         if self.fit_result is None:
             self.fit_result = self.fit_window(window_ms // 2, end_us)
         self.track_points = 0
 
-    def replay_staircase(self):
-        """A fresh staircase reader, fed the kept samples since this phase
-        began, corrected, through a fresh coarse stream."""
+    def replay_staircase(self, since):
+        """A fresh staircase reader fed the kept samples since `since` ms,
+        corrected, through a fresh coarse stream."""
         self.reader_cal = StaircaseReader()
         self.coarse_n = self.coarse_sum = self.coarse_tsum = 0
         self.coarse_base = None
@@ -2013,9 +1763,9 @@ class Transfer:
         first = self.fit_n - count
         for n in range(first, self.fit_n):
             i = n % FLICKER_BUFFER
-            if time.ticks_diff(self.fit_ms[i], self.phase_started) < 0:
+            if time.ticks_diff(self.fit_ms[i], since) < 0:
                 continue
-            self.replayed += 1          # its cost, for Dev Mode and the sim
+            self.replayed += 1          # its cost, for the simulator
             value = self.flicker.correct(self.fit_t[i], self.fit_v[i],
                                          self.fit_s[i])
             if self.pool_coarse(self.fit_ms[i], value):
@@ -2037,225 +1787,169 @@ class Transfer:
                 ts.append(self.fit_t[i])
                 vs.append(self.fit_v[i])
                 spans.append(self.fit_s[i])
+        return self.check_or_fit(ts, vs, spans)
+
+    def check_or_fit(self, ts, vs, spans):
+        """A window with no flicker the fit could keep is steady without the
+        fit's stall (130-153 ms on v2)."""
+        self.fit_checked = True
+        self.fit_checks += 1
+        if self.flicker.steady_window(ts, vs):
+            self.flicker.steady = True
+            return "steady"
+        self.fit_ran = True
         return self.flicker.fit(ts, vs, spans)
 
-    # -- phase: announce (Leader beacons, waits for Peer Present)
+    # -- phase: announce (Leader beacons, reads for the Follower's staircase)
 
     def step_announce(self, now, light):
-        self.progress = "Looking for a badge"
-        self.detector.push(now, light)
-        if self.detector.matches(PRESENT_HALF_MS):
-            # The Follower's beacon alternates black and high: its black is
-            # the room's light here, the only measure of it a Leader has
-            # before it must send its staircase.
-            self.lit = self.is_lit(self.detector.low())
-            self.enter(PHASE_CAL_SEND, now)
+        if self.reader_cal.feed(now, light):
+            # A closing gap: stop announcing and settle in it, whether or
+            # not it ended a staircase -- see settle_staircase().
+            self.cal_ended = self.reader_cal.ended_at
+            self.levels = None
             self.scheme = SCHEME_BACKLIGHT
-            return LOW
-        if time.ticks_diff(now, self.started) > ANNOUNCE_TIMEOUT_MS:
-            self.fail(ERR_NO_PEER)
-            return LOW
-        # Alternating black and high, the beacon the Follower is looking for.
-        # It was middle and high until the readers averaged thousands of
-        # readings a sample: then the measured middle's 0.6 of the swing, 48
-        # counts on the mirror, read at or under MIN_SWING.
-        return beacon_field(self.elapsed(now), ANNOUNCE_HALF_MS, LOW)
-
-    # -- phase: peer present (Follower beacons, waits for the staircase)
-
-    def step_present(self, now, light):
-        self.detector.push(now, light)
-        if time.ticks_diff(now, self.started) > ANNOUNCE_TIMEOUT_MS:
-            self.fail(ERR_NO_PEER)
-            return LOW
-
-        # Until the Leader has been seen, hold black. Only then beacon.
-        if not self.saw_announce:
-            self.progress = "Looking for a badge"
-            if self.detector.matches(ANNOUNCE_HALF_MS):
-                self.saw_announce = True
-                self.phase_started = now
-            return LOW
-
-        self.progress = "Found a badge"
-
-        # Quiet, not "the beacon disappeared": a staircase alternating every
-        # PLATEAU_MS looks like another beacon to a detector that only knows
-        # about periodic swings. The opening gap's black is longer than any
-        # beacon half period, so silence is the unambiguous cue.
-        quiet = self.detector.quiet_ms(now)
-        if quiet > ANNOUNCE_HALF_MS + 30:
-            # The Leader's last crossing: its fit window is timed from it.
-            self.quiet_at = time.ticks_add(now, -quiet)
-            self.enter(PHASE_CAL_RECV, now)
-            return LOW
-        return beacon_field(self.elapsed(now), PRESENT_HALF_MS, LOW)
-
-    # -- phase: transmit the calibration staircase
-
-    def cal_order(self):
-        """The tier flag: this badge's own on the Leader, the pair's on the
-        Follower."""
-        exact = self.pair_exact if not self.leader else self.exact
-        return REVERSED if exact else ASCENDING
-
-    def cal_reps(self):
-        """The light flag, likewise."""
-        lit = self.pair_lit if not self.leader else self.lit
-        return CAL_REPS_LIT if lit else CAL_REPS
-
-    def cal_open(self):
-        return CAL_OPEN_LEADER_MS if self.leader else CAL_OPEN_MS
-
-    def step_cal_send(self, now, light):     # noqa: ARG002 - every step_* takes (now, light)
-        self.progress = "Calibrating"
-        reps = self.cal_reps()
-        opens = self.cal_open()
-        length = staircase_ms(reps, opens)
-        body_end = opens + reps * 3 * PLATEAU_MS
-        elapsed = self.elapsed(now)
-        if elapsed >= body_end:
-            if self.leader and not self.fit_tried:
-                # The closing gap: this badge holds LOW, and the Follower
-                # has been dark through the body's end.
-                self.fit_flicker(FLICKER_FIT_MS)
-            if not self.leader and not self.collected:
-                self.collected = True
-                self.collect_due = True
-        if elapsed >= length:
-            if self.leader:
-                self.enter(PHASE_CAL_RECV, now)
-                return LOW
-            # The Follower transmitted second, so it knows exactly when the
-            # body ended. That instant is the shared reference.
-            self.epoch = time.ticks_add(self.phase_started, length)
+            self.epoch = time.ticks_add(self.cal_ended, CAL_GAP_FAST_MS)
             self.enter(PHASE_CAL_GAP, now)
             return LOW
-        return staircase_field(elapsed, self.cal_order(), reps, opens)
-
-    # -- phase: measure the peer's staircase
-
-    def step_cal_recv(self, now, light):
-        self.progress = "Calibrating"
-        elapsed = self.elapsed(now)
-        if (not self.leader and self.exact and not self.fit_tried
-                and self.quiet_at is not None
-                and time.ticks_diff(now, self.quiet_at)
-                >= FLICKER_FOLLOWER_FIT_START_MS + FLICKER_FOLLOWER_FIT_MS):
-            # Inside the Leader's dark: see FLICKER_FOLLOWER_FIT_START_MS.
-            self.fit_flicker(FLICKER_FOLLOWER_FIT_MS)
-            if self.flicker.harmonics is not None:
-                # What has been read of the staircase so far was not
-                # corrected: read it again, from the kept samples, as if the
-                # flicker had been known from the start.
-                self.replay_staircase()
-                return LOW
-        ended = self.reader_cal.feed(now, light)
-        if (not self.leader and not self.fit_tried
-                and self.quiet_at is not None
-                and (ended or time.ticks_diff(now, self.quiet_at)
-                     >= FLICKER_FOLLOWER_LATE_FIT_MS)):
-            # A POLLED Follower: the fit it put off, on the same window,
-            # once the staircase has ended -- or must have, for a reader
-            # flicker keeps from finding its closing gap -- so its stall
-            # lands in the Leader's closing gap.
-            end_ms = time.ticks_add(self.quiet_at,
-                                    FLICKER_FOLLOWER_FIT_START_MS
-                                    + FLICKER_FOLLOWER_FIT_MS)
-            self.fit_flicker(FLICKER_FOLLOWER_FIT_MS, end_ms * 1000)
-            if self.flicker.harmonics is not None:
-                self.replay_staircase()
-            # Decided on the next call, after the fit's stall: this badge's
-            # staircase is timed from when it begins, and one begun before a
-            # stall loses its opening to it.
+        if time.ticks_diff(now, self.started) > ANNOUNCE_TIMEOUT_MS:
+            self.fail(ERR_NO_PEER)
             return LOW
-        if ended:
-            levels = self.reader_cal.levels()
-            if levels is None:
-                if self.cal_restarts < CAL_RESTARTS:
-                    # What ended was not the peer's staircase: in bright
-                    # flickering light the Follower can take the end of the
-                    # Leader's beacon for quiet, and the beacon's last half
-                    # and the opening gap for a body and its closing gap.
-                    # The real staircase is still to come; read afresh, and
-                    # leave ERR_CONTRAST to the phase's own deadline.
-                    self.cal_restarts += 1
-                    self.reader_cal = StaircaseReader()
-                    return LOW
+        return beacon_field(self.elapsed(now), ANNOUNCE_FAST_HALF_MS)
+
+    def settle_staircase(self, now):
+        """Leader, LEADER_SETTLE_MS into the closing gap: the flicker fitted
+        on the gap, then the staircase read again, corrected, from the kept
+        samples. Its levels are this badge's thresholds, its repetitions the
+        pair's light, the fit the hold. No levels: it announces again."""
+        ended = self.cal_ended
+        reader = self.reader_cal
+        levels = reader.levels()
+        self.fit_flicker(LEADER_SETTLE_MS - LEADER_FIT_SKIP_MS,
+                         time.ticks_add(ended, LEADER_SETTLE_MS) * 1000)
+        if self.flicker.harmonics is not None:
+            self.replay_staircase(time.ticks_add(
+                ended, -(staircase_ms(CAL_REPS_FAST, CAL_OPEN_FAST_MS,
+                                      PLATEAU_FAST_MS, 0)
+                         + PLATEAU_FAST_MS)))
+            reader = self.reader_cal
+            if reader.ended_at is None:
+                reader.ended_at = ended
+            corrected = reader.levels()
+            if corrected is not None:
+                levels = corrected
+        if levels is None:
+            self.cal_refusals += 1
+            if self.cal_refusals > CAL_RESTARTS:
                 self.fail(ERR_CONTRAST)
-                return LOW
-            self.levels = levels
-            rising, falling, highs = staircase_steps(self.reader_cal.values,
-                                                     levels)
-            exact = falling > rising
-            lit = highs <= LIT_STEPS_MAX
-            if self.leader:
-                # The Follower decided the pair: adopt it as read.
-                self.pair_exact = exact
-                self.pair_lit = lit
-                # The Follower's closing gap is the reference; the clock
-                # starts one gap after it began.
-                self.epoch = time.ticks_add(self.reader_cal.ended_at,
-                                            CAL_GAP_MS)
-                self.collect_due = True
-                self.enter(PHASE_CAL_GAP, now)
-                return LOW
-            self.peer_exact = exact
-            self.peer_lit = lit
-            # This badge's own light, from the black of the staircase it
-            # just measured, fixed before its own staircase carries it.
-            self.lit = self.is_lit(levels.black)
-            self.pair_exact = self.exact and exact
-            self.pair_lit = self.lit and lit
-            self.scheme = SCHEME_BACKLIGHT
-            self.enter(PHASE_CAL_SEND, now)
+                return
+            self.flicker = FlickerFilter()
+            self.fit_tried = False
+            self.reader_cal = StaircaseReader(LEADER_CAL_LIMIT,
+                                              LEADER_CAL_SMOOTH)
+            self.scheme = SCHEME_BEACON
+            self.enter(PHASE_ANNOUNCE, now)
+            return
+        # The pair's light as the Follower decided it.
+        self.pair_lit = staircase_highs(reader.values, levels) \
+            <= LIT_STEPS_MAX_FAST
+        self.levels = levels
+        self.lit = self.is_lit(levels.black)
+        self.pair_flicker = self.flicker.harmonics is not None
+        self.collect_due = True
+
+    # -- phase: listen (Follower holds black until it sees the Announce)
+
+    def step_listen(self, now, light):
+        self.detector.push(now, light)
+        if time.ticks_diff(now, self.started) > ANNOUNCE_TIMEOUT_MS:
+            self.fail(ERR_NO_PEER)
             return LOW
-        if elapsed > staircase_ms(CAL_REPS, CAL_OPEN_LEADER_MS) * 3:
-            self.fail(ERR_CONTRAST)
+        if not self.detector.matches(ANNOUNCE_FAST_HALF_MS):
+            return LOW
+        # The Announce's dark halves are this badge's light, which its
+        # staircase carries; its full is the Leader's high; the middle a
+        # guess until the first Begin trains it.
+        black = self.detector.low()
+        white = self.detector.high()
+        self.announce_swing = white - black
+        self.lit = self.is_lit(black)
+        self.pair_lit = self.lit
+        levels = Levels()
+        levels.fit(black, black + (white - black)
+                   * PROVISIONAL_GREY_PERCENT // 100, white)
+        levels.last = LOW
+        self.levels = levels
+        self.scheme = SCHEME_BACKLIGHT
+        self.enter(PHASE_CAL_SEND, now)
         return LOW
+
+    # -- phase: the Follower's staircase
+
+    def cal_reps(self):
+        """The light flag: the pair's, which the Follower decides."""
+        return CAL_REPS_FAST_LIT if self.pair_lit else CAL_REPS_FAST
+
+    def hold_slots(self):
+        """Slots a Leader holds its first block back in flicker."""
+        d = self.clock.duration
+        return ((CAL_GAP_FAST_FLICKER_MS - CAL_GAP_FAST_MS) * 1000
+                + d - 1) // d
+
+    def step_cal_send(self, now, light):     # noqa: ARG002 - every step_* takes (now, light)
+        if self.cal_pending:
+            return LOW              # not begun: see enter()
+        reps = self.cal_reps()
+        length = staircase_ms(reps, CAL_OPEN_FAST_MS, PLATEAU_FAST_MS,
+                              CAL_GAP_FAST_MS)
+        body_end = CAL_OPEN_FAST_MS + reps * 3 * PLATEAU_FAST_MS
+        elapsed = self.elapsed(now)
+        if elapsed >= body_end and not self.collected:
+            self.collected = True
+            self.collect_due = True
+        if elapsed >= length:
+            # The Follower sent it, so it knows when its closing gap began:
+            # the shared reference.
+            self.epoch = time.ticks_add(self.phase_started, length)
+            gap = time.ticks_add(self.epoch, -CAL_GAP_FAST_MS)
+            self.fit_due = (gap + FOLLOWER_FIT_START_MS) * 1000
+            self.enter(PHASE_CAL_GAP, now)
+            return LOW
+        return staircase_field(elapsed, STAIRCASE, reps,
+                               CAL_OPEN_FAST_MS, PLATEAU_FAST_MS)
 
     # -- phase: wait out the shared gap, then start the slot clock
 
     def step_cal_gap(self, now, light):     # noqa: ARG002 - every step_* takes (now, light)
-        self.progress = "Syncing"
+        if self.leader and self.levels is None:
+            if time.ticks_diff(now, self.cal_ended) < LEADER_SETTLE_MS:
+                return LOW
+            self.settle_staircase(now)
+            if self.phase != PHASE_CAL_GAP:
+                return LOW
         if time.ticks_diff(self.epoch, now) > 0:
             return LOW
         self.start_data(self.epoch, self.start_index())
         return LOW
 
     def is_lit(self, black):
-        """Whether a badge reading `black` is in a lit room."""
         return black is not None and black >= LIT_BLACK_COUNTS
 
     def start_index(self):
-        """The rung both badges start on, from the pair's flags: the
-        Follower's, which the Leader adopted, so they agree."""
-        if self.pair_exact:
-            index = EXACT_LIT_INDEX if self.pair_lit else EXACT_INDEX
-        else:
-            index = BACKLIGHT_LIT_INDEX if self.pair_lit else BACKLIGHT_INDEX
-        return min(len(SLOT_LADDER) - 1, index + OPTIMISTIC_RUNGS)
-
-    def conservative_index(self):
-        """The proven rung: CRC failures on a faster one demote."""
-        return PROVEN_INDEX
-
-    # There is no rate-proving phase: both badges start on the rung their
-    # staircases agreed, and a test burst cannot be trusted anyway -- a rate
-    # too fast for a payload still carries 48 symbols of alternation. The
-    # first block is the test. A Follower that cannot frame one sends the
-    # Data Sync Error Pattern and steps down; the Leader follows. Both change
-    # slot duration and leave the shared epoch alone, so the grids stay
-    # aligned.
+        """The rung both start on, from the pair's light flag."""
+        return EXACT_LIT_INDEX if self.pair_lit else EXACT_INDEX
 
     # -- phase: data
-    # Half duplex. Exactly one badge transmits at a time and the other holds
-    # black, which also gives the transmitter a continuous black reference.
+    # Half duplex: one badge transmits and the other holds black. No rate
+    # test: the first block is the test, and a Follower that cannot frame it
+    # asks to step down. A demotion changes the slot, never the epoch, so
+    # the grids stay aligned.
 
-    STEP_BLOCK = 0      # Leader sends a block / Follower collects one
-    STEP_CRC = 1        # Follower sends 16 raw CRC bits / Leader listens
-    STEP_VERDICT = 2    # Leader sends CRC Good or Bad / Follower listens
+    STEP_BLOCK = 0      # Leader sends a block's lead-in / Follower waits for one
     STEP_FINISH = 3     # Complete sent, and being acknowledged
+    STEP_FAST = 4       # Leader: its burst on air
+    STEP_FAST_REPLY = 5     # Leader: waiting for the ACK or NAK
+    STEP_FAST_RX = 6    # Follower: decoding a burst
 
     def start_data(self, now, index=None):
         """The data phase, from `now` ms -- the epoch -- on rung `index`."""
@@ -2266,86 +1960,99 @@ class Transfer:
         self.clear_data(now)
         self.next = 0
         self.lit_end = self.clock.epoch
-        self.progress = "Sending" if self.leader else "Receiving"
+        hold = self.hold_slots()
         if self.leader:
-            self.send_block()
+            # In flicker the first block holds back, black, as if the gap
+            # were CAL_GAP_FAST_FLICKER_MS; the epoch stays.
+            held = hold if self.pair_flicker else 0
+            self.fast_data = fast_stream(list(self.payload or ()))
+            self.fast_chunk = 0
+            self.fast_rung = FAST_START_LIT if self.pair_lit \
+                else FAST_START_DARK
+            self.fast_top = self.fast_rung
+            self.send_block(held)
+            # A Leader late to the data phase -- its fit's stall -- trims
+            # what is left of the hold.
+            self.tx_anchor = held
+        else:
+            if not self.reader.check():
+                self.fail(ERR_RING)
+                return
+            # Whatever the flag: a Follower always waits out a Leader that
+            # holds back, and its collection.
+            grace = hold + (FAST_START_GRACE_MS * 1000
+                            + self.clock.duration - 1) // self.clock.duration
+            self.idle_grace = self.start_grace = grace
+            self.stall_slots = -grace
+            self.watch_announce = self.announce_swing is not None
 
-    # The data phase's state, as it starts.
     def clear_data(self, now):
-        self.block_index = self.retries = self.blocks_accepted = 0
+        self.retries = self.blocks_accepted = 0
         self.idle_slots = self.complete_tries = self.wait_slots = 0
+        self.finish_slots = 0
         self.stall_slots = self.attempts = self.resend_requests = 0
+        self.unframed = 0
+        self.dark_run = 0
         self.sub = self.STEP_BLOCK
-        self.received = []
-        # A framed block awaiting its verdict. Not `pending_tokens`, which is
-        # empty for an empty block as well as for no block at all.
-        self.pending_block = False
-        self.crc_started = self.pending_slow_down = self.want_resend = False
+        self.received = None        # Follower: the payload's fields, once whole
+        self.pending_slow_down = self.want_resend = False
         self.block_started = now
-        # The next slot to decide, and the end of the peer's -- or this
-        # badge's own -- last light, from which silence is counted.
+        # The next slot to decide, and the end of the last light, from which
+        # silence is counted.
         self.next = 0
         self.lit_end = 0
         self.reset_block()
 
     def send_block(self, extra_lead_in=0):
-        # Sending it again cannot be the answer for ever.
+        """Leader: the lead-in -- black, so a rate change has landed on both
+        -- FAST_BEGIN, the rung and FAST_GAP_SLOTS of low at the slot rung;
+        the burst from the next boundary (fast_burst, for the shell); then
+        the Follower's ACK or NAK. Ends the transfer once the block's
+        attempts are spent, or the ring has failed."""
         if self.attempts >= MAX_BLOCK_ATTEMPTS:
             self.fail(ERR_CRC)
             return
         if not self.reader.check():
-            # The ring has failed: the ADC is no longer on the sensor, or
-            # the DMA stopped.
-            self.fail(ERR_LOST_PEER)
+            self.fail(ERR_RING)
             return
-        # Built here, not per slot: the text only changes once a block.
         self.attempts += 1
-        self.progress = "Sending %d/%d" % (self.block_index + 1, len(self.blocks))
-        tokens = self.blocks[self.block_index]
         self.sub = self.STEP_BLOCK
-        # Black before the Begin Block Pattern: after a rate change the two
-        # badges do not switch on the same slot, and without it the pattern goes
-        # out while the peer is still sampling at the old rate.
-        # Resent after a Data Sync Error, the Leader says its last verdict
-        # again first: the error may have been a Follower that missed it,
-        # holding a block it cannot tell accepted from rejected. One that
-        # holds none ignores it.
-        verdict = []
-        if extra_lead_in and self.last_verdict:
-            verdict = list(self.last_verdict) + [LOW] * RESYNC_LEAD_IN
-        self.send([LOW] * (RESYNC_LEAD_IN + extra_lead_in) + verdict
-                  + list(BEGIN_BLOCK) + block_symbols(tokens) + list(END_BLOCK))
-        self.expected_crc = block_crc(tokens)
+        fast = self.fast
+        periods = fast.RUNGS[self.fast_rung]
+        data = fast_block(fast, self.fast_data, self.fast_chunk, periods)
+        self.fast_block_len = len(data)
+        self.fast_symbols = fast.encode(self.fast_chunk, data)
+        self.fast_periods = periods
+        self.send([LOW] * (RESYNC_LEAD_IN + extra_lead_in) + list(FAST_BEGIN)
+                  + bits_symbols(self.fast_rung, FAST_RUNG_BITS)
+                  + [LOW] * FAST_GAP_SLOTS)
+        self.fast_pending = True
+
+    def burst_us(self):
+        """The burst's length on air, in us."""
+        return len(self.fast_symbols) * self.fast_periods \
+            * self.fast.COMMON_NS // 1000
+
+    def burst_started(self, t_us):
+        """The shell started the burst at `t_us`: on air until it ends,
+        then listening for the reply."""
+        self.fast_burst = None
+        self.fast_start = t_us
+        self.fast_end = t_us + self.burst_us()
 
     # -- the window
 
     def set_window(self):
-        """Where a slot is decided on this rung, by this badge's reader and
-        light; and the flicker table for its parts, built now rather than
-        on the first slot."""
+        """Where a slot is decided on this rung, by this badge's light, and
+        its flicker table built now rather than on the first slot."""
         d = self.clock.duration
-        if self.exact:
-            settle = SETTLE_LIT_US if self.lit else SETTLE_DARK_US
-            guard = GUARD_LIT_US if self.lit else GUARD_DARK_US
-            self.w_open, self.w_close = exact_window(d, settle, guard)
-            # A rung too fast for this badge's settle -- one it can only be
-            # on by a misread flag, or a demotion still to come -- keeps a
-            # quarter of a slot to read, settled or not: a badge that cannot
-            # decide at all cannot ask to slow down either.
-            if self.w_close - self.w_open < WINDOW_MIN_US // 2:
-                self.w_open = self.w_close - d // 4
-        else:
-            # The read loop's rule, which the POLLED rungs were found with.
-            tx = BACKLIGHT_TX_MS * 1000
-            guard = min(tx * END_GUARD_PERCENT // 100, d // 2 - tx * 6 // 5)
-            guard = max(guard, d * BACKLIGHT_GUARD_PERCENT // 100)
-            self.w_open = d // 2
-            self.w_close = d - max(0, guard)
-            # How far a lock may interpolate across a blind gap, for this
-            # rung and this loop's own read rate: see reader.gap_for().
-            set_slot = getattr(self.reader, "set_slot", None)
-            if set_slot is not None:
-                set_slot(d)
+        settle = SETTLE_LIT_US if self.lit else SETTLE_DARK_US
+        guard = GUARD_LIT_US if self.lit else GUARD_DARK_US
+        self.w_open, self.w_close = exact_window(d, settle, guard)
+        # A rung too fast for this badge's settle keeps a quarter of a slot
+        # to read: a badge that cannot decide cannot ask to slow down.
+        if self.w_close - self.w_open < WINDOW_MIN_US // 2:
+            self.w_open = self.w_close - d // 4
         window = self.w_close - self.w_open
         n = (window + PART_MAX_US - 1) // PART_MAX_US
         self.w_parts = max(PARTS_MIN, min(PARTS_MAX, n))
@@ -2362,92 +2069,46 @@ class Transfer:
         span = (self.w_close - self.w_open) // n
         raw = self.part_raw
         times = self.part_time
-        reader = self.reader
         spans = self.part_span
-        if reader.exact:
-            reader.parts(opens, opens + span * n, n, raw, times)
-            for j in range(n):
-                spans[j] = span
-        else:
-            counts = self.part_count
-            reader.parts(opens, opens + span * n, n, raw, times, counts)
-            n = self.merge_parts(n, span)
+        self.reader.parts(opens, opens + span * n, n, raw, times)
+        for j in range(n):
+            spans[j] = span
         self.parts_now = n
-        flicker = self.flicker
+        # Equal spans, ascending centres: one table and shift a window.
+        amount = self.part_amount
+        self.flicker.amounts(times, n, span, amount)
         ordered = self.part_sorted
         count = 0
         for j in range(n):
             v = raw[j]
             if v < 0:
                 continue
-            v = flicker.correct(times[j], v, spans[j])
+            v -= amount[j]
+            if v < 0:
+                v = 0
             _insert_sorted(ordered, count, v)
             count += 1
-        self.valid_parts = count
+        # The brightest part: a fast burst's short symbols can give a dark
+        # median with lit parts in it.
+        self.part_max = ordered[count - 1] if count else -1
         if count:
             half = count // 2
             if count & 1:
                 return ordered[half]
-            # An even count's median is the mean of the middle two: the
-            # upper one alone biased every two-part POLLED window up, and a
-            # dark slot after a lit one read inside the hysteresis band.
+            # The mean of the middle two: the upper alone put a dark slot
+            # after a lit one inside the hysteresis band.
             return (ordered[half - 1] + ordered[half]) // 2
         whole = self.reader.mean(start, start + self.clock.duration)
         if whole < 0:
             return -1
-        return flicker.correct(start + self.clock.duration // 2, whole,
-                               self.clock.duration)
-
-    def merge_parts(self, n, span):
-        """A POLLED window's parts, merged in order until each holds
-        POLL_PART_READINGS readings, in place: how many are left. A polled
-        part holds whatever the loop read in it -- one reading or none when
-        reads are slow -- and a median of single readings is a median of
-        noise. The last, short, is folded into the one before it. Each
-        merged part is corrected at its readings' mean time, over the span
-        it now covers (part_span): the flicker a longer mean keeps is
-        smaller, and corrected at the nominal span a 6 ms part had 2.5
-        times too much taken off."""
-        raw = self.part_raw
-        times = self.part_time
-        counts = self.part_count
-        spans = self.part_span
-        m = 0
-        acc_s = acc_c = acc_t = acc_n = 0
-        for j in range(n):
-            c = counts[j]
-            acc_n += 1
-            if c:
-                acc_s += raw[j] * c
-                acc_t += times[j] * c
-                acc_c += c
-            if acc_c >= POLL_PART_READINGS:
-                raw[m] = acc_s // acc_c
-                times[m] = acc_t // acc_c
-                counts[m] = acc_c
-                spans[m] = acc_n * span
-                m += 1
-                acc_s = acc_c = acc_t = acc_n = 0
-        if acc_c:
-            if m:
-                c = counts[m - 1]
-                total = c + acc_c
-                raw[m - 1] = (raw[m - 1] * c + acc_s) // total
-                times[m - 1] = (times[m - 1] * c + acc_t) // total
-                counts[m - 1] = total
-                spans[m - 1] += acc_n * span
-            else:
-                raw[0] = acc_s // acc_c
-                times[0] = acc_t // acc_c
-                counts[0] = acc_c
-                spans[0] = acc_n * span
-                m = 1
-        return m
+        whole = self.flicker.correct(start + self.clock.duration // 2, whole,
+                                     self.clock.duration)
+        self.part_max = whole
+        return whole
 
     def learn(self, _k, dark):
-        """The flicker learns from a slot decided dark: each part of its
-        window, as the read loop learnt from its back half's samples. The
-        parts are the ones window_value() just read for slot `_k`."""
+        """The flicker learns from a slot decided dark: each part
+        window_value() just read for slot `_k`."""
         flicker = self.flicker
         if dark:
             n = self.parts_now
@@ -2460,43 +2121,30 @@ class Transfer:
         flicker.close(dark)
 
     # -- phase locking
-    # The badge that DETECTS the shared instant reads it late, so a receiver
-    # re-bases its grid onto the peer's real first edge out of black at the
-    # start of every message. rebase() touches epoch and never duration;
-    # slow_down() touches duration and never epoch.
+    # The badge that detects the shared instant reads it late, so a receiver
+    # re-bases its grid on the peer's first edge out of black at the start
+    # of every message: rebase() moves the epoch, never the duration;
+    # slow_down() the reverse.
 
-    # Only while ACQUIRING -- waiting for a message to begin, never part way
-    # through one. Re-basing mid-message would re-frame the rest of a pattern
-    # against a grid the first half was not decoded on.
+    # Only between messages: re-basing mid-pattern would re-frame its rest.
     def can_phase_lock(self):
-        # STEP_FINISH is an acquiring state on both sides -- one is waiting for
-        # an acknowledgement, the other for a repeat of Complete -- so the same
-        # rule applies: re-base between messages, never inside one.
         if self.sub == self.STEP_FINISH:
             return True
         if self.leader:
-            return self.sub == self.STEP_CRC and not self.crc_started
-        # STEP_VERDICT counts: having sent its CRC the Follower is between
-        # messages exactly as it is in STEP_BLOCK. Without it the grid locked at
-        # the start of a block had to survive the whole block -- 500+ slots --
-        # before the verdict arrived on it.
-        return ((self.sub == self.STEP_BLOCK and not self.in_block)
-                or self.sub == self.STEP_VERDICT)
+            return self.sub == self.STEP_FAST_REPLY
+        return self.sub == self.STEP_BLOCK and not self.in_block
 
-    # How much black must precede an edge before it is taken for the start of a
-    # transmission rather than a symbol inside one. No gap within a pattern is
-    # that long. Not every message clears it: a block has its lead-in, but the
-    # CRC reply and the Complete Ack follow with at most the one slot the peer
-    # spent deciding, so they are read on the grid as it stands. Deliberately:
-    # see "The Leader's grid is the reference" in the spec.
+    # Black before an edge for it to start a transmission: no gap inside a
+    # pattern is this long. The Complete Ack follows with one slot, so is
+    # read on the grid as it stands (spec: "The Leader's grid is the
+    # reference").
     def silence_us(self):
         return (self.clock.duration * 3) // 2
 
     def try_lock(self, k):
-        """Slot `k` was decided lit while acquiring. If the readings rose
-        out of at least silence_us() of dark inside it -- found in the ring
-        -- re-base on that edge and return True: `k` is then decided again on
-        the new grid."""
+        """Slot `k` was decided lit while acquiring. If the readings rose out
+        of silence_us() of dark inside it, re-base on that edge and return
+        True: `k` is then decided again on the new grid."""
         clock = self.clock
         d = clock.duration
         close = clock.start_of(k) + self.w_close
@@ -2512,38 +2160,50 @@ class Transfer:
             n = len(self.thr)
         t_low = self.levels.t_low
         flicker = self.flicker
-        if flicker.active_now():
-            for i in range(n):
-                self.thr[i] = t_low + flicker.amount(start + i * step + step // 2,
-                                                     100)
-        else:
-            for i in range(n):
-                self.thr[i] = t_low
-        crossing = reader.rise(start, close, self.thr, n, step)
-        # Silence is counted to the start of the slot the crossing is in,
-        # not to the crossing: a reply comes one silent slot after this
-        # badge stops, and a slow sensor -- a dark room, a rise to the middle
-        # -- crosses T_low well into it. Counted to the crossing, that
-        # reply's silence passed 1.5 slots and the Leader locked on it, late
-        # by the sensor's delay; in simulation, with a sensor three to four
-        # times slower than measured, it then read a CRC bit as the Data Sync
-        # Error and demoted alone.
+        crossing = reader.rise(start, close, self.thresholds(start, n, step),
+                               n, step)
+        # A real edge stays lit (LOCK_HOLD_US); past one that does not, the
+        # search goes on from the next step, the thresholds moved down.
+        while crossing >= 0:
+            hold = min(LOCK_HOLD_US, close - crossing)
+            if hold < LOCK_HOLD_US // 2:
+                break
+            level = reader.mean(crossing + LOCK_SKIP_US, crossing + hold) \
+                - flicker.amount(crossing + hold // 2, hold)
+            if level >= t_low:
+                break
+            skip = (crossing - start) // step + 1
+            if skip < 1:
+                skip = 1        # rise() interpolates into the bin before
+            if skip >= n:
+                crossing = -1
+                break
+            thr = self.thr
+            for i in range(n - skip):
+                thr[i] = thr[i + skip]
+            start += skip * step
+            n -= skip
+            crossing = reader.rise(start, close, thr, n, step)
+        # Silence to the start of the crossing's slot, not the crossing: a
+        # slow sensor crosses well into a reply's first slot, and a lock on
+        # it was late by the sensor's delay.
         if crossing < 0 or clock.start_of(clock.number(crossing)) \
                 - self.lit_end < silence:
             return False
-        lag = EDGE_LAG_LIT_US if self.lit else EDGE_LAG_DARK_US
+        lag = EDGE_LAG_EXACT_LIT_US if self.lit else EDGE_LAG_EXACT_DARK_US
         self.rebase(crossing - lag, crossing)
         return True
 
     def rebase(self, boundary, crossing):
         """Re-frames the grid on `boundary`. The slot in progress is not
-        decided on the old grid: its samples belong to the silence, and
-        deciding it would push a spurious symbol into a pattern match that
-        may be part way through. The crossing is consumed, so the slot it
-        starts cannot lock again: one re-base per message."""
+        decided on the old grid; the crossing is consumed, so one re-base a
+        message."""
         self.clock.epoch = boundary
         self.next = self.clock.number(boundary)
         self.lit_end = crossing
+        if self.verify_rate and not self.leader:
+            self.verify_rate = False
+            self.rate_from = crossing
 
     def decided_end(self):
         """The end of the slot being decided, or now if none is."""
@@ -2552,8 +2212,8 @@ class Transfer:
         return self.deciding_end
 
     def demote(self, t_ref):
-        """One rung slower, effective at `t_ref` µs: the slot straddling it
-        is not decided."""
+        """One rung slower from `t_ref` us: the slot straddling it is not
+        decided."""
         self.clock.slow_down()
         self.set_window()
         self.next = self.clock.number(t_ref) + 1
@@ -2561,28 +2221,35 @@ class Transfer:
     # -- the data phase's pass
 
     def data_field(self, t):
-        """The field for slot number(t): this badge's queue, high while it
-        breaks in, black otherwise. Ends the queue once its last slot is
-        over."""
-        if self.breaking:
-            return HIGH
+        """The field for slot number(t): this badge's queue, black
+        otherwise. Ends the queue once its last slot is over."""
         tx = self.tx
         if not tx:
             return LOW
         clock = self.clock
         n = clock.number(t)
         if self.tx_slot is None:
-            # After the slot after the one decided: number(end) is the slot
-            # that starts as the decided one ends.
+            # After the slot after the one decided.
             self.tx_slot = max(clock.number(self.tx_after_us) + 1, n + 1)
+            if self.tx_anchor is not None:
+                trim = min(self.tx_slot - 1, self.tx_anchor)
+                if trim > 0:
+                    del tx[:trim]
+                self.tx_anchor = None
+            if self.fast_pending:
+                # The burst plays from the boundary after the queue.
+                self.fast_burst = (clock.start_of(self.tx_slot + len(tx)),
+                                   self.fast_symbols, self.fast_periods)
         index = n - self.tx_slot
         if index < 0:
             return LOW              # holding black until the boundary
         if index >= len(tx):
             end = self.tx_slot + len(tx)
             self.tx = []
-            # Silence counts from the end of this badge's own transmission,
-            # and the first slot after it is the first decided.
+            if self.fast_pending:
+                self.fast_pending = False
+                self.sub = self.STEP_FAST
+            # Silence counts from the end of this badge's own transmission.
             self.lit_end = clock.start_of(end)
             if self.next < end:
                 self.next = end
@@ -2590,47 +2257,61 @@ class Transfer:
         return tx[index]
 
     def work_data(self, t):
-        # Checked first and unconditionally, including part way through a
-        # transmission. A backstop that only applies while listening is not a
-        # backstop -- the case it exists for is the one whose shape we did not
-        # predict.
+        # First and unconditionally, mid-transmission too: a backstop for
+        # the shape nobody predicted.
         if time.ticks_diff(self.now, self.block_started) > BLOCK_TIMEOUT_MS:
             self.fail(ERR_LOST_PEER)
             return
         self.data_field(t)          # ends a queue whose last slot is over
         clock = self.clock
-        if self.breaking:
-            self.work_break(t)
-            return
         if self.tx:
             # Transmitting: no slot is decided, and nothing counts.
             if self.rx:
                 self.rx = []
             self.idle_slots = 0
             if self.leader and self.sub == self.STEP_BLOCK:
-                self.watch_break(t)
+                self.watch_lead_in()
             following = clock.number(t) + 1
             if self.next < following:
                 self.next = following
             return
 
-        # A rate change always takes effect AFTER the pattern announcing it has
-        # been transmitted. Changing first would send the announcement at a rate
-        # the peer is not listening at, so it would never arrive and the two
-        # badges would end up on different rungs.
+        # A rate change after the pattern announcing it has gone out, at the
+        # rate the peer is listening at.
         if self.pending_slow_down:
             self.pending_slow_down = False
             self.demote(t)
 
-        # The Complete Pattern has finished going out. Wait to be told it
-        # arrived rather than assuming it did.
+        # Complete has gone out: wait to be told it arrived.
         if self.finishing:
             self.finishing = False
             self.sub = self.STEP_FINISH
             self.wait_slots = 0
+            self.finish_slots = 0
 
         newest = self.reader.newest_us()
-        while (self.phase == PHASE_DATA and not self.tx and not self.breaking
+        if self.sub == self.STEP_FAST:
+            if self.fast_burst is not None or t < self.fast_end:
+                following = clock.number(t) + 1
+                if self.next < following:
+                    self.next = following
+                return
+            self.fast_listen()
+        if self.sub == self.STEP_FAST_RX:
+            self.fast_receive(newest)
+            return
+        if self.rate_from is not None and newest >= self.rate_from \
+                + RATE_CHECK_SLOTS * clock.duration:
+            self.check_leader_rate(newest)
+        if self.fit_due is not None and not self.leader:
+            self.follower_fit(newest)
+            if self.fit_due is not None:
+                # No slot is decided before the fit: the Leader is dark.
+                following = clock.number(newest)
+                if self.next < following:
+                    self.next = following
+                return
+        while (self.phase == PHASE_DATA and not self.tx
                and clock.start_of(self.next) + self.w_close <= newest):
             k = self.next
             self.next = k + 1
@@ -2639,9 +2320,532 @@ class Transfer:
             self.deciding_end = clock.start_of(k + 1)
             self.decide_slot(k)
             self.deciding = None
+            if self.watch_announce and self.phase == PHASE_DATA:
+                self.watch_for_announce(k)
+
+    def follower_fit(self, newest):
+        """The Follower's flicker, from the ring, FOLLOWER_FIT_START_MS into
+        the gap: a steady check over FOLLOWER_CHECK_MS -- its median the
+        Leader's data low, the provisional black -- and a fit over
+        FLICKER_FAST_FIT_MS if not steady, refused, its later half. In
+        flicker no light before the hold ends is taken for the Leader."""
+        start = self.fit_due
+        if not self.fit_checked:
+            end = start + FOLLOWER_CHECK_MS * 1000
+            if newest < end:
+                return
+            ts, vs, spans = self.ring_samples(start, end)
+            if vs:
+                ordered = sorted(vs)
+                black = ordered[len(ordered) // 2]
+                white = self.levels.white
+                if white - black >= MIN_SWING:
+                    self.levels.fit(black, black + (white - black)
+                                    * PROVISIONAL_GREY_PERCENT // 100, white)
+            self.fit_checked = True
+            self.fit_checks += 1
+            if self.flicker.steady_window(ts, vs):
+                self.flicker.steady = True
+                self.fit_tried = True
+                self.fit_result = "steady"
+                self.fit_due = None
+            return
+        end = start + FLICKER_FAST_FIT_MS * 1000
+        if newest < end:
+            return
+        ts, vs, spans = self.ring_samples(start, end)
+        self.fit_tried = True
+        self.fit_ran = True
+        self.fit_result = self.flicker.fit(ts, vs, spans)
+        if self.fit_result is None:
+            half = len(ts) // 2
+            self.fit_result = self.flicker.fit(ts[half:], vs[half:],
+                                               spans[half:])
+        self.fit_due = None
+        self.set_window()
+        if self.flicker.harmonics is not None:
+            self.hold_until = self.clock.start_of(
+                RESYNC_LEAD_IN + self.hold_slots() - HOLD_MARGIN_SLOTS)
+            if self.fast is not None:
+                # A Leader whose fit found the room steady sends at once,
+                # into the hold, and sends again only after its wait for a
+                # reply: wait that out too before calling it lost -- until
+                # a Begin frames, not the first light, which may be the
+                # end of the burst missed.
+                d = self.clock.duration
+                rung = FAST_START_LIT if self.pair_lit else FAST_START_DARK
+                wait = FAST_REPLY_MS * 1000 + burst_max_us(
+                    self.fast, self.fast.RUNGS[rung])
+                extra = (wait + d - 1) // d + RESYNC_LEAD_IN \
+                    + len(FAST_BEGIN) + FAST_RUNG_BITS + FAST_GAP_SLOTS
+                self.first_grace = extra
+                self.stall_slots -= extra
+
+    def check_leader_rate(self, newest):
+        """Follower: the Leader's slot, from the message locked on at
+        `rate_from` -- two rises after it, three slots apart. On another
+        rung, move to it and wait for its next message."""
+        c0 = self.rate_from
+        self.rate_from = None
+        d = self.clock.duration
+        end = c0 + RATE_CHECK_SLOTS * d
+        if c0 < self.reader.oldest_us():
+            return
+        # In 1 ms parts, flicker corrected: the first fall, then two rises.
+        t_low = self.levels.t_low
+        raw = self.part_raw
+        times = self.part_time
+        amount = self.part_amount
+        fall = r1 = r2 = -1
+        lit = True
+        t = c0
+        while t < end and r2 < 0:
+            n = (end - t) // 1000
+            if n > PARTS_MAX:
+                n = PARTS_MAX
+            if n < 1:
+                break
+            self.reader.parts(t, t + n * 1000, n, raw, times)
+            self.flicker.amounts(times, n, 1000, amount)
+            for j in range(n):
+                if raw[j] < 0:
+                    continue
+                now_lit = raw[j] - amount[j] >= t_low
+                start = t + j * 1000
+                if lit and not now_lit:
+                    if fall < 0:
+                        fall = start
+                elif now_lit and not lit and fall >= 0:
+                    if r1 < 0:
+                        r1 = start
+                    elif r2 < 0:
+                        r2 = start
+                lit = now_lit
+            t += n * 1000
+        if r2 < 0:
+            return
+        period = r2 - r1
+        if abs((r1 - c0) - period) * 100 > period * 15:
+            return                  # not one rate: a pattern ended, or noise
+        share = (fall - c0) * 100 // (r1 - c0)
+        if 40 < share < 60:
+            return                  # lit half of each: Complete
+        slot = period // 3
+        index = -1
+        for i, rung in enumerate(SLOT_LADDER):
+            if abs(rung * 1000 - slot) * 100 <= rung * 1000 * RATE_MATCH_PERCENT:
+                index = i
+                break
+        if index < 0 or index == self.clock.index:
+            return
+        self.clock.set_index(index)
+        self.set_window()
+        self.rate_heals += 1
+        if self.sub == self.STEP_BLOCK:
+            self.reset_block()
+        self.rx = []
+        self.next = self.clock.number(newest) + 1
+        self.lit_end = newest
+
+    # -- fast blocks
+
+    def fast_listen(self):
+        """Leader: its burst is out. Listen for the ACK or NAK, allowing the
+        Follower FAST_REPLY_MS past the longest burst."""
+        self.sub = self.STEP_FAST_REPLY
+        self.rx = []
+        self.next = self.clock.number(self.fast_end) + 1
+        self.lit_end = self.fast_end
+        self.idle_slots = 0
+        d = self.clock.duration
+        wait = FAST_REPLY_MS * 1000 + burst_max_us(self.fast,
+                                                   self.fast_periods) \
+            - (self.fast_end - self.fast_start)
+        grace = (wait + d - 1) // d
+        self.idle_grace = grace
+        self.stall_slots = -grace
+
+    def fast_reply_rx(self):
+        """Leader: the Follower's ACK (CRC Good) or NAK (CRC Bad), each heard
+        less its first symbol too -- a slow sensor reads the first high out
+        of the dark as a middle -- or its Data Sync Error."""
+        tail = "".join(self.rx[-len(CRC_GOOD_TAIL):])
+        late = tail[1:]
+        if tail == CRC_GOOD_TAIL or late == CRC_GOOD_TAIL[1:]:
+            self.advance()
+            self.rx = []
+            size = self.fast.CHUNK
+            self.fast_chunk += (self.fast_block_len + size - 1) // size
+            self.retries = 0
+            self.attempts = 0
+            self.block_started = self.now
+            self.fast_acked()
+            if self.fast_chunk * size >= len(self.fast_data):
+                self.send_complete()
+            else:
+                self.collect_due = True
+                self.send_block()
+            return
+        if tail == CRC_BAD_TAIL or late == CRC_BAD_TAIL[1:]:
+            self.advance()
+            self.rx = []
+            self.retries += 1
+            self.fast_acks = 0
+            if self.retries >= FAST_TRIES:
+                self.retries = 0
+                self.fast_rung += 1
+                if self.fast_trial:
+                    # The rung stepped up to did not hold: wait longer.
+                    self.fast_trial = False
+                    self.fast_up_after *= 2
+                if self.fast_rung >= len(self.fast.RUNGS):
+                    # The slowest rung again, until the block's attempts
+                    # are spent (send_block ends it ERR_CRC).
+                    self.fast_rung = len(self.fast.RUNGS) - 1
+            self.collect_due = True
+            self.send_block()
+            return
+        if "".join(self.rx[-len(SYNC_ERROR_TAIL):]) == SYNC_ERROR_TAIL:
+            self.advance()
+            self.rx = []
+            self.demote(self.decided_end())
+            self.retries = 0
+            self.send_block(SYNC_LEAD_IN)
+
+    def fast_acked(self):
+        """Leader: an ACK. fast_up_after in a row below the pair's start rung
+        step back up one, on trial until it holds for FAST_UP_ACKS."""
+        self.fast_acks += 1
+        if self.fast_acks >= FAST_UP_ACKS:
+            self.fast_trial = False     # the rung has held
+        if self.fast_rung > self.fast_top \
+                and self.fast_acks >= self.fast_up_after:
+            self.fast_rung -= 1
+            self.fast_acks = 0
+            self.fast_trial = True
+
+    def start_fast_rx(self, periods):
+        """Follower: FAST_BEGIN and the rung decided, the last on slot
+        `deciding`. The burst is due FAST_GAP_SLOTS later; no slot is
+        decided until it is read."""
+        self.sub = self.STEP_FAST_RX
+        self.fast_periods = periods
+        self.fast_expect = self.clock.start_of(self.deciding + 1
+                                               + FAST_GAP_SLOTS)
+        self.fast_anchor = None
+        self.fast_b0 = None
+        self.fast_have = 0
+        self.fast_nak_at = None
+        self.fast_fed = False
+        self.fast_last_lit = self.fast_expect
+        self.fast_lit_seen = self.fast_expect
+        self.rx = []
+
+    def fast_receive(self, newest):
+        """Follower: find the burst's first rise, start the decoder there,
+        pull bins as the ring fills, feed them once the burst is over; then
+        ACK or NAK."""
+        fast = self.fast
+        if self.fast_nak_at is not None:
+            # Failed early: the Leader may still be on air. A dark longer
+            # than MAX_LOWS symbols is the burst's end; failing that, its
+            # longest.
+            end = self.burst_over(newest)
+            if end is not None or newest >= self.fast_nak_at:
+                self.fast_reply(False, end if end is not None
+                                else self.fast_nak_at)
+            return
+        if self.fast_anchor is None:
+            if newest < self.fast_expect + FAST_SEARCH_US:
+                return
+            crossing = self.burst_rise()
+            if crossing < 0:
+                self.fast_nak_after(self.fast_expect)
+                return
+            lag = EDGE_LAG_FAST_LIT_US if self.lit else EDGE_LAG_FAST_DARK_US
+            anchor = crossing - lag
+            self.fast_anchor = anchor
+            self.fast_b0 = anchor - 10 * FAST_BIN_US
+            width = fast.sym_q16(self.fast_periods)
+            start = (anchor - self.fast_b0) * 65536 // FAST_BIN_US
+            q = width // 4
+            mhz = self.fast_flicker_mhz()
+            self.decoder.begin(start, width, flicker=mhz,
+                               max_len=fast.block_bytes(self.fast_periods),
+                               shifts=(-q, 0, q))
+        avail = (newest - self.fast_b0) // FAST_BIN_US
+        if avail > FAST_BINS:
+            avail = FAST_BINS
+        if avail > self.fast_have:
+            self.reader.bins(self.fast_b0 + self.fast_have * FAST_BIN_US,
+                             avail - self.fast_have, self.fast_bins,
+                             self.fast_have)
+            self.fast_bins_fed += avail - self.fast_have
+            self.fast_have = avail
+        if not self.fast_fed:
+            # The first feed trains, longer than the ring holds on v2: nothing
+            # is fed until the whole burst is binned -- its end dark in the
+            # ring, or the rung's longest.
+            most = (self.fast_anchor - self.fast_b0 + burst_max_us(
+                fast, self.fast_periods)) // FAST_BIN_US
+            if avail < most and avail < FAST_BINS \
+                    and self.burst_over(newest) is None:
+                return
+            self.fast_fed = True
+            status = self.decoder.feed(self.fast_bins, self.fast_have)
+            # A rung's first block trains (three starts); later ones retune.
+            if self.decoder.mode == "retune":
+                self.fast_retunes += 1
+            elif self.decoder.mode == "train":
+                self.fast_trainings += 3
+        else:
+            status = self.decoder.feed(self.fast_bins, self.fast_have)
+        if status == fast.NEED:
+            if avail < FAST_BINS and newest - self.fast_anchor \
+                    < fast.MAX_AIR_NS // 1000 + FAST_SEARCH_US:
+                return
+            self.fast_reply(False, newest)
+            return
+        if status == fast.OK:
+            chunk = self.decoder.chunk
+            payload = self.decoder.payload()
+            self.fast_accept(chunk, payload)
+            # Reply a slot after the burst ends, its length now known: the
+            # Leader listens from the slot after.
+            symbols = len(fast.encode(chunk, payload))
+            self.fast_reply(True, self.fast_anchor + symbols
+                            * self.fast_periods * fast.COMMON_NS // 1000)
+            return
+        self.fast_nak_after(self.fast_anchor)
+
+    def burst_over(self, newest):
+        """Follower, after a failed burst: when it ended -- the last lit 1 ms
+        part, flicker corrected, before a dark longer than any it holds --
+        or None while it may be on air."""
+        fast = self.fast
+        # Lit: half-way from black to T_low; a slow sensor's single highs
+        # do not all reach T_low.
+        black = self.levels.black
+        line = black + (self.levels.t_low - black) // 2
+        raw = self.part_raw
+        times = self.part_time
+        amount = self.part_amount
+        t = self.fast_lit_seen
+        while True:
+            n = (newest - t) // 1000
+            if n > PARTS_MAX:
+                n = PARTS_MAX
+            if n < 1:
+                break
+            self.reader.parts(t, t + n * 1000, n, raw, times)
+            self.flicker.amounts(times, n, 1000, amount)
+            for j in range(n):
+                if raw[j] >= 0 and raw[j] - amount[j] >= line:
+                    self.fast_last_lit = t + j * 1000 + 1000
+            t += n * 1000
+        self.fast_lit_seen = t
+        quiet = 2 * (fast.MAX_LOWS + 2) * self.fast_periods \
+            * fast.COMMON_NS // 1000
+        if t - self.fast_last_lit < quiet:
+            return None
+        return self.fast_last_lit
+
+    def fast_nak_after(self, start):
+        """Follower: NAK once the longest burst from `start` could have
+        ended."""
+        self.fast_nak_at = start + burst_max_us(self.fast, self.fast_periods) \
+            + self.clock.duration
+
+    def fast_flicker_mhz(self):
+        """The flicker fundamental for the decoder, in mHz: twice the mains,
+        or the mains itself where the fit found that harmonic stronger -- a
+        once-a-cycle light. 0 if none is fitted."""
+        f = self.flicker
+        h = f.harmonics
+        if h is None:
+            return 0
+        one = h[0][0] * h[0][0] + h[0][1] * h[0][1]
+        two = h[1][0] * h[1][0] + h[1][1] * h[1][1]
+        if one > two:
+            return f.mains * 1000 + f.rate_m // 320
+        return self.fast.flicker_mhz(f.mains, f.rate_m)
+
+    def burst_rise(self):
+        """The burst's first rise through T_low plus the flicker, within
+        FAST_SEARCH_US of when it is due; -1 if none."""
+        start = self.fast_expect - FAST_SEARCH_US
+        close = self.fast_expect + FAST_SEARCH_US
+        step = 300
+        n = (close - start) // step + 1
+        return self.reader.rise(start, close, self.thresholds(start, n, step),
+                                n, step)
+
+    def thresholds(self, start, n, step):
+        """T_low plus the flicker, for each of `n` steps of `step` us from
+        `start`, in self.thr."""
+        t_low = self.levels.t_low
+        thr = self.thr
+        if self.flicker.active_now():
+            times = self.thr_t
+            for i in range(n):
+                times[i] = start + i * step + step // 2
+            self.flicker.amounts(times, n, 100, thr)
+            for i in range(n):
+                thr[i] += t_low
+        else:
+            for i in range(n):
+                thr[i] = t_low
+        return thr
+
+    def fast_accept(self, chunk, payload):
+        """Follower: a burst that passed its CRC-32, kept by chunk -- a
+        resend after a lost ACK is not kept twice. Once the stream from
+        chunk 0 parses, it is the payload."""
+        self.fast_chunks[chunk] = bytes(payload)
+        self.blocks_accepted = len(self.fast_chunks)
+        self.block_started = self.now
+        size = self.fast.CHUNK
+        data = bytearray()
+        k = 0
+        while k in self.fast_chunks:
+            piece = self.fast_chunks[k]
+            data.extend(piece)
+            if not piece or len(piece) % size:
+                break
+            k += len(piece) // size
+        fields = parse_fast_stream(data)
+        if fields is not None:
+            self.received = fields
+
+    def fast_reply(self, ok, burst_end):
+        """Follower: ACK or NAK from the second slot after `burst_end`,
+        after the ring check, then wait for the next block. After a NAK the
+        next trains afresh: the retuned taps may have failed."""
+        if not ok and self.decoder is not None:
+            self.decoder.forget()
+        if not self.reader.check():
+            self.fail(ERR_RING)
+            return
+        self.sub = self.STEP_BLOCK
+        self.reset_block()
+        self.rx = []
+        self.next = self.clock.number(self.now_us) + 1
+        self.lit_end = self.now_us
+        self.advance()
+        self.send(CRC_GOOD if ok else CRC_BAD)
+        after = burst_end + self.clock.duration
+        if self.tx_after_us < after:
+            self.tx_after_us = after
+
+    def watch_for_announce(self, k):
+        """Follower, before its first Begin: slot `k`'s 2 ms means into the
+        beacon detector. The Announce again means its staircase was refused:
+        send another, or past CAL_RESTARTS end ERR_CONTRAST."""
+        start = self.clock.start_of(k)
+        end = start + self.clock.duration
+        one = self.one_v
+        t = start
+        while t + FINE_US <= end:
+            self.reader.parts(t, t + FINE_US, 1, one)
+            if one[0] >= 0:
+                self.detector.push(t // 1000, one[0])
+            t += FINE_US
+        if not self.detector.matches(ANNOUNCE_FAST_HALF_MS) or \
+                self.detector.hi - self.detector.lo < self.announce_swing // 2:
+            self.announce_since = None
+            return
+        # Held two windows: a Begin on 8 ms slots can match one, but is
+        # framed by then.
+        now = self.now_us // 1000
+        if self.announce_since is None:
+            self.announce_since = now
+        if now - self.announce_since < 2 * BEACON_FAST_HALVES \
+                * ANNOUNCE_FAST_HALF_MS:
+            return
+        self.cal_refusals += 1
+        if self.cal_refusals > CAL_RESTARTS:
+            self.fail(ERR_CONTRAST)
+            return
+        self.watch_announce = False
+        self.announce_since = None
+        self.collected = False
+        self.fit_due = None
+        self.fit_checked = self.fit_tried = False
+        self.flicker = FlickerFilter()
+        self.hold_until = 0
+        self.fine_end = self.now_us + FINE_US
+        self.coarse_base = None
+        self.coarse_n = self.coarse_sum = self.coarse_tsum = 0
+        self.enter(PHASE_CAL_SEND, now)
+
+    def ring_samples(self, start, end):
+        """2 ms means of the ring over [start, end) us: times, values,
+        spans."""
+        ts, vs, spans = [], [], []
+        t = start
+        while t + FINE_US <= end:
+            v = self.reader.mean(t, t + FINE_US)
+            if v >= 0:
+                ts.append(t + FINE_US // 2)
+                vs.append(v)
+                spans.append(FINE_US)
+            t += FINE_US
+        return ts, vs, spans
+
+    def begin_levels(self):
+        """If the last nine slots have FAST_BEGIN's shape -- high, middle,
+        low, three times -- the levels they show, else None: how a Follower
+        learns the Leader's. High and middle are medians of three; black is
+        the long dark before, not the pattern's lows, which a slow sensor
+        leaves unsettled. Every high clears every middle, and every middle
+        black, by MIN_GAP_EXACT; every low is under every middle; the middle
+        a quarter of the swing from either end. No allocation."""
+        if self.rx_n < 9:
+            return None
+        v = self.rx_values
+        i = self.rx_n
+        # FAST_BEGIN, "-_ -_ _- ": high, middle, low twice, then middle,
+        # high, low.
+        h0 = v[i % 9]
+        m0 = v[(i + 1) % 9]
+        l0 = v[(i + 2) % 9]
+        h1 = v[(i + 3) % 9]
+        m1 = v[(i + 4) % 9]
+        l1 = v[(i + 5) % 9]
+        m2 = v[(i + 6) % 9]
+        h2 = v[(i + 7) % 9]
+        l2 = v[(i + 8) % 9]
+        if l0 < 0 or l1 < 0 or l2 < 0:
+            return None
+        black = self.levels.black
+        m_lo = m0 if m0 < m1 else m1
+        m_lo = m_lo if m_lo < m2 else m2
+        m_hi = m0 if m0 > m1 else m1
+        m_hi = m_hi if m_hi > m2 else m2
+        h_lo = h0 if h0 < h1 else h1
+        h_lo = h_lo if h_lo < h2 else h2
+        l_hi = l0 if l0 > l1 else l1
+        l_hi = l_hi if l_hi > l2 else l2
+        if h_lo - m_hi < MIN_GAP_EXACT or m_lo - black < MIN_GAP_EXACT \
+                or l_hi >= m_lo:
+            return None
+        grey = _median3(m0, m1, m2)
+        white = _median3(h0, h1, h2)
+        span = white - black
+        if span < MIN_SWING or grey - black < span // 4 \
+                or white - grey < span // 4:
+            return None
+        levels = Levels()
+        levels.fit(black, grey, white)
+        levels.last = LOW
+        return levels
 
     def decide_slot(self, k):
         value = self.window_value(k)
+        if value >= self.levels.t_low and \
+                self.clock.start_of(k) < self.hold_until:
+            # In the Leader's hold, light is the flicker's.
+            value = self.levels.black
         lit = value >= self.levels.t_low
         if lit and self.can_phase_lock() and self.try_lock(k):
             return
@@ -2652,223 +2856,116 @@ class Transfer:
         self.learn(k, decided == LOW and value >= 0)
         if decided != LOW:
             self.lit_end = self.clock.start_of(k) + self.w_close
-        # Trim: while waiting for a pattern this list would otherwise grow
-        # for the whole wait, and it is sliced and joined every slot.
+        # Trimmed: sliced and joined every slot.
         if len(self.rx) > MAX_PATTERN * 2:
             del self.rx[:-MAX_PATTERN]
-        # Two budgets, because a link dies in two ways. This one is not
-        # exempted in STEP_FINISH the way the silence budget is: the
-        # closing handshake's own retry and linger counts are well inside
-        # it, so it stands as a backstop if either of those is ever wrong.
+        # Not exempted in STEP_FINISH: a backstop if the closing handshake's
+        # own counts are ever wrong.
         self.stall_slots += 1
         if self.stall_slots > STALL_SLOTS and not self.request_resend():
             self.fail(ERR_LOST_PEER)
             return
 
+        # Dark through and through, no part lit: a missed fast Begin's
+        # burst reads dark at the median, and asking during it is unheard.
+        if decided == LOW and self.part_max < self.levels.t_low:
+            self.dark_run += 1
+        else:
+            self.dark_run = 0
         if decided == LOW:
             self.idle_slots += 1
-            # The closing handshake keeps its own time. A Follower that is
-            # slow to pick Complete out of the air is legitimately silent
-            # for longer than LOST_PEER_SLOTS, and failing here would end
-            # the transfer before the first retry had even gone out. The
-            # retry budget is the timeout for this state.
+            if self.dark_run == RESEND_QUIET_SLOTS \
+                    and self.unframed >= UNFRAMED_LIT_SLOTS:
+                self.unframed = 0
+                self.dark_run = 0
+                self.request_resend()
+            # The closing handshake keeps its own time: its retry budget is
+            # this state's timeout.
             if (self.idle_slots > LOST_PEER_SLOTS + self.idle_grace
-                    and self.sub != self.STEP_FINISH):
+                    + self.first_grace and self.sub != self.STEP_FINISH):
+                if self.leader and self.sub == self.STEP_FAST_REPLY \
+                        and self.fast_chunk == 0 and self.attempts == 1 \
+                        and not self.pair_flicker:
+                    # Not a word on the first block from a Leader that did
+                    # not hold: a Follower that found flicker took none of
+                    # it as light. Its hold is long over: once more.
+                    self.send_block()
+                    return
                 self.fail(ERR_LOST_PEER)
                 return
         else:
             self.idle_slots = 0
             self.idle_grace = 0
+            self.start_grace = 0    # the Leader's first light: no hold left
+            if not self.leader and self.sub == self.STEP_BLOCK \
+                    and not self.in_block:
+                self.unframed += 1
 
         if self.want_resend and self.idle_slots >= RESEND_QUIET_SLOTS:
             self.want_resend = False
             self.resend_requests += 1
-            # One signal for a framing failure and for a block never seen,
-            # because they mean the same thing: this block did not arrive,
-            # send it again slower.
+            # One signal for a framing failure and a block never seen: send
+            # it again, slower.
             self.send_sync_error()
             return
 
         self.rx.append(decided)
+        self.rx_values[self.rx_n % 9] = value
+        self.rx_n += 1
         if self.leader:
             self.leader_rx()
         else:
             self.follower_rx()
 
-    # -- breaking in
+    # -- the Leader's lead-in
 
-    def watch_break(self, t):
-        """Leader, sending a block: whether the Follower has held high for
-        BREAK_DETECT_SLOTS whole slots. Its own screen's light is not in the
-        reading -- the sensor faces the Follower's -- and the Follower's
-        screen is dark while it listens."""
+    def watch_lead_in(self):
+        """Leader, sending a block's lead-in: its slots teach the flicker as
+        they close -- the Follower is dark while it listens, and this badge's
+        own light is not in the reading. After a stall only the last
+        WATCH_SLOTS: catching up on every slot ran past the next symbol's
+        boundary."""
         clock = self.clock
         newest = self.reader.newest_us()
-        t_high = self.levels.t_high
         t_low = self.levels.t_low
+        last = clock.number(newest - self.w_close)
+        if clock.start_of(last) + self.w_close > newest:
+            last -= 1
+        if last - self.watched >= WATCH_SLOTS:
+            self.watched = last - WATCH_SLOTS + 1
         while clock.start_of(self.watched) + self.w_close <= newest:
             k = self.watched
             self.watched = k + 1
             value = self.window_value(k)
-            if value >= t_high:
-                self.high_slots += 1
-                if self.high_slots >= BREAK_DETECT_SLOTS:
-                    self.stop_for_break(t)
-                    return
-            else:
-                self.high_slots = 0
-            # The Follower is dark while it listens, so a block is the
-            # Leader's longest stretch of dark slots: the flicker's phase
-            # lock tracks the mains through it rather than extrapolating a
-            # rate learnt in calibration across seconds of block. Its own
-            # screen does not face its sensor [inferred-all].
             self.learn(k, 0 <= value < t_low)
-
-    def stop_for_break(self, t):
-        """Leader: stop the block and listen, as if it had ended. What the
-        Follower sends next -- its Data Sync Error -- demotes and resends."""
-        self.tx = []
-        self.sub = self.STEP_CRC
-        self.crc_started = False
-        self.rx = []
-        self.high_slots = 0
-        self.lit_end = t
-        self.next = self.clock.number(t) + 1
-        self.breaks += 1
-
-    def start_break(self, now_us):
-        """Follower: show high until the Leader stops."""
-        self.breaking = True
-        self.break_since = now_us
-        self.break_dark = 0
-        self.watched = self.clock.number(now_us) + 1
-        self.tx = []
-        self.await_block()
-        self.breaks += 1
-
-    def work_break(self, t):
-        clock = self.clock
-        duration = clock.duration
-        if t - self.break_since > BREAK_MAX_SLOTS * duration:
-            # Not heard. Wait the block out and ask afterwards, as a Follower
-            # that cannot break does.
-            self.breaking = False
-            self.want_resend = True
-            self.idle_slots = 0
-            self.next = clock.number(t) + 1
-            return
-        newest = self.reader.newest_us()
-        t_low = self.levels.t_low
-        while clock.start_of(self.watched) + self.w_close <= newest:
-            k = self.watched
-            self.watched = k + 1
-            value = self.window_value(k)
-            if 0 <= value < t_low:
-                self.break_dark += 1
-                if self.break_dark >= BREAK_ACK_SLOTS:
-                    # The Leader has stopped, or finished, and is listening.
-                    self.breaking = False
-                    self.lit_end = t
-                    self.next = clock.number(t) + 1
-                    self.send_sync_error()
-                    return
-            else:
-                self.break_dark = 0
-        self.next = clock.number(t) + 1
 
     # -- Leader side
 
     def leader_rx(self):
-        if self.sub == self.STEP_BLOCK:
-            self.sub = self.STEP_CRC
-            self.rx = []
-            self.crc_started = False
+        if self.sub == self.STEP_FAST_REPLY:
+            self.fast_reply_rx()
             return
-
-        if self.sub == self.STEP_CRC:
-            symbol = self.rx[-1]
-
-            # The reply is 16 pure data symbols. Two blacks in a row among
-            # them can only be the Data Sync Error Pattern -- `_  _  _` after
-            # its leading black -- which is how the Follower says it could
-            # not frame the block. One alone is a misread bit, and counts as
-            # one: a slow sensor reading a middle symbol out of a fall reads
-            # it black, and taking that for the pattern demoted the Leader
-            # alone and split the rungs (simulation, a sensor three to four
-            # times slower than measured, 16 ms slots). The CRC catches it.
-            if not self.crc_started:
-                if symbol == LOW:
-                    self.rx = []
-                    return
-                self.crc_started = True
-                self.advance()
-                self.rx = [symbol]
-            elif symbol == LOW and len(self.rx) >= 2 and self.rx[-2] == LOW:
-                # The peer's demotion, so the same rule as our own below: a
-                # new rate starts with the whole CRC retry budget.
-                self.demote(self.decided_end())
-                self.retries = 0
-                self.rx = []
-                self.send_block(SYNC_LEAD_IN)
-                return
-
-            if len(self.rx) >= 16:
-                received = symbols_bits(self.rx[:16])
-                self.rx = []
-                self.sub = self.STEP_VERDICT
-                if received == self.expected_crc:
-                    self.last_verdict = CRC_GOOD
-                    self.send(CRC_GOOD)
-                    self.block_index += 1
-                    self.retries = 0
-                    self.attempts = 0
-                    self.block_started = self.now
-                else:
-                    self.retries += 1
-                    if self.retries > MAX_BLOCK_RETRIES:
-                        # A rate can frame a block and still get its bits
-                        # wrong. Step down, but only from ground that was a
-                        # gamble. Demoting on the first bad CRC splits the
-                        # rungs: the announcement has to be read at the very
-                        # rate that is too fast to read, so it arrives
-                        # corrupted and the badges end up a rung apart.
-                        if self.clock.index > self.conservative_index():
-                            self.pending_slow_down = True
-                            self.retries = 0
-                            self.send(SYNC_ERROR)
-                            return
-                        self.fail(ERR_CRC)
-                        return
-                    self.last_verdict = CRC_BAD
-                    self.send(CRC_BAD)
-            return
-
-        if self.sub == self.STEP_VERDICT:
-            self.rx = []
-            if self.block_index >= len(self.blocks):
-                self.send_complete()
-            else:
-                # Between blocks, nothing is time critical: the caller
-                # collects before the block goes out.
-                self.collect_due = True
-                self.send_block()
-            return
-
         if self.sub == self.STEP_FINISH:
-            if "".join(self.rx[-len(COMPLETE_ACK_TAIL):]) == COMPLETE_ACK_TAIL:
-                # The only evidence the Leader ever gets that the Follower has
-                # the payload, and the only thing entitled to report success.
+            heard = "".join(self.rx[-len(COMPLETE_ACK_LATE_TAIL):])
+            if heard == COMPLETE_ACK_LATE_TAIL:
+                # The only evidence the Follower has the payload.
                 self.result = OK
                 self.phase = PHASE_DONE
                 return
-            self.wait_slots += 1
-            if self.wait_slots > COMPLETE_RETRY_SLOTS:
+            # Unanswered means silent: a lit slot may be the Ack arriving
+            # late, and a repeat over it cut it short. But never past
+            # COMPLETE_REPEAT_MAX_SLOTS, or it goes out after the linger.
+            if self.rx[-1] != LOW:
                 self.wait_slots = 0
+            else:
+                self.wait_slots += 1
+            self.finish_slots += 1
+            if (self.wait_slots > COMPLETE_RETRY_SLOTS
+                    or self.finish_slots >= COMPLETE_REPEAT_MAX_SLOTS):
+                self.wait_slots = 0
+                self.finish_slots = 0
                 if self.complete_tries > MAX_COMPLETE_RETRIES:
-                    # Every block was acknowledged, but the ending was not, so
-                    # we do not know whether the Follower has it. Saying so is
-                    # the honest answer; saying OK is the one that matters most
-                    # not to say.
+                    # Every block acknowledged, the ending not: not OK.
                     self.fail(ERR_LOST_PEER)
                 else:
                     self.rx = []
@@ -2876,27 +2973,15 @@ class Transfer:
 
     def send_complete(self):
         self.complete_tries += 1
-        # Queued, then acknowledged. `finishing` marks the handover from
-        # transmitting to waiting; it is no longer a licence to report OK.
+        # Queued, then acknowledged: `finishing` is the handover to waiting.
         self.send(COMPLETE)
         self.finishing = True
 
-    # A Follower that misses a Begin Block Pattern never enters the block, so
-    # nothing trips the framing check and it has nothing to say -- leaving the
-    # Leader waiting in STEP_CRC for a reply that was never coming. Asking again
-    # triggers the demotion path the Leader already has. A request already
-    # waiting -- a framing failure's -- is left as it is: re-arming it makes no
-    # second request and no second demotion.
-    #
-    # Returns whether the request was made; if not, the caller gives up.
+    # A Follower that missed a Begin never enters the block and has nothing
+    # to say: asking again takes the Leader's demotion path. A request
+    # already waiting is left as it is. Returns whether it asked.
     def request_resend(self):
         if self.leader or self.sub != self.STEP_BLOCK or self.in_block:
-            return False
-        # Only with nothing uncommitted. Holding a block whose verdict never
-        # arrived, the Follower cannot tell an accepted one from a rejected one,
-        # and asking for a resend would either drop a block the Leader has moved
-        # past or duplicate one it has not.
-        if self.pending_tokens or self.pending_block:
             return False
         if self.resend_requests >= MAX_BLOCK_ATTEMPTS:
             return False
@@ -2908,227 +2993,145 @@ class Transfer:
 
     def follower_rx(self):
         if self.sub == self.STEP_BLOCK:
-            # Complete arrives here, after the last block's verdict returned us
-            # to waiting for another Begin Block Pattern that never comes.
-            if "".join(self.rx[-len(COMPLETE_TAIL):]) == COMPLETE_TAIL and not self.in_block:
-                self.accept_pending()
+            # Complete arrives here, after the last ACK -- never before a
+            # block: that is the Announce again.
+            if self.blocks_accepted and not self.in_block \
+                    and "".join(self.rx[-len(COMPLETE_TAIL):]) == COMPLETE_TAIL:
                 self.acknowledge_complete()
                 return
             self.collect_block()
             return
 
         if self.sub == self.STEP_FINISH:
-            # A repeat means the acknowledgement did not arrive. Answer again
-            # rather than leaving the Leader to time out over a payload it
-            # successfully delivered.
+            # A repeat: the Ack did not arrive. Answer again.
             if "".join(self.rx[-len(COMPLETE_TAIL):]) == COMPLETE_TAIL:
                 self.acknowledge_complete()
                 return
             self.wait_slots += 1
             if self.wait_slots > LINGER_SLOTS:
                 self.finish_follower()
-            return
 
-        if self.sub == self.STEP_VERDICT:
-            if self.rx[-1] != LOW:
-                self.verdict_lit += 1
-            tail = "".join(self.rx[-len(CRC_GOOD_TAIL):])
-            if tail == CRC_GOOD_TAIL:
-                self.advance()
-                self.accept_pending()
-                self.await_block()
-                # A ring reads through a collection, so an EXACT badge
-                # collects now. A POLLED one is blind for it, and the
-                # Leader's Complete, or its next block, follows the verdict
-                # by a slot: it collects before it next transmits instead.
-                # Not every badge that way: the delay it puts before the
-                # reply is silence the Leader may phase-lock after, and on
-                # a slow sensor a lock on a reply's rise to the middle
-                # lands a slot late [simulation, ring k3.0].
-                if self.reader.exact:
-                    self.collect_due = True
-                else:
-                    self.collect_owed = True
-                # And the next silence may be the Leader missing this
-                # badge's answer to a Complete it never heard: wait out a
-                # retry of it before calling the peer lost.
-                self.idle_grace = COMPLETE_RETRY_SLOTS + len(COMPLETE)
-            elif tail == CRC_BAD_TAIL:
-                self.advance()
-                self.discard_pending()
-                self.await_block()
-            elif tail == SYNC_ERROR_TAIL:
-                self.advance()
-                # The Leader is stepping down a rung. Follow it, changing only
-                # the slot duration so the shared epoch keeps both grids aligned.
-                self.demote(self.decided_end())
-                self.discard_pending()
-                self.await_block()
-            elif "".join(self.rx[-len(COMPLETE_TAIL):]) == COMPLETE_TAIL:
-                # Complete is only sent after the Leader matched the last
-                # block's CRC, so it carries the same guarantee CRC Good does.
-                # Arriving here means the verdict went missing and this is the
-                # proof of it: commit before finishing, or the badge reports
-                # success while holding nothing.
-                self.accept_pending()
-                self.acknowledge_complete()
-            elif self.verdict_lit > VERDICT_LOST_SYMBOLS:
-                # The Leader has moved on and the verdict went by unread.
-                self.start_break(self.now_us)
-
-    # Commit the block whose CRC has just been acknowledged, once. Clearing what
-    # is pending is what makes it once: a block may be acknowledged twice -- by
-    # its verdict and again by the Complete Pattern -- and appending it twice
-    # would corrupt the payload while every CRC still passed (I4). The flag as
-    # well as the tokens, because an empty block adds none and still has to
-    # count as accepted.
-    def accept_pending(self):
-        self.resend_requests = 0
-        self.block_started = self.now
-        if self.pending_block or self.pending_tokens:
-            self.received.extend(self.pending_tokens)
-            self.blocks_accepted += 1
-        self.discard_pending()
-
-    def discard_pending(self):
-        self.pending_tokens = []
-        self.pending_block = False
-
-    # Answer Complete, then stay on air long enough to answer it again. A
-    # Follower that finished the instant it acknowledged would be gone before
-    # the Leader's first retry, turning one lost acknowledgement into a failure
-    # on a transfer that actually worked.
+    # Answer Complete, then linger to answer a repeat.
     def acknowledge_complete(self):
+        self.resend_requests = 0
         self.send(COMPLETE_ACK)
         self.sub = self.STEP_FINISH
         self.wait_slots = 0
         self.idle_slots = 0
         self.rx = []
 
-    # The Follower only succeeds if a block actually landed. A Complete Pattern
-    # that arrives with none accepted means the blocks never did, and saying OK
-    # to that is the failure this protocol most needs not to have. Counted in
-    # blocks, not tokens: an empty payload is one accepted block holding none.
+    # OK only if a block landed and the stream parsed.
     def finish_follower(self):
-        self.result = OK if self.blocks_accepted else ERR_DECODE
+        self.result = OK if self.received is not None else ERR_DECODE
         self.phase = PHASE_DONE
 
     def await_block(self):
+        # The Follower's once-a-block ring check, as send_block()'s is the
+        # Leader's.
+        if not self.reader.check():
+            self.fail(ERR_RING)
+            return
         self.rx = []
         self.reset_block()
         self.sub = self.STEP_BLOCK
 
     def reset_block(self):
-        self.tokens = []
-        self.bits = []
+        self.fast_bits = None
         self.in_block = False
-        self.end_match = []
 
     def collect_block(self):
         symbol = self.rx[-1]
-
         if not self.in_block:
-            if self.pending_block or self.pending_tokens:
-                # Holding a block whose verdict never came: a resend repeats
-                # it first. Settle that before any new block.
-                tail = "".join(self.rx[-len(CRC_GOOD_TAIL):])
-                if tail == CRC_GOOD_TAIL:
-                    self.accept_pending()
-                    self.rx = []
-                    return
-                if tail == CRC_BAD_TAIL:
-                    self.discard_pending()
-                    self.rx = []
-                    return
-            if "".join(self.rx[-len(BEGIN_BLOCK):]) == BEGIN_BLOCK:
-                if self.pending_block or self.pending_tokens:
-                    # Still unsettled: taking this block would overwrite the
-                    # one held. Ask again.
-                    self.frame_error()
-                    return
+            trained = self.begin_levels() if symbol == LOW else None
+            if trained is not None or \
+                    "".join(self.rx[-len(FAST_BEGIN):]) == FAST_BEGIN:
+                if trained is not None:
+                    self.levels = trained
                 self.advance()
+                self.watch_announce = False
                 self.want_resend = False
-                self.in_block = True
-                self.tokens = []
-                self.bits = []
-                self.end_match = []
+                self.first_grace = 0
+                self.in_block = True        # the rung's bits follow
+                self.fast_bits = []
                 self.rx = []
             return
-
-        # Part way through matching the End Block Pattern's tail.
-        if self.end_match:
-            self.end_match.append(symbol)
-            if len(self.end_match) == len(END_BLOCK):
-                if "".join(self.end_match) == END_BLOCK:
-                    self.finish_block()
-                else:
-                    self.frame_error()
+        # The rung, two bits after FAST_BEGIN; then the burst. A low reads
+        # as 0: the burst follows whatever the bits said, and an error sent
+        # now goes out over it. A wrong rung costs a NAK.
+        self.fast_bits.append(1 if symbol == HIGH else 0)
+        if len(self.fast_bits) < FAST_RUNG_BITS:
             return
-
-        if symbol == LOW:
-            # The End Block Pattern opens with two data symbols and then a
-            # black, so a black arriving two bits into a byte after '_-' is the
-            # pattern starting, not a framing error. A black on a byte boundary
-            # is the Field Separator.
-            if len(self.bits) == 2 and self.bits == [0, 1]:
-                self.bits = []
-                self.end_match = [MID, HIGH, LOW]
-                return
-            if self.bits:
-                self.frame_error()
-                return
-            self.tokens.append(SEPARATOR)
-            self.advance()
-            return
-
-        self.bits.append(1 if symbol == HIGH else 0)
-        if len(self.bits) == 8:
-            value = 0
-            for bit in self.bits:
-                value = (value << 1) | bit
-            self.tokens.append(value)
-            self.bits = []
-            self.advance()
-            if sum(1 for t in self.tokens if t != SEPARATOR) > BLOCK_BYTES:
-                self.frame_error()
-
-    def finish_block(self):
-        self.pending_tokens = self.tokens
-        self.pending_block = True
-        self.verdict_lit = 0
-        self.send(bits_symbols(block_crc(self.tokens), 16))
-        self.rx = []
-        self.sub = self.STEP_VERDICT
-
-    # The block cannot be framed. Stop decoding it, and say so only once the
-    # Leader has finished sending it: it does not listen while it transmits,
-    # so a Data Sync Error sent now would never be heard -- and this badge
-    # would demote on its own, a rung away from a Leader it could no longer
-    # read. The answer goes out by the same route as a request for a block
-    # never seen, so one failure is one request and one demotion, however
-    # long the rest of the block keeps the stall budget running.
-    def frame_error(self):
-        # The Leader hears a break while it transmits: no need to wait for
-        # the rest of the block.
-        self.start_break(self.now_us)
+        rung = 0
+        for bit in self.fast_bits:
+            rung = (rung << 1) | bit
+        self.fast_bits = None
+        self.in_block = False
+        self.start_fast_rx(self.fast.RUNGS[rung])
 
     def send_sync_error(self):
         self.pending_slow_down = True
+        self.verify_rate = True
         self.send(SYNC_ERROR)
         self.await_block()
 
 
-# Splits a received token stream back into its fields. Structure only: the
-# protocol has no opinion about what the fields should contain, so anything that
-# arrived intact parses. The caller decides whether it is acceptable.
-def parse_payload(tokens):
+def fast_stream(fields):
+    """A fast transfer's payload: the field count, then each field's length
+    and bytes, lengths and count as varints."""
+    out = bytearray()
+    _put_varint(out, len(fields))
+    for field in fields:
+        _put_varint(out, len(field))
+        out.extend(field)
+    return bytes(out)
+
+
+def burst_max_us(fast, periods):
+    """The longest a rung's block can be on air, in us: its most payload,
+    stuffed at worst."""
+    symbols = fast.PREAMBLE_LEN + fast.stuffed_len(
+        fast.HEADER + fast.block_bytes(periods) + fast.CRC) + fast.TAIL
+    return symbols * periods * fast.COMMON_NS // 1000
+
+
+def fast_block(fast, stream, chunk, periods):
+    """The fast block from `chunk` of `stream`: block_bytes(periods) of it,
+    or what is left."""
+    at = chunk * fast.CHUNK
+    return stream[at:at + fast.block_bytes(periods)]
+
+
+def parse_fast_stream(data):
+    """fast_stream() undone: the fields, or None if `data` is not one."""
+    at = 0
     fields = []
-    current = []
-    for token in tokens:
-        if token == SEPARATOR:
-            fields.append(bytes(current))
-            current = []
-        else:
-            current.append(token)
-    fields.append(bytes(current))
-    return fields
+    count, at = _get_varint(data, at)
+    if count is None:
+        return None
+    for _ in range(count):
+        n, at = _get_varint(data, at)
+        if n is None or at + n > len(data):
+            return None
+        fields.append(bytes(data[at:at + n]))
+        at += n
+    return fields if at == len(data) else None
+
+
+def _put_varint(out, n):
+    while n >= 128:
+        out.append((n & 127) | 128)
+        n >>= 7
+    out.append(n)
+
+
+def _get_varint(data, at):
+    n = shift = 0
+    while True:
+        if at >= len(data):
+            return None, at
+        byte = data[at]
+        at += 1
+        n |= (byte & 127) << shift
+        shift += 7
+        if not byte & 128:
+            return n, at

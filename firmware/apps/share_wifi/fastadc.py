@@ -1,29 +1,19 @@
-"""Fast reads of the light sensor, straight from the RP2350's ADC.
+"""The light sensor, read straight from the RP2350's ADC by DMA.
 
-Two users. Dev Mode's probe captures with them to find how fast the badge
-can read, and whether averaging many readings beats the sensor's noise. And
-`Ring`, below, is what a transfer reads through where it works: the ADC
-free-running at 50 kHz into a 32 KB DMA ring for the whole transfer, summed
-by viper kernels -- reader.RingReader turns it into times and means.
-
-`badge.light_level()` is `machine.ADC.read_u16()`, ~14 us a call on the badge
-over the loop it sits in [measured-v2], where one conversion takes 96 cycles
-of the 48 MHz ADC clock, 2 us [datasheet]. Two ways past the call:
-
-    viper   a @micropython.viper loop starting each conversion and waiting
-            for it, one register write and a poll a reading
-    dma     the ADC converting free-running into its FIFO at a set rate, and
-            a DMA channel moving each result to a buffer: no CPU at all, and
-            a sample clock as exact as the crystal
+`Ring` is what a transfer reads through: the ADC free-running at 50 kHz
+into a 32 KB DMA ring, summed by viper kernels; reader.RingReader turns it
+into times and means. No CPU time a reading, and a sample clock as exact as
+the crystal, where light_level() costs ~14 us a call [measured-v2].
 
 Every address and bit is from the Pico SDK's RP2350 register headers
 (hardware/regs/addressmap.h, adc.h, dreq.h) [datasheet]. A wrong one would
 fault the chip, so `check()` first confirms the registers hold what a
-`read_u16()` just left there.
+`read_u16()` just left there -- the one light_level() a launch makes, before
+the ring exists.
 
 Badge-only, like __init__.py: it reaches for `machine` and `rp2`. The app
-imports it inside a try, so a firmware without viper or rp2.DMA fails the
-probe's step, or leaves transfers on light_level(), not the app.
+imports it inside a try, so a firmware without viper or rp2.DMA records
+why, and does not transfer; the app still runs.
 """
 
 import array
@@ -38,7 +28,6 @@ RESULT = 0x04
 FCS = 0x08
 FIFO = 0x0C
 DIV = 0x10
-ATOMIC_SET = 0x2000         # writing here sets bits, and only those
 ATOMIC_CLR = 0x3000
 # The addresses, summed once: ADC_BASE is over the small-int limit on this
 # build (2**30), so each sum would allocate a big int -- and health() runs
@@ -68,15 +57,9 @@ FCS_THRESH_SHIFT = 24
 
 DREQ_ADC = 48
 ADC_CLOCK_HZ = 48000000
-CONVERSION_CYCLES = 96      # so 500k conversions a second, back to back
 
 # LIGHT_SENSE is GPIO43, and an RP2350B's ADC inputs are GPIO40-47.
 LIGHT_CHANNEL = 3
-
-# How long a DMA capture may take beyond its expected length before it is
-# abandoned: a capture that never ends would hang the probe.
-DMA_SLACK_MS = 50
-
 
 def check(read_u16):
     """None if the ADC's registers are where this module thinks, else why
@@ -107,31 +90,6 @@ _KEEP = ~CS_OURS & 0xFFFFFFFF
 _RESTORE = ~(CS_START_ONCE | CS_START_MANY) & 0xFFFFFFFF
 
 
-@micropython.viper
-def _convert(base: uint, keep: uint, restore: uint, buf: ptr16, n: int,
-             ain: int):
-    adc = ptr32(base)
-    start = ptr32(base + 0x2000)        # ATOMIC_SET alias of CS
-    cs = adc[0]
-    adc[0] = (cs & keep) | (ain << 12) | 1
-    i = 0
-    while i < n:
-        start[0] = 4                    # START_ONCE
-        while not (adc[0] & 0x100):     # READY
-            pass
-        buf[i] = adc[1] & 0xFFF
-        i += 1
-    adc[0] = cs & restore
-
-
-def viper_capture(buf, n):
-    """`n` single conversions into `buf`, an array('H'). Returns the time
-    they took, in us."""
-    t = time.ticks_us()
-    _convert(ADC_BASE, _KEEP, _RESTORE, buf, n, LIGHT_CHANNEL)
-    return time.ticks_diff(time.ticks_us(), t)
-
-
 def _drain():
     mem = machine.mem32
     for _ in range(16):
@@ -140,76 +98,20 @@ def _drain():
         mem[ADC_FIFO]
 
 
-def dma_capture(buf, n, rate_hz):
-    """`n` free-running conversions at `rate_hz` into `buf`, an array('H'),
-    by DMA. Returns the time they took, in us, or raises if they did not
-    finish. Puts the ADC back as it found it, whatever happens."""
-    import rp2
-    mem = machine.mem32
-    cs_saved = mem[ADC_CS]
-    fcs_saved = mem[ADC_FCS]
-    div_saved = mem[ADC_DIV]
-    div = ADC_CLOCK_HZ // rate_hz - 1
-    if div <= CONVERSION_CYCLES - 1:
-        # Back to back. A divider of a conversion's own 96 cycles gave half
-        # the rate asked, 249k a second for 500k [measured-v2]: a start
-        # falling as the last conversion ends seems to be missed.
-        div = 0
-    dma = rp2.DMA()
-    elapsed = None
-    try:
-        mem[ADC_DIV] = div << 8
-        mem[ADC_FCS] = FCS_EN | FCS_DREQ_EN | (1 << FCS_THRESH_SHIFT)
-        _drain()
-        ctrl = dma.pack_ctrl(size=1, inc_read=False, inc_write=True,
-                             treq_sel=DREQ_ADC)
-        dma.config(read=ADC_FIFO, write=buf, count=n, ctrl=ctrl,
-                   trigger=True)
-        limit_ms = n * 1000 // rate_hz + DMA_SLACK_MS
-        t = time.ticks_us()
-        mem[ADC_CS] = ((cs_saved & _KEEP)
-                              | (LIGHT_CHANNEL << CS_AINSEL_SHIFT)
-                              | CS_EN | CS_START_MANY)
-        while dma.active():
-            if time.ticks_diff(time.ticks_us(), t) > limit_ms * 1000:
-                break
-        else:
-            elapsed = time.ticks_diff(time.ticks_us(), t)
-    finally:
-        mem[ADC_CS_CLR] = CS_START_MANY
-        for _ in range(100):
-            if mem[ADC_CS] & CS_READY:
-                break
-        dma.active(0)
-        dma.close()
-        mem[ADC_FCS] = 0
-        _drain()
-        mem[ADC_FCS] = fcs_saved
-        mem[ADC_DIV] = div_saved
-        mem[ADC_CS] = cs_saved & _RESTORE
-    if elapsed is None:
-        raise RuntimeError("DMA did not finish in %d ms" % limit_ms)
-    return elapsed
-
-
-def buffer(n):
-    return array.array("H", bytes(2 * n))
-
-
 # --- the ring ---------------------------------------------------------------
 # A transfer's reader: the ADC converting free-running into its FIFO, and one
 # DMA channel writing every result into a 32 KB ring for as long as a
 # transfer lasts. A reading's time is its index, at the crystal's rate. See
-# "Reading" in .agents/docs/optical-data-transfer-protocol.md.
+# section 6 of .agents/optical_data_transfer/spec.md, and
+# section 4 of data.md beside it.
 #
 # Nothing else may touch the ADC while the ring runs: not light_level(), not
-# the battery, and not the chip's temperature. Dev Mode reads temperature_c
-# before start() and after stop(), never between.
+# the battery, and not the chip's temperature.
 #
-# Every address and bit below is cited. Two are new ground even on v2, where
-# only dma_capture() has run: the DMA ring fields of pack_ctrl, and reading
-# PSRAM around the cache while DMA writes it. verify() establishes both on
-# each launch, and a failure leaves the badge on light_level() [unverified].
+# Every address and bit below is cited. Two were new ground on v2: the DMA
+# ring fields of pack_ctrl, and reading PSRAM around the cache while DMA
+# writes it. verify() establishes both on each launch [verified-v2,
+# 2026-10-07a]; a failure is recorded, and the badge does not transfer.
 
 RING_RATE_HZ = 50000
 RING_DIV = ADC_CLOCK_HZ // RING_RATE_HZ - 1     # 959: 960 cycles a reading

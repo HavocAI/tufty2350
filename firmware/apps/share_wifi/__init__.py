@@ -1,71 +1,38 @@
-# The protocol transmits on the whole screen, at LORES, and nothing else is
-# drawn while it does: see "the whole screen, at LORES" below and "Screen as a
-# transmitter" in the protocol. Every screen with text is HIRES.
-
-# Share WiFi credentials between badges over the screen and light sensor.
+# Share WiFi credentials between badges over the backlight and light sensor.
 #
-# Protocol specification: .agents/docs/optical-data-transfer-protocol.md
-# API notes: .agents/docs/badgeware-api.md, .agents/docs/badgeware-hardware.md
+# Protocol specification: .agents/optical_data_transfer/spec.md
 #
-# Everything here is a per-frame state machine: transmitting means changing the
-# screen, which only happens when a frame is presented, so a blocking loop
-# would transmit nothing at all.
+# A per-frame state machine, but for the transfer loop, which runs a whole
+# transfer inside one update(): it transmits on the backlight alone, behind
+# a white screen drawn once, and reads the peer through the DMA ring
+# (sections 5 and 6 of the spec). Every screen with text is HIRES.
 
 import gc
 import json
 import os
 import time
+from array import array
 
-# wifi is NOT one of the injected globals -- it is modules/common/wifi.py in the
-# firmware, and the bundled apps import it like this. State, badge, screen and
-# the rest genuinely are builtins.
+# Not an injected global: a firmware module (modules/common/wifi.py).
 import wifi
 
-# Absolute, not relative: the launcher does sys.path.insert(0, app_dir) before
-# importing an app, on v2 and v3 alike, so sibling modules are plain top-level
-# imports. Named rather than `*`, so every name the app depends on is listed.
+# The launcher puts the app's folder on sys.path, so siblings are top-level.
 from protocol import (
-    ERR_CANCELLED, ERR_CONTRAST, ERR_CRC, ERR_DECODE, ERR_LOST_PEER,
-    BACKLIGHT_INDEX, ERR_NO_PEER, EXACT_LIT_INDEX, LEVEL_SCHEMES, LOW,
-    OK,
-    PHASE_ANNOUNCE, PHASE_DONE, PHASE_PRESENT,
-    SCHEME_BACKLIGHT, SCHEME_FIELDS, FlickerFilter, Levels,
-    Transfer, parse_payload,
+    BEACON_LOW_BACKLIGHT, LOW_BACKLIGHT, ERR_CANCELLED, ERR_CONTRAST, ERR_RING,
+    ERR_CRC, ERR_DECODE, ERR_LOST_PEER, ERR_NO_PEER, LEVEL_SCHEMES, OK,
+    PHASE_ANNOUNCE, PHASE_DONE, PHASE_LISTEN, Transfer,
 )
-
-# How a transfer reads the sensor: pure, like the protocol.
 import reader as readers
 
-# Dev Mode's measurement engine: pure, like the protocol, and imported the same
-# way. Its PHASE_DONE is not imported -- the protocol's has the same name.
-from measure import (
-    PHASE_ANSWERING, PHASE_CALLING, PHASE_MEASURING, PHASE_NOISE,
-    PHASE_SENDING, TOOL_MIRROR, TOOL_SECOND_BADGE, MirrorRun, SecondBadgeRun,
-    core_temp_c, merge_results, pages, tool_result,
-)
-
-# Dev Mode's frame timing probe: pure too, with the badge handed in as hooks.
-from probe import (
-    FAST_READS, STEP_TITLES, STEPS, TOOL_PROBE, FrameProbe, Hooks,
-    TimeStats, ring_listen,
-)
-
-# Dev Mode's room-flicker tool: pure, the sensor and clock handed in.
-from flicker import (
-    DRIFT_WINDOWS, TOOL_FLICKER, Capture, Drift, analyse, drift_hz,
-    summary,
-)
+# The dev link's modules load when it opens, never at launch: a transfer's
+# heap is smaller without them [measured-v2].
 
 badge.mode(HIRES | VSYNC)
 
 CONNECT_TIMEOUT_MS = 30000   # a UI deadline, not part of the wire protocol
 WIFI_PENDING = (0, 1, 2, 3)  # idle/connecting/connected/got-ip; anything else failed
 
-# During a transfer each symbol sets its own backlight (FIELD_BACKLIGHT, under
-# drawing): full throughout for the fields scheme, so the peer gets the widest
-# swing the hardware has, and per level for the backlight one. The firmware sets 230/255 at init
-# and nothing reads the light sensor to change it, so that is what "restore it
-# after" means -- there is no getter to read first.
+# What the firmware sets at init; there is no getter to read first.
 BACKLIGHT_NORMAL = 230 / 255
 
 ERROR_TEXT = {
@@ -75,7 +42,12 @@ ERROR_TEXT = {
     ERR_CRC: "Too many errors.\nHold the badges still.",
     ERR_DECODE: "Received data was invalid.",
     ERR_CANCELLED: "Cancelled.",
+    ERR_RING: "The light sensor stopped\nreading. Relaunch the app.",
 }
+
+NO_RING_TEXT = "This badge can't read its light\nsensor fast enough to transfer."
+# ... nor send a fast block: no divider gives its clock the common period.
+NO_FAST_TEXT = "This badge can't send\nfast blocks."
 
 # --- layout -----------------------------------------------------------------
 
@@ -84,9 +56,8 @@ LINE_HEIGHT = 16
 ALIGN_LINE = 2                  # px: the alignment screen's middle line
 
 
-# The named fonts are `font.<name>` on v3 and `rom_font.<name>` on v2 -- the
-# badge's firmware -- where `font` is the vector type and has none. Both are
-# probed by bare name; a missing font keeps the default rather than crashing.
+# `font.<name>` on v3, `rom_font.<name>` on v2, probed by bare name; a
+# missing font keeps the default.
 def pick_font(*names):
     spaces = []
     try:
@@ -110,34 +81,25 @@ if _font is not None:
     screen.font = _font
 
 
-
 # --- config file ------------------------------------------------------------
-# State takes a name, not a path, and puts it at /state/share_wifi.json.
-# Keys must survive a JSON round trip, so SSIDs that are not valid UTF-8 are
-# stored percent-escaped.
+# /state/share_wifi.json. SSIDs that are not valid UTF-8 are stored
+# percent-escaped, so keys survive a JSON round trip.
 
 CONFIG = "share_wifi"
 
-# 802.11 and WPA limits. These live here, not in the protocol: the protocol
-# carries a list of byte fields and has no opinion about what they mean.
+# 802.11 and WPA limits: the caller's, not the protocol's.
 SSID_MAX = 32
 KEY_MIN = 8
 KEY_MAX = 63
 PSK_LEN = 64
 
-# WEP keys are 5 or 13 characters, or the same written as 10 or 26 hex digits.
-# All four are outside the WPA range, so without knowing the security type a
-# WEP key looks like a corrupt WPA one.
+# WEP keys: 5 or 13 characters, or 10 or 26 hex digits -- all outside WPA's.
 WEP_LENGTHS = (5, 10, 13, 26)
 
-# Security types, as a credential's third field. The codes are the generic
-# MicroPython auth-mode numbering, NOT what WLAN.scan() returns on this badge --
-# that is a CYW43_AUTH_FLAG_* bitmask. 255 is this app's: a key whose network
-# type nobody recorded.
-#
-# The field exists because key length has no single answer -- 0 for open, 5 or
-# 13 for WEP, 8..63 for WPA -- and because an empty key is otherwise ambiguous
-# between "no password" and "password lost".
+# A credential's third field: MicroPython's generic auth numbering, NOT
+# WLAN.scan()'s CYW43_AUTH_FLAG_* bitmask. 255 is a key of unrecorded type.
+# The field exists because an empty key is otherwise ambiguous between "no
+# password" and "password lost".
 SEC_OPEN = 0
 SEC_WEP = 1
 SEC_WPA = 2
@@ -161,15 +123,11 @@ def security_name(security):
     return SECURITY_NAMES.get(security, "Unknown (%d)" % security)
 
 
-# Shown instead of attempting a join this firmware cannot make.
 WEP_UNSUPPORTED = "WEP networks not supported"
 
-
-# wifi.status() raised NameError from inside wifi.py on one badge, on a branch
-# only reached once a connection is live. Nothing here is load-bearing --
-# is_connected() decides success and CONNECT_TIMEOUT_MS decides failure -- so an
-# unreadable status is reported as STILL CONNECTING rather than as a failure,
-# which would abandon an attempt that may be about to succeed.
+# wifi.status() has raised NameError from inside wifi.py: an unreadable
+# status reads as still connecting, since is_connected() decides success and
+# CONNECT_TIMEOUT_MS failure.
 STATUS_UNREADABLE = "Wi-Fi status unavailable"
 
 
@@ -183,26 +141,11 @@ def wifi_status():
 
 
 def wep_supported():
-    """Whether this firmware can select WEP when joining a network.
-
-    Probed, not hardcoded. Today it is always False, and the reason is in the
-    radio driver rather than in anything above it: `cyw43_ll_wifi_join()`
-    accepts Open, WPA-TKIP, WPA2-AES, WPA2-mixed and the two WPA3 modes, and
-    returns -CYW43_EINVAL for anything else before it issues a single ioctl.
-    There is no code in that driver to install a WEP key either -- it only ever
-    writes `wsec_pmk`, which is the WPA passphrase path.
-
-    The constant is the signal because it is the only part of this that is
-    visible from Python: `network.WLAN` exports SEC_OPEN, SEC_WPA_WPA2,
-    SEC_WPA3 and SEC_WPA2_WPA3, and no SEC_WEP, because there is nothing behind
-    it. A firmware that gained WEP would export it alongside the rest.
-
-    If this ever returns True, one more thing is needed before a join will
-    work: `wifi.connect()` passes no `security=` to `wlan.connect()`, so WEP
-    would have to go through `network.WLAN` directly. That is the point to wire
-    it, and it is why this gates the attempt rather than pretending the
-    ordinary path would carry it.
-    """
+    """Whether this firmware can join a WEP network. Probed: the cyw43
+    driver refuses WEP before touching the radio, and network.WLAN exports
+    no SEC_WEP. A firmware that gained it would export it -- and would then
+    need a join through network.WLAN, since wifi.connect() passes no
+    security=."""
     try:
         from network import WLAN
     except ImportError:
@@ -213,12 +156,9 @@ def wep_supported():
 def valid_key(key, security):
     """Whether `key` is a usable key for a network of this type."""
     if security == SEC_OPEN:
-        return len(key) == 0        # there is no key, and a key would be wrong
+        return len(key) == 0
     if security == SEC_ENTERPRISE:
-        # Needs an identity and usually a certificate, neither of which is a
-        # passphrase and neither of which this carries. Better to refuse than
-        # to deliver something that cannot connect.
-        return False
+        return False        # needs an identity and a certificate, not a key
     if len(key) == 0:
         return False
     if security == SEC_WEP:
@@ -227,11 +167,8 @@ def valid_key(key, security):
 
 
 def valid_credential(fields):
-    """A received payload as (ssid, key, security), or None.
-
-    Two fields is what a badge sent before there was a security field; the type
-    is inferred rather than the credential refused.
-    """
+    """A received payload as (ssid, key, security), or None. Two fields:
+    the type is inferred."""
     if fields is None or len(fields) not in (2, 3):
         return None
     ssid = fields[0]
@@ -261,10 +198,8 @@ def credential_fields(ssid_bytes, key_text, security):
 
 
 def escape_ssid(raw):
-    # A leading "%" marks a hex-escaped SSID, so an SSID that genuinely starts
-    # with "%" has to be escaped too even though it is valid UTF-8. Otherwise
-    # the SSID "%41" is stored verbatim and read back as b"A" -- a different
-    # network, silently. A "%" anywhere else is unambiguous and kept as is.
+    # A leading "%" marks a hex-escaped SSID, so one that starts with "%" is
+    # escaped too, or "%41" would read back as b"A".
     try:
         text = raw.decode("utf-8")
     except (UnicodeError, AttributeError):
@@ -283,17 +218,11 @@ def unescape_ssid(text):
             raise ValueError("odd length")
         return bytes(int(body[i:i + 2], 16) for i in range(0, len(body), 2))
     except ValueError:
-        # Not something we wrote. Better a wrong name than a crash on the
-        # screen that lists saved networks.
-        return text.encode("utf-8")
+        return text.encode("utf-8")     # not ours: a wrong name, not a crash
 
 
 def radio_ssid(name):
-    """The SSID to hand the radio, from the name the config file is keyed by.
-
-    Only the radio wants the original octets; everything else uses the escaped
-    name. An ordinary SSID round trips to the identical string.
-    """
+    """The SSID to hand the radio, from the name the config file is keyed by."""
     raw = unescape_ssid(name)
     try:
         return raw.decode("utf-8")
@@ -302,12 +231,8 @@ def radio_ssid(name):
 
 
 def load_state(name):
-    """`name`'s state file as a dict, {} when missing, unreadable or not a dict.
-
-    State.load() returns a bool and fills the dict it was handed, whatever the
-    prose says; taking the return value when it happens to be a dict costs one
-    comparison and covers a build that does.
-    """
+    """`name`'s state file as a dict, {} when missing, unreadable or not a
+    dict. State.load() fills the dict it is handed and returns a bool."""
     loaded = {}
     try:
         returned = State.load(name, loaded)
@@ -327,12 +252,9 @@ def load_networks():
 
 
 def stored_entry(entry):
-    """One stored value as (key, security).
-
-    A bare string is what earlier versions wrote; infer its type rather than
-    dropping the network. Anything else is treated as a missing key, so a
-    hand-edited config cannot stop the app listing the rest.
-    """
+    """One stored value as (key, security). A bare string has its type
+    inferred; anything else is a missing key, so a hand-edited config
+    cannot stop the app listing the rest."""
     if isinstance(entry, dict):
         key = entry.get("key", "")
         security = entry.get("security", SEC_UNKNOWN)
@@ -349,25 +271,19 @@ def stored_entry(entry):
 
 
 def save_network(ssid_bytes, key_bytes, security):
-    # modify() merges. save() would replace the object and drop every other
-    # network. Called once, after a transfer verifies -- never per frame.
+    # modify() merges; save() would drop every other network.
     State.modify(CONFIG, {escape_ssid(ssid_bytes): {
         "key": key_bytes.decode("utf-8"), "security": security}})
 
 
 # --- this badge's own network -----------------------------------------------
-# `secrets` is the only place a key exists in readable form: the CYW43 driver's
-# config() has no getter for a station PSK, so the network a badge is currently
-# on cannot be recovered -- only the one it was provisioned with.
+# `secrets` is the only readable copy of a key: the CYW43 driver's config()
+# has no getter for a station PSK.
 
 
 def this_badge_credential():
-    """This badge's own network as (ssid, key, security), or None.
-
-    Imported here and guarded so a badge with neither /secrets.py nor
-    /system/secrets.py loses the feature instead of failing to launch. Not
-    secrets.require(), which reports a missing key by calling fatal_error().
-    """
+    """This badge's own network as (ssid, key, security), or None. Not
+    secrets.require(), which reports a missing key with fatal_error()."""
     try:
         import secrets
     except ImportError:
@@ -375,24 +291,15 @@ def this_badge_credential():
     ssid = getattr(secrets, "WIFI_SSID", "") or ""
     key = getattr(secrets, "WIFI_PASSWORD", "") or ""
     if not ssid:
-        return None                 # an unprovisioned badge: both are ""
-    # secrets.py records no security type, so infer one: no password means an
-    # open network, and with a password we genuinely do not know which kind.
+        return None
     security = SEC_OPEN if not key else SEC_UNKNOWN
-    # Through the same gate a received credential goes through, so a key too
-    # short for its network type is rejected here rather than being saved and
-    # then refused at the far end.
     return valid_credential(credential_fields(ssid.encode("utf-8"), key,
                                               security))
 
 
 def seed_own_network(networks):
     """Add this badge's own network to `networks` and the config file, once.
-
-    A name already in the file wins: it may have been received from another
-    badge or corrected by hand, and overwriting it every launch would undo that
-    and cost a flash write to do it.
-    """
+    A name already in the file wins: it may have been corrected by hand."""
     credential = this_badge_credential()
     if credential is None:
         return False
@@ -400,158 +307,37 @@ def seed_own_network(networks):
     name = escape_ssid(ssid)
     if name in networks:
         return False
-    save_network(ssid, key, security)       # the one flash write this can do
-    networks[name] = (key.decode("utf-8"), security)    # known to decode
+    save_network(ssid, key, security)
+    networks[name] = (key.decode("utf-8"), security)
     return True
 
 
-# --- light sampling ---------------------------------------------------------
+# --- the reader ---------------------------------------------------------------
+# The DMA ring (fastadc.Ring under reader.RingReader), made once a launch on
+# the first transfer -- verify() takes ~0.4 s -- with the reason it was
+# refused kept: a badge without it does not transfer.
 
-def sample_light():
-    # Median of three immediate reads. light_level() is a raw ADC read, so this
-    # costs almost nothing and takes the edge off single-sample noise.
-    a = badge.light_level()
-    b = badge.light_level()
-    c = badge.light_level()
-    if a > b:
-        a, b = b, a
-    if b > c:
-        b = c if c > a else a
-    return b
-
-
-def dark_mirror_levels():
-    # The dark mirror run's black, middle and white, in counts.
-    levels = Levels()
-    levels.fit(32, 64, 112)
-    return levels
-
-
-def probe_replay():
-    """Dev Mode M7: a POLLED Follower's late replay of the staircase it read
-    -- every kept sample corrected and pooled again -- timed on a full
-    buffer of a dark staircase in a room flickering 12 counts at 120 Hz,
-    after a fit of it. The simulator charges REPLAY_MS_PER_SAMPLE for it."""
-    import math
-    transfer = Transfer(False)
-    transfer.phase_started = 0
-    level = (32, 64, 112)
-    n = len(transfer.fit_t)
-    for i in range(n):
-        us = i * 2000
-        step = (us // 40000) % 3 if 400000 <= us < 760000 else 0
-        transfer.fit_t[i] = us + 1000
-        transfer.fit_v[i] = level[step] + int(
-            12 * math.sin(2 * math.pi * 120 * us / 1000000.0))
-        transfer.fit_s[i] = 2000
-        transfer.fit_ms[i] = us // 1000
-    transfer.fit_n = n
-    transfer.fit_flicker(100, 300000)
-    gc.collect()
-    t = time.ticks_us()
-    transfer.replay_staircase()
-    return {"us": time.ticks_diff(time.ticks_us(), t),
-            "samples": transfer.replayed}
-
-
-def probe_listener(reader, index=BACKLIGHT_INDEX):
-    """A Follower in the data phase on rung `index`, listening for a block
-    through `reader` -- started here -- with the dark mirror run's levels.
-    What it hears is thrown away: callers reset its budgets each pass."""
-    reader.start()
-    transfer = Transfer(False, reader=reader)
-    transfer.levels = dark_mirror_levels()
-    transfer.scheme = SCHEME_BACKLIGHT
-    transfer.start_data(0, index)
-    return transfer
-
-
-def listen_pass(transfer):
-    """One pass of the transfer loop, listening: wait for what is due, then
-    the protocol's work, with nobody sending -- so its budgets are reset."""
-    reader = transfer.reader
-    reader.pump(transfer.due_us())
-    t = reader.now_us()
-    transfer.field_at(t)
-    transfer.work(t)
-    transfer.idle_slots = 0
-    transfer.stall_slots = 0
-
-
-class TimedListener:
-    """A probe listener driven as the transfer loop drives it, with the
-    protocol's work and its parts timed by timing the listener's own
-    methods."""
-
-    def __init__(self, transfer):
-        self.transfer = transfer
-        self.parts = {}
-        self.passes = 0
-        self.slots = 0
-        for name in ("work", "window_value", "decide_slot", "data_field"):
-            self.parts[name] = TimeStats()
-            # An instance attribute is found before the class's method.
-            setattr(transfer, name, self.timed(getattr(transfer, name),
-                                               self.parts[name]))
-
-    @staticmethod
-    def timed(method, stats):
-        def call(*args):
-            t = time.ticks_us()
-            out = method(*args)
-            stats.add(time.ticks_diff(time.ticks_us(), t))
-            return out
-        return call
-
-    def step(self):
-        listen_pass(self.transfer)
-        self.passes += 1
-        self.slots += self.transfer.work_slots
-
-    def result(self):
-        transfer = self.transfer
-        out = {}
-        for name in self.parts:
-            out[name] = self.parts[name].rate()
-        out["passes"] = self.passes
-        out["slots"] = self.slots
-        out["phase"] = transfer.phase
-        out["flicker"] = round(transfer.flicker.size(), 1)
-        out["exact"] = transfer.exact
-        return out
-
-
-# --- the readers --------------------------------------------------------------
-# A transfer reads the sensor through a reader (reader.py): the DMA ring
-# (fastadc.Ring) where this firmware has one that works, else light_level()
-# polled. Both made once per launch, the ring on the first transfer -- its
-# verify() takes ~0.4 s -- and the reason it was refused kept.
-
-RING_ENABLED = True
 _READERS = {}
 
 
 def ring_reader():
-    """The EXACT reader, or None; `ring_note()` says why not. Tried once."""
+    """The reader, or None; `ring_note()` says why not. Tried once."""
     if "ring" not in _READERS:
         _READERS["ring"] = None
         _READERS["note"] = None
-        if not RING_ENABLED:
-            _READERS["note"] = "disabled"
-        else:
-            try:
-                import fastadc
-                problem = fastadc.check(badge.light_level)
-                ring = None
-                if problem is None:
-                    ring = fastadc.Ring()
-                    problem = ring.verify(readers)
-                if problem is None:
-                    _READERS["ring"] = readers.RingReader(ring)
-                else:
-                    _READERS["note"] = problem
-            except Exception as error:     # noqa: BLE001 - every refusal is POLLED
-                _READERS["note"] = "%s: %s" % (type(error).__name__, error)
+        try:
+            import fastadc
+            problem = fastadc.check(badge.light_level)
+            ring = None
+            if problem is None:
+                ring = fastadc.Ring()
+                problem = ring.verify(readers)
+            if problem is None:
+                _READERS["ring"] = readers.RingReader(ring)
+            else:
+                _READERS["note"] = problem
+        except Exception as error:     # noqa: BLE001 - every refusal is reported
+            _READERS["note"] = "%s: %s" % (type(error).__name__, error)
     return _READERS["ring"]
 
 
@@ -560,70 +346,121 @@ def ring_note():
     return _READERS["note"]
 
 
-def polled_reader():
-    """The POLLED reader: light_level() into bins. Made once per launch."""
-    if "polled" not in _READERS:
-        _READERS["polled"] = readers.PolledReader(badge.light_level)
-    return _READERS["polled"]
+# --- the fast block ----------------------------------------------------------
+# A burst goes out through a DMA channel paced by the backlight's PWM wrap
+# (fasttx.Pacer), at a period every clock reaches (fastblock.common_div());
+# fastblock.Decoder decodes one. Made once a launch. A badge whose clock no
+# divider reaches still receives, but cannot share.
+
+_FAST = {}
 
 
-def transfer_reader():
-    return ring_reader() or polled_reader()
+def fast_module():
+    """fastblock, or None if it does not import."""
+    if "module" not in _FAST:
+        try:
+            import fastblock
+            _FAST["module"] = fastblock
+        except Exception:   # noqa: BLE001 - then no transfer
+            _FAST["module"] = None
+    return _FAST["module"]
+
+
+def fast_pacer():
+    """(pacer, div16, words) for sending bursts, or None: tried once."""
+    if "pacer" not in _FAST:
+        _FAST["pacer"] = None
+        fb = fast_module()
+        try:
+            import machine
+            import rp2
+            import fasttx
+            div16 = fb.common_div(machine.freq())[0] if fb else None
+            if div16 is not None:
+                most = 0
+                for periods in fb.RUNGS:
+                    symbols = fb.PREAMBLE_LEN + fb.TAIL + fb.stuffed_len(
+                        fb.HEADER + fb.block_bytes(periods) + fb.CRC)
+                    most = max(most, periods * symbols + 1)
+                words = array("I", bytes(4 * most))
+                _FAST["pacer"] = (fasttx.Pacer(machine.mem32, rp2.DMA()),
+                                  div16, words)
+        except Exception:   # noqa: BLE001 - then it cannot share
+            _FAST["pacer"] = None
+    return _FAST["pacer"]
+
+
+def fast_for(leader):
+    """The fast block's module for a transfer, or None if this badge cannot
+    take part: a Leader needs the pacer too, a Follower only the decoder."""
+    fb = fast_module()
+    if fb is None or leader and fast_pacer() is None:
+        return None
+    return fb
+
+
+# A burst's words are filled during the lead-in's low slots, where a pass
+# held up changes nothing shown, and it is played from BURST_LEAD_US before
+# its start, pump() waiting to the start.
+BURST_LEAD_US = 2000
+
+
+def fill_burst(burst):
+    """The burst's CC words, once: low and high read from the firmware's
+    own backlight curve, the first time inside an open pacer."""
+    if _FAST.get("filled") is burst:
+        return
+    fb = fast_module()
+    pacer, div16, words = fast_pacer()
+    if "low" not in _FAST:
+        with pacer.opened(div16):
+            _FAST["low"] = pacer.word(pacer.cc_for(display.backlight,
+                                                   LOW_BACKLIGHT))
+            _FAST["high"] = pacer.word(pacer.cc_for(display.backlight, 1.0))
+    _FAST["n"] = fb.fill_words(words, burst[1], burst[2], _FAST["low"],
+                               _FAST["high"])
+    _FAST["filled"] = burst
+
+
+def play_burst(transfer, burst):
+    """Leader: the burst, from its start, through the pacer; the ring reads
+    through it, and the pacer puts DIV and CC back after."""
+    fill_burst(burst)
+    pacer, div16, words = fast_pacer()
+    reader = transfer.reader
+    reader.pump(burst[0])
+    transfer.burst_started(reader.now_us())
+    pacer.transmit(div16, words, _FAST["n"])
 
 
 def on_exit():
     """HOME: the launcher calls this, then resets the badge. A raise here
-    would skip the reset and leave HOME dead, so nothing escapes."""
+    would skip the reset, so nothing escapes."""
     try:
         ring = _READERS.get("ring")
         if ring is not None:
             ring.stop()
     except Exception:   # noqa: BLE001 - HOME must still reset
         pass
+    try:
+        port = app.link_port
+        if port is not None:
+            port.close()
+    except Exception:   # noqa: BLE001 - HOME must still reset
+        pass
+    try:
+        sending = _FAST.get("pacer")
+        if sending is not None:
+            sending[0].release()
+    except Exception:   # noqa: BLE001 - HOME must still reset
+        pass
 
 
 # --- drawing ----------------------------------------------------------------
 
-FIELD_COLOR = {}        # scheme -> {symbol: pen}
-FIELD_BACKLIGHT = {}    # scheme -> {symbol: display.backlight() value}
-
-
-# A transmitted field's "black" and "white" are the panel's full range, not
-# the palette's: on the Tufty `color.black` and `color.white` are tinted --
-# rgb(20, 30, 40) and rgb(222, 238, 214), from the TUFTY=1 build -- which
-# gives away part of the swing the peer's sensor sees. Menus and text keep the
-# palette.
-FIELD_BLACK = (0, 0, 0)
-FIELD_WHITE = (255, 255, 255)
-
-
-def field_pen(pixels):
-    if pixels == "white":
-        pixels = FIELD_WHITE
-    elif pixels == "black":
-        pixels = FIELD_BLACK
-    return color.rgb(pixels[0], pixels[1], pixels[2])
-
-
-def field_colors():
-    # Every scheme, once, so that switching mid-transfer allocates nothing.
-    # One pen per pixel value, shared: show_full() compares pens by identity,
-    # so symbols with the same pixels -- all three of the backlight scheme's
-    # -- change only the backlight and never refill the screen.
-    pens = {}
-    for scheme in LEVEL_SCHEMES:
-        levels = LEVEL_SCHEMES[scheme]
-        FIELD_COLOR[scheme] = {}
-        FIELD_BACKLIGHT[scheme] = {}
-        for symbol in levels:
-            pixels, light = levels[symbol]
-            if pixels not in pens:
-                pens[pixels] = field_pen(pixels)
-            FIELD_COLOR[scheme][symbol] = pens[pixels]
-            FIELD_BACKLIGHT[scheme][symbol] = light
-
-
-field_colors()
+# The panel's full white: `color.white` is tinted on the Tufty, which would
+# dim what the peer sees. Made once; _SHOWN compares it by identity.
+WHITE_PEN = color.rgb(255, 255, 255)
 
 
 def fill(pen):
@@ -632,14 +469,8 @@ def fill(pen):
     screen.clear()
 
 
-# The alignment constants exist, but an injected global lives in `builtins` and
-# not in the app's namespace -- so `globals().get("CENTER")` reads None whether
-# the badge has it or not, and so does getattr(builtins, ...). Naming it and
-# catching NameError is the only probe that works.
-#
-# `overflow=ELLIPSES` is deliberately unused: it truncates by WORD, so a
-# one-line box holding a long hyphenated SSID comes out as "..." and nothing
-# else. fit() truncates by character and keeps the start of the name.
+# An injected global lives in `builtins`, so only naming it finds it. Not
+# overflow=ELLIPSES: it truncates by word, and a long SSID becomes "...".
 try:
     #         (left, top)   (left, middle)  (centre, top)  (centre, middle)
     _ALIGN = ((LEFT, TOP), (LEFT, MIDDLE), (CENTER, TOP), (CENTER, MIDDLE))
@@ -655,112 +486,22 @@ def body_box():
             screen.height - 2 * MARGIN - LINE_HEIGHT)
 
 
-def draw_bands(pen):
-    """Dev Mode's handshake screen: black, with `pen` in a band down each
-    edge, a quarter of the screen wide, and its status between them.
-
-    The one screen that shows a field and text together. Two bands rather
-    than one half because the sensor is not central: it sits about 1mm
-    outside the RIGHT edge at mid height and reads a patch near itself, and
-    two badges facing each other are mirrored, so one band would be a bet on
-    how they are held. Hard to the screen edges, where the pixels couple
-    best. The text column is drawn on black and must not animate: a sensor
-    whose patch straddles a band edge picks some of it up. Transfers and
-    tests used this layout too, until it measured at three 60 Hz refreshes a
-    frame; they now fill the whole screen.
-    """
-    fill(color.black)
-    band = screen.width // 4
-    screen.pen = pen
-    screen.rectangle(0, 0, band, screen.height)
-    screen.rectangle(screen.width - band, 0, band, screen.height)
-
-
-def text_column():
-    """The middle, between draw_bands()' two bands and inside its margins."""
-    band = screen.width // 4
-    return (band + MARGIN, MARGIN, screen.width - 2 * band - 2 * MARGIN,
-            screen.height - 2 * MARGIN)
-
-
-# --- signalling: the whole screen, at LORES ---------------------------------
-# While a field is transmitted -- a transfer, or one of Dev Mode's tests -- the
-# whole screen is the field, at LORES, and nothing else is drawn. Measured on
-# the badge (v2 firmware, BW-1.27.0, 60 Hz panel): one HIRES fill costs
-# 11.4 ms, run() does one before update() is even called, and a frame that
-# drew two bands and a column of text took 50 ms -- three refreshes. At LORES
-# a fill is a quarter of the pixels. run()'s own clear is switched off
-# (default_clear None) and the field is drawn only when it changes, since the
-# framebuffer keeps it: a frame that changes nothing costs the protocol's own
-# work and the present. See "Screen as a transmitter" in the protocol.
-SIGNAL_MODE = LORES | VSYNC
-TEXT_MODE = HIRES | VSYNC
-
-# What is on screen while signalling: the pen and the backlight, or None to
-# force the next show to draw.
+# What is on screen: the pen and the backlight, or None to force the next
+# show to draw.
 _SHOWN = [None, None]
 
 
-def begin_signalling():
-    badge.mode(SIGNAL_MODE)
-    badge.default_clear = None
-    # Neither the pixels nor the backlight are known after a mode change and
-    # whatever set the backlight since: both are drawn afresh.
-    _SHOWN[0] = None
-    _SHOWN[1] = None
-
-
-def end_signalling():
-    """Back to HIRES text screens. The caller restores the backlight."""
-    badge.mode(TEXT_MODE)
-    badge.default_clear = color.black
-    _SHOWN[0] = None
-    _SHOWN[1] = None
-
-
-def show_full(pen, backlight):
-    """The whole screen in `pen` at `backlight`, each set only if it changed.
-    True if the pixels changed, which only a present will show.
-
-    The backlight scheme's symbols share one pen, so a change between them is
-    a display.backlight() call and no fill: the framebuffer already holds the
-    pixels, as run()'s clear is off while signalling.
-    """
-    if _SHOWN[1] != backlight:
-        display.backlight(backlight)
-        _SHOWN[1] = backlight
-    if _SHOWN[0] is pen:
-        return False
-    fill(pen)
-    _SHOWN[0] = pen
-    return True
-
-
 def show_backlight(backlight):
-    """Only the backlight, which needs no present: the PWM duty is live at
-    once. The pixels stay as show_full() last drew them."""
+    """Only the backlight, which needs no present: the PWM duty is live."""
     display.backlight(backlight)
     _SHOWN[1] = backlight
 
 
-def show_field(field, scheme=SCHEME_FIELDS):
-    """Transmit `field`, in `scheme`, on the whole screen."""
-    show_full(FIELD_COLOR[scheme].get(field, color.black),
-              FIELD_BACKLIGHT[scheme].get(field, 1.0))
-
-
 # --- text layout ------------------------------------------------------------
-# The app breaks text into lines itself rather than leaving it to
-# screen.text(text, rect): that wraps and CLIPS to the rect, silently dropping
-# lines that do not fit, and the badge's firmware is older than the source the
-# wrapping was read from, so whether it wraps at all is not something to lean
-# on. Lines are handed over already broken with "\n" and already short enough.
-#
-# A space is counted at the wider of its two widths. measure_text() gives one
-# a third of the font's glyph width (3 px in `smart`); wrapped layout gives one
-# a third of the font's height (5.3 px). A line measured the narrow way can be
-# wrapped again by the firmware -- which is how a one-line "fit" string came to
-# lose its second half.
+# The app breaks lines itself: screen.text(text, rect) clips lines that do
+# not fit, and whether v2 wraps at all is not to be leaned on. A space is
+# counted at the wider of measure_text()'s and the wrapped layout's widths,
+# or the firmware may wrap a line measured to fit.
 _SPACE = [0]
 
 
@@ -783,13 +524,10 @@ def text_width(text):
 
 
 def wrap_lines(text, width):
-    """`text` broken into lines no wider than `width`, at spaces where it can.
-
-    Runs of spaces are kept: the help lines use them as gaps, and the firmware
-    draws every one. A line break swallows the spaces it falls on. A word wider
-    than the box on its own -- an SSID with no spaces -- is broken between
-    characters rather than left to be clipped.
-    """
+    """`text` broken into lines no wider than `width`, at spaces where it
+    can. Runs of spaces are kept (help lines use them as gaps); a break
+    swallows the spaces it falls on; a word wider than the box is broken
+    between characters."""
     lines = []
     space = space_width()
     for hard in str(text).split("\n"):
@@ -804,7 +542,6 @@ def wrap_lines(text, width):
                 gap += 1        # the space that split() consumed
             w = screen.measure_text(word)[0]
             while w > width and len(word) > 1:
-                # As many characters as fit, on a line of their own.
                 cut = len(word) - 1
                 while cut > 1 and screen.measure_text(word[:cut])[0] > width:
                     cut -= 1
@@ -828,7 +565,7 @@ def wrap_lines(text, width):
     return lines
 
 
-# draw_text() is called every frame, so a layout is kept rather than redone.
+# draw_text() runs every frame, so a layout is kept rather than redone.
 _LAYOUTS = {}
 
 
@@ -865,14 +602,11 @@ def fit(text, width):
 def draw_text(text, box, center=False, middle=False):
     """Draw `text` inside `box`, an (x, y, w, h) tuple."""
     x, y, width, height = box
-    # Broken into lines that fit, here, whichever path draws them: see
-    # layout_text(). A box one line high gets one line, cut with "...".
     text = layout_text(text, width, height)
     if _HAS_ALIGN:
         screen.text(text, rect(x, y, width, height),
                     align=_ALIGN[(2 if center else 0) + (1 if middle else 0)])
         return
-    # No align: place each line ourselves, centred if asked.
     lines = text.split("\n")
     if middle:
         y += max(0, (height - len(lines) * LINE_HEIGHT) // 2)
@@ -886,11 +620,8 @@ def draw_text(text, box, center=False, middle=False):
 
 def draw_alignment(text, title=None):
     """A vertical line down the middle, and `text` on the half away from the
-    light sensor -- which sits beside the RIGHT edge, so the left half.
-
-    The other badge's edge is held on the line, putting its screen over this
-    one's sensor rather than its bezel beside it. See optical-coupling.md.
-    """
+    light sensor, which sits beside the RIGHT edge. The other badge's edge is
+    held on the line, putting its screen over this one's sensor."""
     fill(color.black)
     middle = screen.width // 2
     screen.pen = color.white
@@ -911,8 +642,7 @@ def draw_help(text):
 
 
 def draw_title(text, reserve=0):
-    """The title, centred. `reserve` keeps that many pixels clear at each end,
-    for a page number on the right, without moving the centre."""
+    """The title, centred, `reserve` pixels kept clear at each end."""
     screen.pen = color.white
     draw_text(text, (MARGIN + reserve, MARGIN,
                      screen.width - 2 * MARGIN - 2 * reserve, LINE_HEIGHT),
@@ -934,21 +664,17 @@ def draw_screen(title, body, help_text=None, pen=None):
 
 
 def menu_top():
-    """Where a list's first row goes: one line below the title."""
     return MARGIN + LINE_HEIGHT + MARGIN
 
 
 def menu_rows():
-    """How many rows fit between the title and the help line: 12 at 320x240.
-
-    Read from the screen every time, since badge.mode() can change its size.
-    """
+    """Rows between the title and the help line, read from the screen
+    every time, since badge.mode() can change its size."""
     help_top = screen.height - LINE_HEIGHT - MARGIN // 2
     return max(1, (help_top - menu_top()) // LINE_HEIGHT)
 
 
-# "n/N" strings for paged titles, built once per distinct page rather than per
-# frame.
+# "n/N" strings for paged titles, built once per page rather than per frame.
 _PAGE_LABELS = {}
 
 
@@ -972,12 +698,8 @@ def draw_paged_title(title, label, label_width):
 
 
 def draw_menu(title, items, cursor, help_text, empty="Nothing here"):
-    """A list, paged when it has more rows than fit.
-
-    The page is derived from the cursor, so moving one row past a page edge
-    shows the adjacent page, and wrapping end <-> start shows the last or
-    first page, with nothing extra to keep in step.
-    """
+    """A list, paged when it has more rows than fit; the page follows from
+    the cursor."""
     fill(color.black)
     count = len(items)
     rows = menu_rows()
@@ -994,7 +716,6 @@ def draw_menu(title, items, cursor, help_text, empty="Nothing here"):
         y = menu_top()
         width = screen.width - 2 * MARGIN
         first = page * rows
-        # A range rather than a slice, so drawing a page copies nothing.
         for i in range(first, min(first + rows, count)):
             screen.pen = color.white if i == cursor else color.smoke
             draw_text(("> " if i == cursor else "  ") + items[i],
@@ -1004,8 +725,7 @@ def draw_menu(title, items, cursor, help_text, empty="Nothing here"):
 
 
 def move_cursor(cursor, count):
-    # Up and down move one row and wrap at both ends. Paging follows from the
-    # cursor in draw_menu(), so it needs nothing here.
+    """Up and down move one row, wrapping at both ends."""
     if count == 0:
         return 0
     if badge.pressed(BUTTON_UP):
@@ -1015,20 +735,17 @@ def move_cursor(cursor, count):
     return cursor
 
 
-# Progress goes to the rear LEDs, because during a transfer both screens face
-# away from their users.
-# Passes one update() may make while a transfer runs; 0 is no limit. The
-# transfer loop otherwise returns to run() only to present a change of
-# pixels or when the transfer ends. A test stepping one field a frame sets 1.
+# Passes one update() may make while a transfer runs; 0 is no limit -- the
+# loop returns to run() only when the transfer ends. A test sets 1.
 TRANSFER_PASSES = 0
 # How often the loop polls the buttons, which also keeps badge.ticks moving.
 POLL_MS = 50
 
 
 def transfer_lights(transfer):
-    # Both screens face away from their users, so the case lights say what is
-    # happening.
-    caselights_for("searching" if transfer.phase in (PHASE_ANNOUNCE, PHASE_PRESENT)
+    # Both screens face away from their users, so the case lights say what
+    # is happening.
+    caselights_for("searching" if transfer.phase in (PHASE_ANNOUNCE, PHASE_LISTEN)
                    else "busy")
 
 
@@ -1041,21 +758,35 @@ def caselights_for(state):
     elif state == "error":
         phase = (badge.ticks // 120) % 2
         badge.caselights(1.0 if phase else 0.0)
-    elif state == "attention":
-        # A measurement screen waiting for the user, who is holding the badge
-        # screen-first against a mirror or another badge and cannot see it.
-        # Slower than the error blink, which means a transfer failed.
-        phase = (badge.ticks // 250) % 2
-        badge.caselights(1.0 if phase else 0.0)
     else:
         badge.caselights(0.0)
 
 
+# --- the transfer screen -----------------------------------------------------
+# White, drawn once and presented before the reader starts; every symbol is
+# then a display.backlight() call, and run()'s clear is off until it ends.
+
+def begin_transfer_screen():
+    badge.default_clear = None
+    # The backlight off first, so the white is written unseen.
+    show_backlight(BEACON_LOW_BACKLIGHT)
+    fill(WHITE_PEN)
+    _SHOWN[0] = WHITE_PEN
+    display.update()
+
+
+def show_level(backlight):
+    """A symbol: the backlight, set only if it changed."""
+    if _SHOWN[1] != backlight:
+        show_backlight(backlight)
+
+
 def restore_panel():
-    """HIRES, backlight back to normal and case lights off, leaving a
-    measuring screen."""
-    end_signalling()
-    display.backlight(BACKLIGHT_NORMAL)
+    """Text screens again: run()'s clear back, the backlight back to normal
+    and the case lights off."""
+    badge.default_clear = color.black
+    _SHOWN[0] = None
+    show_backlight(BACKLIGHT_NORMAL)
     badge.caselights(0.0)
 
 
@@ -1072,87 +803,40 @@ ALIGN = "align"                 # the line to hold the other badge's edge on
 ALIGN_TEXT = "Align edge of badge with line. A to continue"
 MENU_ITEMS = ("Share", "Receive", "Connect")
 DEV_MODE = "Dev Mode"           # appended to the main menu by C; never saved
+DEV_HOLD_MS = 5000              # how long C is held to reveal it
 
 DEV = "dev"
-DEV_ITEMS = ("measure screen w/ mirror", "measure screen w/ 2nd badge",
-             "probe frame timing", "measure room flicker",
-             "display measurements", "clear saved measurements")
-TOOL_CLEAR = "clear"            # not a tool: where Done returns the cursor
-DISPLAY_INDEX = 4
-CLEAR_INDEX = 5
-TOOL_INDEX = {TOOL_MIRROR: 0, TOOL_SECOND_BADGE: 1, TOOL_PROBE: 2,
-              TOOL_FLICKER: 3, TOOL_CLEAR: CLEAR_INDEX}
-DEV_ROLE = "dev_role"           # 2nd badge: who goes first
-DEV_PROMPT = "dev_prompt"       # Dark room / Bright room
-DEV_MEASURE = "dev_measure"     # the 3 s delay, then one condition's run
-DEV_SAVED = "dev_saved"         # Done
-DEV_DISPLAY = "dev_display"     # display measurements
-DEV_PROBE_PROMPT = "dev_probe_prompt"   # probe frame timing: what it does
-DEV_PROBE = "dev_probe"                 # probe frame timing: running
-DEV_FLICKER = "dev_flicker"             # measure room flicker
-DEV_FLICKER_DRIFT = "dev_flicker_drift"  # ... its drift windows, screen dark
-FLICKER_TITLE = "Room flicker"
-FLICKER_HELP = "A - Measure   B - Save & exit"
-# What a measurement takes, said before the screen goes dark: the capture and
-# its analysis, a second or two, then DRIFT_WINDOWS windows of 250 ms, each
-# with its phase worked out and a frame presented -- about 0.3 s a window on
-# the 60 Hz badge [inferred-v2], so about 25 s, said as 30 for the margin.
-FLICKER_MEASURING = ("Measuring for about 30 s - hold still. The screen "
-                     "goes dark; hold B to stop.")
-CLEARED = "Measurements cleared"
+DEV_ITEMS = ("Display Saved Measurements", "Clear Saved Measurements",
+             "USB Dev Link")
+DISPLAY_INDEX = 0
+CLEAR_INDEX = 1
+LINK_INDEX = 2
+DEV_DISPLAY = "dev_display"
+DEV_DONE = "dev_done"
+DEV_RUNNING = "Starts in 3 s. Hold B to cancel between steps."
+MEASURE_DELAY_MS = 3000
+DEV_LINK = "dev_link"
+LINK_TITLE = "USB dev link"
+LINK_ROOT = "/devtests"         # subtools, on the writable LittleFS
+CLEARED = "Measurements and dev tools cleared"
 
-# --- dev mode ----------------------------------------------------------------
-# /state/measurements.json, one object per tool. Written once, when a run ends.
+# /state/measurements.json: one object per tool, written by the dev link's
+# subtools (Api.save()).
 MEASUREMENTS = "measurements"
 MEASUREMENTS_PATH = "/state/%s.json" % MEASUREMENTS
-MEASURE_DELAY_MS = 3000         # after A, so the hand pressing it can get clear
 
-CONDITION_TITLES = {"dark": "Dark room", "lit": "Bright room"}
-CONDITION_LABELS = {"dark": "Dark", "lit": "Bright"}     # "Dark 4/11: flicker"
-PROMPTS = {
-    (TOOL_MIRROR, "dark"): "Turn the lights off. Hold the badge screen-first "
-                           "against a mirror.",
-    (TOOL_MIRROR, "lit"): "Turn the lights on. Hold the badge against the "
-                          "mirror again.",
-    (TOOL_SECOND_BADGE, "dark"): ALIGN_TEXT,
-    (TOOL_SECOND_BADGE, "lit"): ALIGN_TEXT,
-}
-PHASE_TEXT = {
-    PHASE_NOISE: "Hold still",          # the handshake's noise is measured
-    PHASE_CALLING: "Calling the other badge",
-    PHASE_ANSWERING: "Answering the other badge",
-    PHASE_SENDING: "Sending",
-    PHASE_MEASURING: "Measuring the other badge",
-}
-
-# A run's pixels are "black", "white" or an (r, g, b) tuple from its schedule.
-# Each distinct one becomes a pen once, so a frame looks one up rather than
-# building a colour.
-_PIXEL_PENS = {}
-
-
-def pixels_pen(pixels):
-    pen = _PIXEL_PENS.get(pixels)
-    if pen is None:
-        pen = field_pen(pixels)
-        _PIXEL_PENS[pixels] = pen
-    return pen
-
-
-# A display-measurements line too wide for the screen continues on the rows
-# below it, indented by this much so they do not read as lines of their own.
+# A display line too wide for the screen continues on the rows below,
+# indented by this much.
 HANG = 2 * MARGIN
 
 
 def wrap_value(line, width):
     """`line` as (text, continued) rows: the first `width` wide, the rest
-    `width - HANG` and drawn that far in. Broken at spaces where it can be,
-    and between characters where a run has none -- nothing is cut."""
+    `width - HANG` and drawn that far in. Nothing is cut."""
     rows = wrap_lines(line, width)
     if len(rows) == 1:
         return [(line, False)]
-    # wrap_lines() keeps the text's own spacing, so its first row is a prefix.
-    first = rows[0]
+    first = rows[0]     # wrap_lines() keeps the spacing: a prefix
     rest = line[len(first):].lstrip(" ")
     out = [(first, False)]
     for row in wrap_lines(rest, width - HANG):
@@ -1161,11 +845,8 @@ def wrap_value(line, width):
 
 
 def fit_tail(text, width):
-    """Shorten `text` to `width` pixels from the FRONT, keeping its end.
-
-    For a JSON path, whose last parts are the ones that say which section this
-    is: "...dark.symbol_errors.fields.50" rather than "second_badge.dark.sy...".
-    """
+    """Shorten `text` to `width` pixels from the FRONT: a path's last parts
+    say which section it is."""
     if screen.measure_text(text)[0] <= width:
         return text
     start = 0
@@ -1175,14 +856,62 @@ def fit_tail(text, width):
     return "..." + text[start:]
 
 
-def write_measurements(data):
-    """Write the whole measurements file, raising OSError if it cannot.
+def ordered_keys(obj):
+    """Numeric keys by value, then the rest alphabetically: the file comes
+    back from JSON in no order."""
+    numeric = []
+    other = []
+    for key in obj:
+        try:
+            numeric.append((float(key), key))
+        except ValueError:
+            other.append(key)
+    numeric.sort()
+    other.sort()
+    return [k for _, k in numeric] + other
 
-    Not State.save(): it catches OSError and returns quietly whenever /state
-    exists, so a failed write would read as a saved one. A run is minutes of
-    holding a badge still -- saying it was saved when it was not is the worst
-    answer this screen can give.
-    """
+
+def sections(obj, path, out):
+    """(title, lines) for every object holding values that are not
+    objects, its own values ahead of its children's."""
+    keys = ordered_keys(obj)
+    lines = [key + ": " + json.dumps(obj[key]) for key in keys
+             if not isinstance(obj[key], dict)]
+    if lines:
+        out.append((path or "measurements", lines))
+    for key in keys:
+        if isinstance(obj[key], dict):
+            sections(obj[key], path + "." + key if path else key, out)
+    return out
+
+
+def measurement_pages(data, per, wrap):
+    """Sections as screens of at most `per` rows, `wrap(line)` giving a
+    line's rows; a line's rows stay on one page where they fit."""
+    out = []
+    for title, lines in sections(data, "", []):
+        first = len(out)
+        page = []
+        for line in lines:
+            rows = wrap(line)
+            if page and len(page) + len(rows) > per:
+                out.append((title, page))
+                page = []
+            for row in rows:
+                if len(page) == per:
+                    out.append((title, page))
+                    page = []
+                page.append(row)
+        if page:
+            out.append((title, page))
+        for i in range(first + 1, len(out)):
+            out[i] = (title + " (cont.)", out[i][1])
+    return out
+
+
+def write_measurements(data):
+    """Write the whole measurements file, raising OSError if it cannot. Not
+    State.save(), which hides a failed write."""
     try:
         os.stat("/state")
     except OSError:
@@ -1191,14 +920,26 @@ def write_measurements(data):
         handle.write(json.dumps(data))
 
 
-def delete_measurements():
-    """Delete the measurements file. True if it is gone -- deleted, or never
-    there -- and False only if it is still there.
+def save_measurement(tool, entry):
+    """`entry` under `tool` in the measurements file -- merged key by key
+    into a dict already there, so one condition's run keeps the other's --
+    True if written."""
+    data = load_state(MEASUREMENTS)
+    old = data.get(tool)
+    if isinstance(old, dict) and isinstance(entry, dict):
+        old.update(entry)
+        entry = old
+    data[tool] = entry
+    try:
+        write_measurements(data)
+        return True
+    except Exception:   # noqa: BLE001 - OSError, or run() would reset
+        return False
 
-    Not State.delete(), which swallows every OSError, so a file it failed to
-    delete would read as cleared. Nor errno, unproven on the badge: whether
-    the file is still there afterwards is the answer that matters.
-    """
+
+def delete_measurements():
+    """True if the measurements file is gone. Not State.delete(), which
+    hides a failure: whether the file is still there is the answer."""
     try:
         os.remove(MEASUREMENTS_PATH)
     except OSError:
@@ -1210,19 +951,14 @@ def delete_measurements():
     return False
 
 
-# Reads of the temperature sensor averaged into one figure: one read is
-# noisy to about a degree.
+# The RP2350's sensor: 27 C at 0.706 V, -1.721 mV/C; 16 reads averaged.
 TEMP_READS = 16
 
 
 def core_temp_reader():
-    """The chip's temperature sensor as a callable giving degrees C, or None.
-
-    MicroPython's rp2 port names the sensor's ADC channel ADC.CORE_TEMP. It is
-    channel 4 on an RP2350A and 8 on an RP2350B, where 4 is an ordinary pin
-    that would read without complaint, so no number is guessed: a firmware
-    without the name records that it has no sensor.
-    """
+    """The chip's temperature as a callable giving degrees C, or None. No
+    channel number is guessed: ADC.CORE_TEMP is 4 on an RP2350A and 8 on a
+    B, where 4 is an ordinary pin."""
     try:
         import machine
         adc = machine.ADC(machine.ADC.CORE_TEMP)
@@ -1233,89 +969,110 @@ def core_temp_reader():
         total = 0
         for _ in range(TEMP_READS):
             total += adc.read_u16()
-        return core_temp_c(total / TEMP_READS)
+        volts = total / TEMP_READS * 3.3 / 65535
+        return round(27 - (volts - 0.706) / 0.001721, 1)
     return read
 
 
-# The probe's fast_reads captures: viper, then DMA back to back and at a fifth
-# of that.
-FAST_DMA_RATES = (500000, 100000)
-
-
-def fast_reads():
-    """The probe's fast_reads captures, as (name, capture) pairs, each
-    giving (raw readings, us). fastadc is imported by the first capture,
-    not here: on a firmware without viper it does not compile, and that
-    fails the step, not the app. Each capture first checks the ADC's
-    registers are where fastadc thinks -- a wrong address would fault."""
-    held = []
-
-    def ready():
-        if not held:
-            import fastadc
-            held.append(fastadc)
-            held.append(fastadc.buffer(FAST_READS))
-        fastadc, buf = held
-        problem = fastadc.check(badge.light_level)
-        if problem:
-            raise RuntimeError(problem)
-        return fastadc, buf
-
-    def viper():
-        fastadc, buf = ready()
-        return buf, fastadc.viper_capture(buf, FAST_READS)
-
-    def dma(rate):
-        def capture():
-            fastadc, buf = ready()
-            return buf, fastadc.dma_capture(buf, FAST_READS, rate)
-        return capture
-
-    out = [("viper", viper)]
-    for rate in FAST_DMA_RATES:
-        out.append(("dma_%dk" % (rate // 1000), dma(rate)))
-    return tuple(out)
-
-
-def firmware_info():
-    """What says which firmware this is: the build, and whether it can set
-    the panel's frame rate (added 2026-06-30, with the 90 Hz default)."""
-    info = {}
+def tethered():
+    """Whether USB power is present (VBUS), or None if unknown."""
     try:
-        info["version"] = os.uname().version
+        return bool(badge.usb_connected())
     except Exception:   # noqa: BLE001 - informational only
-        pass
-    info["set_framerate"] = getattr(display, "set_framerate", None) is not None
-    # Dev Mode M1: whether this firmware has what the DMA ring needs, and
-    # whether the ring worked -- None -- or why not.
-    for name in ("rp2", "uctypes"):
-        try:
-            __import__(name)
-            info[name] = True
-        except ImportError:
-            info[name] = False
+        return None
+
+
+def format_exc(error):
+    """An exception with its traceback, as text, for the dev link."""
     try:
-        import rp2
-        info["rp2_dma"] = hasattr(rp2, "DMA")
-    except ImportError:
-        info["rp2_dma"] = False
-    info["ring"] = ring_note()
-    ring = ring_reader()
-    if ring is not None:
-        info["heap_addr"] = "0x%08x" % ring.ring.cached
-        info["ring_addr"] = "0x%08x" % ring.ring.addr
-    return info
+        import io
+        import sys
+        out = io.StringIO()
+        sys.print_exception(error, out)
+        return out.getvalue()
+    except Exception:   # noqa: BLE001 - CPython has no print_exception
+        return "%s: %s" % (type(error).__name__, error)
+
+
+def firmware_version():
+    try:
+        return os.uname().version
+    except Exception:   # noqa: BLE001 - informational only
+        return "unknown"
+
+
+class LinkHooks:
+    """The badge, as the dev link's server -- or a run Dev Mode starts
+    itself, titled `title` -- is handed it."""
+
+    def __init__(self, title=LINK_TITLE):
+        self.title = title
+        self.firmware = firmware_version()
+        self.temp = core_temp_reader()
+        self.light = badge.light_level
+        self.ring = ring_reader
+        self.ring_note = ring_note
+        self.backlight = show_backlight
+        self.present = display.update
+        self.ticks_us = time.ticks_us
+        self.ticks_ms = time.ticks_ms
+        self.format_exc = format_exc
+        self.collect = gc.collect
+        self.save = save_measurement
+
+    def usb_connected(self):
+        return tethered() is not False
+
+    def poll(self):
+        badge.poll()
+
+    def b_held(self):
+        return badge.held(BUTTON_B)
+
+    def status(self, text):
+        draw_screen(self.title, text, "B - Cancel")
+        display.update()
+
+    def restore(self):
+        restore_panel()
+
+
+def clear_all():
+    """The measurements file and every stored dev tool and library gone:
+    True if nothing is left."""
+    import devserver
+    tools = devserver.clear_tools(LINK_ROOT)
+    return delete_measurements() and tools
+
+
+def link_builtins():
+    """The link's instant commands: the measurements file, sent or cleared."""
+    import devserver
+
+    def measurements(_args):
+        return load_state(MEASUREMENTS), None, ""
+
+    def clear(_args):
+        ok = clear_all()
+        return None, ok, CLEARED if ok else "Could not clear"
+
+    return {
+        "measurements": devserver.Builtin(
+            "measurements", "send the saved measurements file", measurements),
+        "clear": devserver.Builtin(
+            "clear", "delete the measurements file and the stored dev tools",
+            clear),
+    }
 
 
 class App:
     def __init__(self):
         self.screen = MAIN
         self.cursor = 0
-        # A list, not MENU_ITEMS itself: C appends Dev Mode for this run only.
+        # A list: C appends Dev Mode for this run only.
         self.menu_items = list(MENU_ITEMS)
+        self.c_since = None             # when C went down, while held
         self.networks = load_networks()
-        # Once, at launch. Not in refresh_networks(), which runs every time a
-        # list is opened: seeding there would re-check secrets for no reason.
         seed_own_network(self.networks)
         self.names = sorted(self.networks)
         self.relabel()
@@ -1333,84 +1090,71 @@ class App:
         self.align_payload = None
         self.align_from = MAIN
         self.retry_target = None
-        # Dev Mode: the run in progress and what it has measured so far.
-        self.measure_tool = None
-        self.measure_first = None       # 2nd badge only: True to go first
-        self.condition = "dark"
-        self.prompt_text = ""
-        self.run = None
-        self.run_begun = False
-        self.signalling = False         # LORES and full screen, during a test
-        self.delay_until = 0
-        self.dark_result = None
-        self.saved_ok = False
-        self.saved_message = None       # Done's message, if not the save's
-        self.status_a = ""
-        self.status_b = None
-        self.status_c = None
-        self.status_phase = None
-        self.status_number = -1
-        self.status_no_answer = False
-        # measure room flicker: its capture buffers and the results so far,
-        # and while the drift is measured, its windows and the result they
-        # will join.
-        self.flicker = None
-        self.flicker_results = []
-        self.drift = None
-        self.drift_result = None
-        # probe frame timing: the probe, the run its frames measure with, and
-        # the listeners its reads step times.
-        self.probe = None
-        self.probe_run = None
-        self.probe_listener = None
-        self.probe_timed = None
-        # display measurements: (title, label, label width, lines) per page.
+        # Dev Mode: Done's message; the display's pages, as (title, label,
+        # label width, rows); the link's server and port while open, and
+        # whether B counts on its screen yet.
+        self.done_message = ""
+        self.done_index = 0
+        self.dev_items = list(DEV_ITEMS)
+        self.dev_tools = []             # (label, stem, args) per tool item
         self.pages = []
         self.page = 0
-        # Bound once, so a frame's dispatch is a lookup and allocates nothing.
+        self.link = None
+        self.link_port = None
+        self.link_b_armed = True
+        # What a host launching over the REPL asked for (autorun()), read
+        # on the first frame: None until then, "" from the menu.
+        self.autorun = None
         self.handlers = {
             MAIN: self.do_main, PICK_SHARE: self.do_pick_share,
             ALIGN: self.do_align, TRANSFER: self.do_transfer,
             RESULT: self.do_result, CONNECT_LIST: self.do_connect_list,
             CONNECTING: self.do_connecting,
             CONNECT_RESULT: self.do_connect_result, DEV: self.do_dev,
-            DEV_ROLE: self.do_dev_role, DEV_PROMPT: self.do_dev_prompt,
-            DEV_MEASURE: self.do_dev_measure, DEV_SAVED: self.do_dev_saved,
-            DEV_DISPLAY: self.do_dev_display,
-            DEV_PROBE_PROMPT: self.do_dev_probe_prompt,
-            DEV_PROBE: self.do_dev_probe, DEV_FLICKER: self.do_dev_flicker,
-            DEV_FLICKER_DRIFT: self.do_dev_flicker_drift,
+            DEV_DISPLAY: self.do_dev_display, DEV_DONE: self.do_dev_done,
+            DEV_LINK: self.do_dev_link,
         }
 
     # -- main menu
 
+    def dev_held(self):
+        """True once C has been held DEV_HOLD_MS."""
+        if not badge.held(BUTTON_C):
+            self.c_since = None
+            return False
+        if self.c_since is None:
+            self.c_since = badge.ticks
+        return badge.ticks - self.c_since >= DEV_HOLD_MS
+
     def do_main(self):
         self.cursor = move_cursor(self.cursor, len(self.menu_items))
-        if badge.pressed(BUTTON_C) and DEV_MODE not in self.menu_items:
+        if self.dev_held() and DEV_MODE not in self.menu_items:
             self.menu_items.append(DEV_MODE)
             self.cursor = len(self.menu_items) - 1
         draw_menu("Share WiFi", self.menu_items, self.cursor,
-                  "Up/Down - Move Selection   A - Select")
+                  "Up/Down - Move   A - Select   B - Exit")
         caselights_for("idle")
+        if badge.pressed(BUTTON_B):
+            return True                 # leave the app
         if badge.pressed(BUTTON_A):
             choice = self.menu_items[self.cursor]
             if choice == "Receive":
                 self.to_align(leader=False)
             elif choice == DEV_MODE:
-                self.cursor = 0
-                self.screen = DEV
+                self.scan_tools()
+                self.to_dev(0)
             else:
                 self.refresh_networks()
                 self.cursor = 0
                 self.screen = PICK_SHARE if choice == "Share" else CONNECT_LIST
+        return None
 
     def refresh_networks(self):
         self.networks = load_networks()
         self.names = sorted(self.networks)
         self.relabel()
 
-    # Built when the list changes, never per frame: a menu is drawn every frame
-    # and a string per row in the draw path is a per-frame allocation.
+    # Built when the list changes, never per frame.
     def relabel(self):
         self.labels = []
         for name in self.names:
@@ -1453,7 +1197,7 @@ class App:
             self.begin_transfer(self.align_leader, self.align_payload)
         elif badge.pressed(BUTTON_B):
             # Back where it came from: the network list, the main screen, or
-            # the failed transfer's result -- which offers the retry again.
+            # the failed transfer's result, which offers the retry again.
             if self.align_from in (PICK_SHARE, RESULT):
                 self.screen = self.align_from
             else:
@@ -1462,41 +1206,37 @@ class App:
     # -- the transfer itself
 
     def begin_transfer(self, leader, payload=None):
-        begin_signalling()
-        # Black, then the reader: the ring is made and checked on the first
-        # transfer of a launch, which blocks for about 0.4 s.
-        fill(FIELD_COLOR[SCHEME_FIELDS][LOW])
-        display.update()
-        reader = transfer_reader()
+        self.retry_target = (leader, payload)
+        begin_transfer_screen()
+        reader = ring_reader()      # ~0.4 s, the first time a launch
+        fast = fast_for(leader) if reader is not None else None
+        if fast is None:
+            restore_panel()
+            self.error = ("%s\n(%s)" % (NO_RING_TEXT, ring_note())
+                          if reader is None else NO_FAST_TEXT)
+            self.screen = RESULT
+            return
         gc.collect()        # now, rather than part way through a symbol
         reader.start()
-        self.transfer = Transfer(leader, payload, reader)
-        self.retry_target = (leader, payload)
+        self.transfer = Transfer(leader, payload, reader, fast=fast)
         self.poll_at = 0
         self.screen = TRANSFER
 
     def do_transfer(self):
         """The transfer loop: wait for what is due, show the field, work.
 
-        Each pass waits -- reading, if the reader polls -- until the protocol
-        has something to do: a slot boundary while transmitting, a window or
-        a sample to decide. It then shows the field for now first, so a
-        change of backlight lands on time, and only then does the work. Only a
-        change of pixels returns to run(), whose present shows it; an EXACT
-        reader goes on reading through it. Collections happen here, when the
-        protocol asks, never inside its calls. The buttons are polled every
-        POLL_MS. See "Reading" in the protocol.
+        The field for now is shown before the work, so a change of
+        backlight lands on time. Nothing is presented: the whole transfer
+        runs in this one call, unless TRANSFER_PASSES says otherwise.
+        Collections happen here, when the protocol asks, never inside its
+        calls. See section 6 of the protocol spec.
         """
         transfer = self.transfer
         reader = transfer.reader
-        # B cancels, checked on entry -- run() has just polled -- and in the
-        # loop.
         if badge.pressed(BUTTON_B):
             transfer.fail(ERR_CANCELLED)
         limit = TRANSFER_PASSES
         passes = 0
-        # What the screen was last set for: a pass only looks up the
-        # backlight and pen when the field or the scheme has changed.
         shown_field = shown_scheme = None
         while True:
             if transfer.collect_due:
@@ -1512,13 +1252,14 @@ class App:
             if field != shown_field or scheme != shown_scheme:
                 shown_field = field
                 shown_scheme = scheme
-                if show_full(FIELD_COLOR[scheme].get(field, color.black),
-                             FIELD_BACKLIGHT[scheme].get(field, 1.0)):
-                    # The whole screen is the field and nothing else is
-                    # drawn; run() presents it. The work waits a pass.
-                    transfer_lights(transfer)
-                    return
+                show_level(LEVEL_SCHEMES[scheme][field])
             transfer.work(t)
+            burst = transfer.fast_burst
+            if burst is not None:
+                if t >= burst[0] - BURST_LEAD_US:
+                    play_burst(transfer, burst)
+                else:
+                    fill_burst(burst)
             passes += 1
             if t >= self.poll_at or passes == limit:
                 self.poll_at = t + POLL_MS * 1000
@@ -1530,8 +1271,7 @@ class App:
                 return
 
     def finish_transfer(self, transfer):
-        # The single exit from the transfer screen, so the only place the
-        # reader stops, the backlight goes back down and HIRES comes back.
+        # The single exit from the transfer screen.
         transfer.reader.stop()
         restore_panel()
         if transfer.result != OK:
@@ -1543,8 +1283,7 @@ class App:
             self.error = None
             self.screen = RESULT
             return
-
-        parsed = valid_credential(parse_payload(transfer.received))
+        parsed = valid_credential(transfer.received)
         if parsed is None:
             self.error = ERR_DECODE
             self.screen = RESULT
@@ -1558,11 +1297,16 @@ class App:
 
     def do_result(self):
         if self.error:
+            # The ring is tried once a launch: only a relaunch can help it.
+            retry = not (self.error == ERR_RING
+                         or self.error.startswith(NO_RING_TEXT)
+                         or self.error == NO_FAST_TEXT)
             draw_screen("Transfer failed",
                         ERROR_TEXT.get(self.error, self.error),
-                        "A - Main Menu   B - Retry", color.smoke)
+                        "A - Main Menu   B - Retry" if retry
+                        else "A - Main Menu", color.smoke)
             caselights_for("error")
-            if badge.pressed(BUTTON_B) and self.retry_target:
+            if retry and badge.pressed(BUTTON_B) and self.retry_target:
                 leader, payload = self.retry_target
                 self.to_align(leader, payload)
             elif badge.pressed(BUTTON_A):
@@ -1587,36 +1331,27 @@ class App:
 
     def start_connect(self, name):
         self.connect_name = name
-        # Cleared up front, so a refusal cannot be reported against the next
-        # network.
         self.error = None
         security = self.networks.get(name, ("", SEC_UNKNOWN))[1]
-        # Only joining is refused: a WEP credential is still worth carrying and
-        # handing to something that can use it.
+        # Only joining is refused: a WEP credential is still worth carrying.
         if security == SEC_WEP and not wep_supported():
             self.error = WEP_UNSUPPORTED
             self.message = "%s\n\n%s" % (name, WEP_UNSUPPORTED)
             self.screen = CONNECT_RESULT
             return
         self.connect_ssid = radio_ssid(name)
-        # An empty key is what selects CYW43_AUTH_OPEN. wifi.connect() never
-        # forwards a security= kwarg, so open and WPA2-mixed are the only modes
-        # reachable from here.
+        # An empty key selects CYW43_AUTH_OPEN.
         self.connect_key = self.networks.get(name, ("", SEC_UNKNOWN))[0]
         self.connect_started = time.ticks_ms()
-        # wifi.connect() keeps a module-level WLAN and ignores the SSID once
-        # it exists, so without this a second network reports the first one's
-        # result. It also restores the retry budget, which wifi spends by
-        # calling fatal_error() -- the reset-the-badge error screen.
+        # wifi.connect() keeps its WLAN and ignores a new SSID once it
+        # exists; disconnect() also restores the retry budget it spends by
+        # calling fatal_error().
         wifi.disconnect()
         self.screen = CONNECTING
 
     def do_connecting(self):
-        # connect() is non-blocking: calling it repeatedly both starts the
-        # attempt and moves it along, so the app keeps drawing while it waits.
+        # Non-blocking: each call starts or moves the attempt along.
         wifi.connect(self.connect_ssid, self.connect_key)
-        # Read once a frame and used twice: on a badge whose firmware raises
-        # from status(), asking again is a second exception for nothing.
         code, description, readable = wifi_status()
 
         dots = "." * (1 + (badge.ticks // 400) % 3)
@@ -1639,18 +1374,9 @@ class App:
 
         timed_out = time.ticks_diff(time.ticks_ms(),
                                     self.connect_started) > CONNECT_TIMEOUT_MS
-
-        # The firmware's own rule, from modules/common/wifi.py: 0 Idle,
-        # 1 Connecting, 2 Connected, 3 Got IP are all "keep going", and anything
-        # else is an error (-1 failed, -2 no such AP, -3 wrong password).
-        # wifi.connect() retries internally, so the timeout here is the backstop
-        # for a radio that sits on a neutral status forever.
+        # The firmware's rule: 0-3 keep going, anything else is an error.
         if code not in WIFI_PENDING or timed_out:
             if timed_out and code >= 0:
-                # Name the real obstacle when there was one: a badge whose
-                # firmware cannot report a status has no way to say *why* a
-                # connection failed, and "Timed out" alone sends you looking
-                # in the wrong place.
                 description = ("Timed out\n" + STATUS_UNREADABLE if not readable
                                else "Timed out")
             self.message = "%s\n\n%s (%d)" % (self.connect_name, description, code)
@@ -1673,294 +1399,75 @@ class App:
 
     # -- dev mode
 
+    def to_dev(self, index):
+        self.cursor = min(index, len(self.dev_items) - 1)
+        self.screen = DEV
+
+    def scan_tools(self):
+        """Dev Mode's items: the three, then every stored dev tool's MENU
+        entries (devserver.menu_entries())."""
+        try:
+            import devserver
+            self.dev_tools = devserver.menu_entries(LINK_ROOT)
+        except Exception:   # noqa: BLE001 - no tools, not a reset
+            self.dev_tools = []
+        self.dev_items = list(DEV_ITEMS) + [t[0] for t in self.dev_tools]
+
     def do_dev(self):
-        self.cursor = move_cursor(self.cursor, len(DEV_ITEMS))
-        draw_menu("Dev Mode", DEV_ITEMS, self.cursor, "A - Select   B - Back")
+        self.cursor = move_cursor(self.cursor, len(self.dev_items))
+        draw_menu("Dev Mode", self.dev_items, self.cursor,
+                  "A - Select   B - Back")
         caselights_for("idle")
         if badge.pressed(BUTTON_B):
             self.to_main()
         elif badge.pressed(BUTTON_A):
-            if self.cursor == 0:
-                self.begin_tool(TOOL_MIRROR, None)
-            elif self.cursor == 1:
-                self.screen = DEV_ROLE
-            elif self.cursor == 2:
-                self.screen = DEV_PROBE_PROMPT
-            elif self.cursor == 3:
-                self.begin_flicker()
-            elif self.cursor == DISPLAY_INDEX:
+            if self.cursor == DISPLAY_INDEX:
                 self.open_measurements()
+            elif self.cursor == CLEAR_INDEX:
+                try:
+                    ok = clear_all()
+                except Exception:   # noqa: BLE001 - run() would reset
+                    ok = False
+                self.scan_tools()
+                self.done(CLEARED if ok else "Could not clear", CLEAR_INDEX)
+            elif self.cursor == LINK_INDEX:
+                self.open_link()
             else:
-                self.clear_measurements()
+                self.run_tool(self.cursor)
 
-    def to_dev(self, index):
-        self.cursor = index
-        self.screen = DEV
-        self.saved_message = None
-
-    def clear_measurements(self):
-        # The same message whether there was a file or not: either way there
-        # are no measurements now.
-        self.measure_tool = TOOL_CLEAR
-        try:
-            self.saved_ok = delete_measurements()
-        except Exception:   # noqa: BLE001 - run() would turn it into a reset
-            self.saved_ok = False
-        self.saved_message = CLEARED if self.saved_ok else "Could not clear"
-        self.screen = DEV_SAVED
-
-    def tool_index(self):
-        return TOOL_INDEX.get(self.measure_tool, 0)
-
-    # -- measure screen w/ 2nd badge: the role
-
-    def do_dev_role(self):
-        # No way back from here: B is "I go second". B at the prompt that
-        # follows is the way out.
-        draw_screen("Who goes first?", "One badge must choose each.",
-                    "A - I go first   B - I go second")
-        caselights_for("attention")    # waiting on the user
-        if badge.pressed(BUTTON_A):
-            self.begin_tool(TOOL_SECOND_BADGE, True)
-        elif badge.pressed(BUTTON_B):
-            self.begin_tool(TOOL_SECOND_BADGE, False)
-
-    # -- both tools: prompt, delay, run, twice; then save
-
-    def begin_tool(self, tool, first):
-        self.measure_tool = tool
-        self.measure_first = first
-        self.dark_result = None
-        self.prompt_for("dark")
-
-    def prompt_for(self, condition):
-        self.condition = condition
-        # Looked up once here: a tuple key built per frame is an allocation.
-        self.prompt_text = PROMPTS[(self.measure_tool, condition)]
-        self.screen = DEV_PROMPT
-
-    def do_dev_prompt(self):
-        if self.measure_tool == TOOL_SECOND_BADGE:
-            # The hold a transfer uses, so the swing measured is its swing.
-            draw_alignment(self.prompt_text, CONDITION_TITLES[self.condition])
+    def run_tool(self, index):
+        """A stored dev tool's MENU entry, with no host: blocking, its
+        result saved by the tool itself (api.save())."""
+        import devserver
+        label, stem, args = self.dev_tools[index - len(DEV_ITEMS)]
+        # A wait first, so the hand that pressed A can get clear.
+        draw_screen(label, DEV_RUNNING)
+        badge.caselights(0.0)
+        display.update()
+        time.sleep_ms(MEASURE_DELAY_MS)
+        outcome, value = devserver.run_local(LINK_ROOT, LinkHooks(label),
+                                             stem, args)
+        if outcome == "ok":
+            message = "Done: see Display Saved Measurements"
+        elif outcome == "cancelled":
+            message = "Cancelled"
         else:
-            draw_screen(CONDITION_TITLES[self.condition], self.prompt_text,
-                        "A - Start   B - Cancel")
-        caselights_for("attention")    # waiting on the user
-        if badge.pressed(BUTTON_B):
-            self.cancel_measure()
-        elif badge.pressed(BUTTON_A):
-            self.start_condition()
+            message = "%s: %s" % (type(value).__name__, value)
+        self.done(message, index)
 
-    def start_condition(self):
-        # Built here, during the delay, so the allocation of its buffers is not
-        # in a measured frame. One run object per condition.
-        temp = core_temp_reader()
-        if self.measure_tool == TOOL_MIRROR:
-            self.run = MirrorRun(badge.light_level, time.ticks_us, temp)
-        else:
-            self.run = SecondBadgeRun(self.measure_first, badge.light_level,
-                                      time.ticks_us, temp)
-        self.run_begun = False
-        self.delay_until = time.ticks_add(time.ticks_ms(), MEASURE_DELAY_MS)
-        self.status_a = "Starting"
-        self.status_b = CONDITION_TITLES[self.condition]
-        self.status_c = None
-        self.status_number = -1
-        self.screen = DEV_MEASURE
+    def done(self, message, index):
+        self.done_message = message
+        self.done_index = index
+        self.screen = DEV_DONE
 
-    def do_dev_measure(self):
-        run = self.run
-        if badge.pressed(BUTTON_B):
-            self.cancel_measure()
-            return
-
-        now = time.ticks_ms()
-        if not self.run_begun:
-            if time.ticks_diff(now, self.delay_until) < 0:
-                fill(color.black)
-                self.draw_measure_column()
-                badge.caselights(0.0)
-                return
-            run.begin(now)
-            self.run_begun = True
-
-        run.frame(now, badge.ticks_delta)
-        if run.done:
-            fill(color.black)
-            self.end_condition(run)
-            return
-
-        self.update_measure_status(run)
-        if run.test_name is not None:
-            # A test is running: the whole screen is its field, with no text.
-            # More of the panel reaches the sensor -- through a mirror, or
-            # across to the other badge however it is held -- and nothing
-            # drawn over the field moves the level being measured. A badge
-            # measuring the other's tests shows its own field, black, the
-            # same way, so its text cannot reflect back into its own sensor.
-            # B still cancels; the status returns between tests.
-            # Drawn as the protocol draws a transfer -- LORES, run()'s clear
-            # off, redrawn only when the field changes -- so frame_timing and
-            # the settle captures measure the frames a transfer will have.
-            # The case lights were switched off before the first test and
-            # nothing between tests turns them on, so they are left alone.
-            if not self.signalling:
-                begin_signalling()
-                self.signalling = True
-            # A backlight step's change is made inside its capture, below:
-            # setting it here would put the edge before the first read.
-            if not run.change_due:
-                show_full(pixels_pen(run.pixels), run.backlight)
-        else:
-            # Start delay, noise second, handshake, waiting: HIRES, two edge
-            # bands, with what is happening in the column between.
-            if self.signalling:
-                end_signalling()
-                self.signalling = False
-            draw_bands(pixels_pen(run.pixels))
-            self.draw_measure_column()
-            display.backlight(run.backlight)
-            # Case lights stay off while measuring: in the dark-room run they
-            # would light the room the ambient and black readings are
-            # measuring. They flash only once a handshake has given up and the
-            # screen is holding "No answer from the other badge" -- nothing is
-            # being measured then.
-            if self.status_no_answer:
-                caselights_for("attention")
-            else:
-                badge.caselights(0.0)
-        # Presentation timing. A settle capture has to read the panel the
-        # moment the frame showing its new field is up, with times measured
-        # from the present call. Under run(update) the firmware presents after
-        # update() returns and then polls and clears before the next update()
-        # -- about 30 ms on the first hardware run, longer than any edge, so
-        # every rise had already crossed by the first read. On a frame with a
-        # capture due the app presents it itself, here, and reads from the
-        # moment display.update() returns; the firmware's own present that
-        # follows shows the same frame again, a frame's cost 40 times a run.
-        # display.update() itself is blind -- nothing reads while it writes
-        # the panel -- so its duration goes to presented() and into the
-        # result as blind_ms. presented() blocks 60-80 ms; measure.py leaves
-        # the frame after it out of frame_timing.
-        #
-        # A backlight step is the exception: display.backlight() is live the
-        # moment it is called, with no present to wait for, so the capture
-        # runs around that call instead -- reading from just before it.
-        if run.change_due:
-            backlight = run.backlight
-            run.changed(lambda: show_backlight(backlight))
-        elif run.loopback_due:
-            # The badge sends a symbol block on its own backlight and reads
-            # its reflection, as a transfer's listen loop would: blocks for
-            # the block. The pixels are white already.
-            run.loopback(show_backlight)
-        elif run.ring_due:
-            # The same through the DMA ring (Dev Mode M4, M5): blocks for the
-            # test. The run read the temperature as the test began, before
-            # the ring took the ADC.
-            run.ring_test(ring_reader(), ring_note(), show_backlight)
-        elif run.capture_due:
-            present_us = time.ticks_us()
-            display.update()
-            run.presented(present_us, time.ticks_us())
-
-    def update_measure_status(self, run):
-        """The centre column's text, rebuilt only when the phase or test moves."""
-        second = self.measure_tool == TOOL_SECOND_BADGE
-        phase = run.phase if second else None
-        no_answer = run.no_handshake if second else False
-        if (phase == self.status_phase and no_answer == self.status_no_answer
-                and run.test_number == self.status_number):
-            return
-        self.status_phase = phase
-        self.status_no_answer = no_answer
-        self.status_number = run.test_number
-        if run.test_name is None:
-            progress = CONDITION_TITLES[self.condition]
-        else:
-            progress = "%s %d/%d: %s" % (CONDITION_LABELS[self.condition],
-                                         run.test_number, run.test_count,
-                                         run.test_name)
-        if second:
-            self.status_a = PHASE_TEXT.get(phase, "")
-            self.status_b = progress
-            self.status_c = ("No answer from the other badge" if no_answer
-                             else None)
-        else:
-            self.status_a = progress
-            self.status_b = None
-            self.status_c = None
-
-    def draw_measure_column(self):
-        """Static text between the bands: it changes only between tests."""
-        left, top, width, height = text_column()
-        screen.pen = color.white
-        draw_text(self.status_a, (left, top, width, LINE_HEIGHT * 2),
-                  center=True)
-        y = top + LINE_HEIGHT * 3
-        if self.status_b:
-            screen.pen = color.smoke
-            draw_text(self.status_b, (left, y, width, LINE_HEIGHT * 2),
-                      center=True)
-        y += LINE_HEIGHT * 2 + MARGIN
-        screen.pen = color.grey
-        if self.status_c:
-            draw_text(self.status_c, (left, y, width, LINE_HEIGHT * 2),
-                      center=True)
-        draw_text("B - Cancel",
-                  (left, screen.height - LINE_HEIGHT - MARGIN, width,
-                   LINE_HEIGHT))
-
-    def end_condition(self, run):
-        result = run.results()
-        self.run = None
-        restore_panel()
-        self.signalling = False
-        if self.condition == "dark":
-            self.dark_result = result
-            self.prompt_for("lit")
-        else:
-            role = None
-            if self.measure_tool == TOOL_SECOND_BADGE:
-                role = "first" if self.measure_first else "second"
-            self.save_measurements(self.measure_tool,
-                                   tool_result(self.dark_result, result, role))
-            self.dark_result = None
-        gc.collect()
-
-    def save_measurements(self, tool, entry):
-        # Merged here so the other tools' objects are kept as they were, then
-        # written in one go -- the one write a run makes.
-        merged = merge_results(load_state(MEASUREMENTS), tool, entry)
-        try:
-            write_measurements(merged)
-            self.saved_ok = True
-        except Exception:   # noqa: BLE001 - OSError, or run() would reset
-            self.saved_ok = False
-        self.screen = DEV_SAVED
-
-    def cancel_measure(self):
-        # Nothing is saved: the dark result, if any, is dropped with the run.
-        self.run = None
-        self.dark_result = None
-        restore_panel()
-        self.signalling = False
-        self.to_dev(self.tool_index())
-        gc.collect()
-
-    def do_dev_saved(self):
-        draw_screen("Done", self.saved_message or (
-            "Measurements saved" if self.saved_ok
-            else "Could not save measurements"), "Any button - Back")
-        caselights_for("attention")    # waiting on the user
+    def do_dev_done(self):
+        draw_screen("Done", self.done_message, "Any button - Back")
+        caselights_for("idle")
         if badge.pressed():
-            self.to_dev(self.tool_index())
-
-    # -- display measurements
+            self.to_dev(self.done_index)
 
     def open_measurements(self):
-        """Build every page once, here, rather than per frame."""
+        """Every page built once, here, rather than per frame."""
         data = load_state(MEASUREMENTS)
         self.pages = []
         self.page = 0
@@ -1968,8 +1475,8 @@ class App:
         width = screen.width - 2 * MARGIN
         if data:
             try:
-                built = pages(data, menu_rows(),
-                              lambda line: wrap_value(line, width))
+                built = measurement_pages(data, menu_rows(),
+                                          lambda line: wrap_value(line, width))
             except Exception:   # noqa: BLE001 - a hand-edited file
                 built = []
         count = len(built)
@@ -2014,263 +1521,49 @@ class App:
             y += LINE_HEIGHT
         draw_help("Up/Down - Page   A/B/C - Exit")
 
-    # -- probe frame timing
+    # -- USB dev link: the screen that owns the USB serial while open; see
+    # "USB dev link" in the spec.
 
-    def do_dev_probe_prompt(self):
-        draw_screen("Probe frame timing",
-                    "Times the display, each part of a measuring frame "
-                    "and how fast the sensor reads. Takes about 25 s; "
-                    "the screen flashes and goes dark.",
-                    "A - Start   B - Back")
-        caselights_for("idle")
-        if badge.pressed(BUTTON_B):
-            self.to_dev(TOOL_INDEX[TOOL_PROBE])
-        elif badge.pressed(BUTTON_A):
-            self.start_probe()
-
-    def start_probe(self):
-        gc.collect()
-        self.measure_tool = TOOL_PROBE
-        self.condition = "dark"
-        # The frames signalling and status screens draw, in parts. `field`
-        # is a transfer's or a test's frame -- LORES, run()'s clear off --
-        # drawing its field every frame, so it is the frame that changes the
-        # field: one that does not skips the fill. `status` is Dev Mode's
-        # HIRES handshake screen, bands and text.
-        field = (("field", self.probe_field), ("measure", self.probe_measure))
-        status = (("bands", self.probe_bands),
-                  ("column", self.draw_measure_column),
-                  ("lights", self.probe_lights),
-                  ("measure", self.probe_measure))
-        # The POLLED listener the reads step times. Its reader is the
-        # launch's own: started here, stopped when the probe ends.
-        self.probe_listener = probe_listener(polled_reader())
-        self.probe_passes = 0
-        # Its own reader, so its timing is not shared with the other's.
-        self.probe_timed = TimedListener(probe_listener(
-            readers.PolledReader(badge.light_level)))
-        hooks = Hooks(
-            present=display.update,
-            set_vsync=getattr(display, "set_vsync", None),
-            poll=badge.poll, clear=badge.clear,
-            screens=(("field", self.probe_start_field, field),
-                     ("status", self.probe_start_status, status)),
-            cancelled=lambda: badge.pressed(BUTTON_B),
-            collect=gc.collect, enable=gc.enable, disable=gc.disable,
-            mem_alloc=getattr(gc, "mem_alloc", None),
-            mem_free=getattr(gc, "mem_free", None),
-            ticks_us=time.ticks_us,
-            reads=(("loop", self.probe_idle), ("read", badge.light_level),
-                   ("sample", sample_light),
-                   ("transfer", self.probe_transfer),
-                   ("transfer_timed", self.probe_transfer_timed)),
-            reads_detail=self.probe_timed.result,
-            temp=core_temp_reader(), fast=fast_reads(),
-            flicker_filter=FlickerFilter, ring=self.probe_ring,
-            replay=probe_replay)
-        self.probe = FrameProbe(hooks, firmware_info())
-        self.screen = DEV_PROBE
-
-    def probe_start_field(self):
-        begin_signalling()
-        self.probe_new_run()
-
-    def probe_start_status(self):
-        end_signalling()
-        self.probe_new_run()
-
-    def probe_new_run(self):
-        # A fresh run per screen, built here so its buffers are not allocated
-        # inside a timed frame.
-        self.probe_run = MirrorRun(badge.light_level, time.ticks_us)
-        self.probe_run.begin(time.ticks_ms())
-        self.status_number = -1
-
-    def probe_field(self):
-        display.backlight(self.probe_run.backlight)
-        fill(pixels_pen(self.probe_run.pixels))
-
-    def probe_bands(self):
-        draw_bands(pixels_pen(self.probe_run.pixels))
-
-    def probe_lights(self):
-        display.backlight(self.probe_run.backlight)
-        badge.caselights(0.0)
-
-    def probe_idle(self):
-        pass
-
-    def probe_transfer_timed(self):
-        # The same pass, on the timed listener: where `transfer`'s time goes.
-        self.probe_timed.step()
-        self.probe_passes += 1
-        if self.probe_passes % 16 == 0:
-            badge.poll()
-            badge.pressed(BUTTON_B)
-
-    def probe_transfer(self):
-        # One pass of the transfer loop, POLLED, as do_transfer() runs it,
-        # and the buttons every 16 passes. What it hears is thrown away, and
-        # so are the budgets that would end it -- nobody is transmitting.
-        listen_pass(self.probe_listener)
-        self.probe_passes += 1
-        if self.probe_passes % 16 == 0:
-            badge.poll()
-            badge.pressed(BUTTON_B)
-
-    def probe_ring(self, presenting):
-        """Dev Mode M3: the EXACT listener on the 8 ms rung, through the
-        ring, for RING_LISTEN_MS; with `presenting`, the probe's status
-        frame presented every pass, the worst the panel's DMA can do to the
-        ring's. The ring is stopped before the probe reads the temperature
-        again."""
-        reader = ring_reader()
-        if reader is None:
-            return {"error": ring_note()}
-        listener = probe_listener(reader, EXACT_LIT_INDEX)
+    def open_link(self):
+        import devserver
+        import usbport
+        port = usbport.badge_port(BUTTON_B)
+        port.open()
+        self.link_port = port
+        self.link = devserver.Server(port, LINK_ROOT, LinkHooks(),
+                                     link_builtins())
         try:
-            return ring_listen(
-                listener, time.ticks_us,
-                present=display.update if presenting else None,
-                poll=badge.poll, collect=gc.collect,
-                mem_free=getattr(gc, "mem_free", None),
-                cancelled=lambda: badge.pressed(BUTTON_B))
+            self.link.scan()
+        except (Exception, SystemExit):   # noqa: BLE001 - listed later
+            pass
+        self.link_b_armed = not badge.held(BUTTON_B)
+        self.screen = DEV_LINK
+
+    def close_link(self):
+        link = self.link
+        port = self.link_port
+        self.link = None
+        self.link_port = None
+        try:
+            link.close()
         finally:
-            reader.stop()
+            port.close()
+        self.scan_tools()               # the host may have sent some
+        self.to_dev(LINK_INDEX)
 
-    def probe_measure(self):
-        run = self.probe_run
-        run.frame(time.ticks_ms(), badge.ticks_delta)
-        self.update_measure_status(run)
-
-    def do_dev_probe(self):
-        probe = self.probe
-        if badge.pressed(BUTTON_B) or probe.cancelled:
-            self.end_probe()
-            self.to_dev(TOOL_INDEX[TOOL_PROBE])
+    def do_dev_link(self):
+        link = self.link
+        if link.service():
+            # A run ended in this frame: B, which may have cancelled it,
+            # counts again only once a later frame sees it released.
+            self.link_b_armed = False
+        elif not badge.held(BUTTON_B):
+            self.link_b_armed = True
+        if self.link_b_armed and badge.pressed(BUTTON_B):
+            self.close_link()
             return
-        if probe.done:
-            self.save_probe()
-            return
-        draw_screen("Probe frame timing",
-                    "%s %d/%d" % (STEP_TITLES[probe.step_name],
-                                  probe.index + 1, len(STEPS)),
-                    "B - Cancel")
+        draw_screen(LINK_TITLE, link.status_text(), "B - Exit")
         caselights_for("idle")
-        # Shown before the step, which blocks for up to 12 s.
-        display.update()
-        probe.step()
-        restore_panel()
-
-    # -- measure room flicker
-    # Its own tool: A takes a measurement, as many as wanted; B saves them all
-    # and leaves. See "measure room flicker" in the spec.
-
-    def begin_flicker(self):
-        # The capture's bins, allocated here, once, not in the measuring frame.
-        self.measure_tool = TOOL_FLICKER
-        self.flicker = Capture()
-        self.flicker_results = []
-        self.screen = DEV_FLICKER
-
-    def do_dev_flicker(self):
-        results = self.flicker_results
-        if results:
-            body = "%d measured. Last: %s" % (len(results),
-                                             summary(results[-1]))
-        else:
-            body = ("Hold the badge where it will be used, sensor "
-                    "towards the room. A measures for about 30 s.")
-        draw_screen(FLICKER_TITLE, body, FLICKER_HELP)
-        caselights_for("idle")
-        if badge.pressed(BUTTON_A):
-            self.measure_flicker()
-        elif badge.pressed(BUTTON_B):
-            self.save_flicker()
-
-    def measure_flicker(self):
-        # Shown first: the capture and its analysis block for a second or two,
-        # and the drift that follows keeps the screen dark.
-        draw_screen(FLICKER_TITLE, FLICKER_MEASURING)
-        display.update()
-        temp = core_temp_reader()
-        # The badge's own light off while it reads -- backlight and case
-        # lights both: its PWM must not be what is measured.
-        badge.caselights(0.0)
-        display.backlight(0.0)
-        self.flicker.take(badge.light_level, time.ticks_us)
-        result = analyse(self.flicker)
-        if temp is not None:
-            result["temp_c"] = temp()
-        hz = drift_hz(result)
-        if hz is None:
-            result["drift"] = {"error": "no mains flicker"}
-            self.end_flicker(result)
-            return
-        # One drift window a frame, from the next: run() presents and polls
-        # between them, so B can stop it. Its clear is off -- nothing is
-        # drawn, the screen is dark -- and the panel keeps what it had.
-        self.drift = Drift(hz)
-        self.drift_result = result
-        badge.default_clear = None
-        self.screen = DEV_FLICKER_DRIFT
-
-    def do_dev_flicker_drift(self):
-        badge.caselights(0.0)
-        result = self.drift_result
-        # held(), not pressed(): the buttons are read once a frame, not
-        # latched, and a frame here is a 250 ms window. A press is seen only
-        # if B is down when the frame ends, so the screen says hold it.
-        if badge.held(BUTTON_B):
-            result["drift"] = {"error": "cancelled"}
-            self.end_flicker(result)
-            return
-        self.flicker.take(badge.light_level, time.ticks_us)
-        self.drift.add(self.flicker)
-        # Attempts, not windows read: a window with no reading must not
-        # keep the screen dark for ever.
-        if self.drift.attempts >= DRIFT_WINDOWS:
-            result["drift"] = self.drift.result()
-            self.end_flicker(result)
-
-    def end_flicker(self, result):
-        """A measurement done: the panel back, the result kept."""
-        self.drift = None
-        self.drift_result = None
-        badge.default_clear = color.black
-        display.backlight(BACKLIGHT_NORMAL)
-        self.flicker_results.append(result)
-        self.screen = DEV_FLICKER
-
-    def save_flicker(self):
-        results = self.flicker_results
-        self.flicker = None
-        self.flicker_results = []
-        if not results:
-            self.to_dev(TOOL_INDEX[TOOL_FLICKER])
-            return
-        # Numbered from 1, so the display shows them in the order taken.
-        numbered = {}
-        for i in range(len(results)):
-            numbered[str(i + 1)] = results[i]
-        self.save_measurements(TOOL_FLICKER, numbered)
-
-    def save_probe(self):
-        results = self.probe.results()
-        self.end_probe()
-        self.save_measurements(TOOL_PROBE, results)
-
-    def end_probe(self):
-        for listener in (self.probe_listener,
-                         self.probe_timed and self.probe_timed.transfer):
-            if listener is not None:
-                listener.reader.stop()
-        self.probe = None
-        self.probe_run = None
-        self.probe_listener = None
-        self.probe_timed = None
-        restore_panel()
-        gc.collect()
 
     def to_main(self):
         self.screen = MAIN
@@ -2279,14 +1572,36 @@ class App:
         self.transfer = None
 
     def frame(self):
-        self.handlers[self.screen]()
+        return self.handlers[self.screen]()
 
 
 app = App()
 
 
+def autorun():
+    """What a host launching this app over the REPL asked for, set as
+    builtins.DEV_AUTORUN before launch() (tests/usbrun.py): "link" opens the
+    USB dev link, and the app quits back to the REPL when it closes. None
+    from the menu. Bare-name lookup, as for any injected builtin."""
+    try:
+        return DEV_AUTORUN    # noqa: F821 - a builtin only the host sets
+    except NameError:
+        return None
+
+
 def update():
-    app.frame()
+    if app.autorun is None:
+        app.autorun = autorun() or ""
+        if app.autorun != "link" and app.autorun:
+            return True     # not one this app knows: back to the REPL
+        if app.autorun:
+            app.open_link()
+    elif app.autorun and app.link is None:
+        return True         # the link closed: back to the REPL
+    if app.frame():
+        on_exit()           # B on the main menu: leave the app
+        return True
+    return None
 
 
 # run() clears the screen, calls update(), presents the frame and polls the

@@ -1,4 +1,4 @@
-"""The flicker fitted before calibration (option A in the protocol): the
+"""The flicker fitted before calibration (section 15 of the protocol spec): the
 mains and the light's shape from a dark window, a table to correct with, and
 the phase lock that follows the mains' drift.
 
@@ -13,6 +13,14 @@ import simulator as sim
 from harness import load_module
 
 P = load_module("share_wifi", "protocol")
+
+
+def flicker_size(f):
+    """The largest flicker amplitude a filter holds, in counts."""
+    if f.harmonics is not None:
+        return max([math.sqrt(a * a + b * b) for a, b in f.harmonics] + [0.0])
+    return max(math.sqrt(f.amp[2 * i] ** 2 + f.amp[2 * i + 1] ** 2)
+               for i in range(len(f.amp) // 2))
 
 
 def light(mains, shape, size=22.0, drift=0.0, mean=88.0, seed=1):
@@ -60,7 +68,7 @@ def test_the_fit_finds_the_mains_and_the_shape():
         f = P.FlickerFilter()
         assert f.fit(*samples(source, 123456, 200)) == "flicker"
         assert f.mains == mains, (mains, shape, f.mains)
-        assert abs(f.size() - 22) < 2, f.size()
+        assert abs(flicker_size(f) - 22) < 2, flicker_size(f)
         # Taken off, a sample is the room's own light within a count or two.
         assert residual(f, source, 123456 + 210000) <= 2
 
@@ -92,7 +100,7 @@ def test_a_window_with_a_step_in_it_is_refused():
     f = P.FlickerFilter()
     step = lambda t: 120.0 if t < 80000 else 60.0
     assert f.fit(*samples(step, 5000, 200)) is None
-    assert not f.fitted
+    assert f.harmonics is None and not f.steady
 
 
 def test_the_phase_lock_follows_the_mains_drift():
@@ -129,8 +137,11 @@ def run(light_name, seed, drift=0.02, flicker=0.47):
     kw.update(sim.LOOP_SENSOR_V2)
     kw.update(contrast=sim.SWING_MIRROR, room_light=48, flicker=flicker,
               light=light_name, mains_drift_hz=drift)
-    link = sim.build_loop(P, sim.TYPICAL, seed=seed,
-                          schemes=(P.SCHEME_FIELDS, P.SCHEME_BACKLIGHT), **kw)
+    # The fit and the lock, not the badge's costs: what charging flicker
+    # calls does to these rooms is the sweep's to say (half50 delivers 140
+    # of 144 with them, 2026-10-07).
+    link = sim.build_loop(P, sim.TYPICAL, seed=seed, cost_profile="none",
+                          **kw)
     link.run(300)
     return link
 
@@ -162,8 +173,7 @@ def test_a_dark_room_without_flicker_fits_steady():
     kw.update(sim.LOOP_V2)
     kw.update(sim.LOOP_SENSOR_V2)
     kw.update(contrast=sim.SWING_MIRROR)
-    link = sim.build_loop(P, sim.TYPICAL, seed=3,
-                          schemes=(P.SCHEME_FIELDS, P.SCHEME_BACKLIGHT), **kw)
+    link = sim.build_loop(P, sim.TYPICAL, seed=3, **kw)
     link.run(300)
     for transfer in (link.leader.transfer, link.follower.transfer):
         assert transfer.result == P.OK
@@ -186,34 +196,66 @@ def _flicker_residual(badge):
     return math.sqrt(sum(e * e for e in errors) / len(errors))
 
 
-def test_a_polled_leaders_flicker_stays_fitted_through_a_block():
-    # The regression: a POLLED Leader's fit stall blinded most of its
-    # closing gap, it learnt a drift rate from a handful of updates in a
-    # room with none, and extrapolated it through its first block -- 30
-    # counts rms by 9 s against 16 of flicker, and the CRC reply misread.
-    # Now the rate needs FLICKER_RATE_MIN_UPDATES, and the Leader tracks
-    # through the block from the Follower's dark slots.
+def test_a_leaders_flicker_stays_fitted_through_a_block():
+    # The regression, found on a Leader whose fit stall blinded most of its
+    # closing gap: it learnt a drift rate from a handful of updates
+    # in a room with none, and extrapolated it through its first block --
+    # 30 counts rms by 9 s against 16 of flicker, and the CRC reply
+    # misread. Now the rate needs FLICKER_RATE_MIN_UPDATES, and the Leader
+    # tracks through its data phase from the Follower's dark slots.
     import sweep
-    # Seeds 2, 4 and 6 are the ones the old rate threw off: 10 counts rms
-    # as the block began, 26-29 by its end.
     for seed in (2, 4, 6):
         kw = dict(sim.SCENARIOS["ideal"])
         kw.update(sweep.TIMING["v2"])
         kw.update(sweep.OPTICS["lit47"])
-        kw["reader"] = kw["peer_reader"] = "polled"
         link = sim.build_loop(P, sim.WORST, seed=seed, **kw)
         residuals = []
-        for tenth in range(30, 140, 5):
-            link.run(tenth / 10.0)
+        for twentieth in range(10, 280):
+            link.run(twentieth / 20.0)
             leader = link.leader.transfer
             if leader.result is not None:
                 break
-            if leader.phase == P.PHASE_DATA and leader.tx:
+            if leader.phase == P.PHASE_DATA:
                 residual = _flicker_residual(link.leader)
                 if residual is not None:
                     residuals.append(residual)
-        # 6-9 counts throughout, as a ring Leader's: the table's whole
-        # counts and the fit's own error.
+        # 6-9 counts throughout: the table's whole counts and the fit's own
+        # error.
         assert len(residuals) >= 5, (seed, residuals)
         assert sum(residuals) / len(residuals) < 8.5, (seed, residuals)
         assert max(residuals) < 11.0, (seed, residuals)
+
+
+def test_a_flickering_room_keeps_a_harmonic_under_min_counts():
+    # A once-a-cycle 50 Hz light of 22 counts: its third harmonic, 3.3
+    # counts, is under FLICKER_MIN_COUNTS but kept (FLICKER_KEEP_COUNTS),
+    # and the residual stays small at every phase.
+    source = light(50, ((1, 1.0), (2, 0.5), (3, 0.15)))
+    f = P.FlickerFilter()
+    assert f.fit(*samples(source, 123456, 200, noise=0.5)) == "flicker"
+    third = f.harmonics[2]
+    assert math.hypot(*third) >= P.FLICKER_KEEP_COUNTS, f.harmonics
+    assert residual(f, source, 123456 + 210000) <= 2
+
+
+def test_a_room_whose_strongest_harmonic_is_small_is_still_steady():
+    # Every harmonic under FLICKER_MIN_COUNTS: steady, however many clear
+    # FLICKER_KEEP_COUNTS -- nothing is taken off.
+    source = light(50, ((2, 1.0), (4, 0.8)), size=3.0)
+    f = P.FlickerFilter()
+    assert f.fit(*samples(source, 123456, 200, noise=0.3)) == "steady"
+    assert P.FLICKER_KEEP_COUNTS < P.FLICKER_MIN_COUNTS
+
+
+def test_a_hard_flickering_leds_third_harmonic_is_fitted():
+    # 2026-10-14's light near the badge, as its room-flicker capture read
+    # it: 120 / 240 / 360 Hz at 1,312 / 765 / 114 counts on 60 Hz mains.
+    # Four harmonics (to 240 Hz) left ~82 counts and refused; six fit it.
+    source = light(60, ((2, 1.0), (4, 765 / 1312.0), (6, 114 / 1312.0)),
+                   size=1312.0, mean=2800.0)
+    ts, vs, ss = samples(source, 123456, 100, noise=2.0, every=2000)
+    f = P.FlickerFilter()
+    assert f.fit(ts, vs, ss) == "flicker", f.fit_info
+    assert f.mains == 60 and f.fit_info["noise"] < P.FLICKER_FIT_MAX_NOISE
+    sixth = f.harmonics[5]
+    assert abs(math.hypot(*sixth) - 114) < 25, f.harmonics

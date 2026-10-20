@@ -3,20 +3,21 @@
 A receiver decides slot k from its window once the readings are in, after
 the fact; `next` is the slot it decides next. Every event that renumbers the
 grid -- a re-base, a demotion -- or puts this badge on air moves `next`, and
-these pin how. See "Deciding a slot" in the protocol.
+these pin how. See section 10.2 of the protocol spec.
 """
 
 from harness import load_module
+from held import HeldTransfer
+import held
 
 P = load_module("share_wifi", "protocol")
 R = load_module("share_wifi", "reader")
 
 
-def listener(index, exact=True, lit=False, leader=False):
-    reader = R.PolledReader()
+def listener(index, lit=False, leader=False):
+    reader = held.HeldReader()
     reader.start()
-    reader.exact = exact
-    t = P.Transfer(leader, (b"net", b"key1") if leader else None, reader)
+    t = HeldTransfer(leader, (b"net", b"key1") if leader else None, reader)
     t.lit = lit
     t.levels = P.Levels()
     t.levels.fit(32, 64, 112)
@@ -43,16 +44,18 @@ def feed(t, start, end, value, every=100, budgets=False):
 def test_the_exact_windows_are_where_the_rule_puts_them():
     lit = listener(P.EXACT_LIT_INDEX, lit=True)
     assert (lit.w_open, lit.w_close, lit.w_parts) == (3200, 6800, 5)
+    # Dark on 16 ms: 40% of the slot outweighs SETTLE_DARK_US's 5 ms.
     dark = listener(P.EXACT_INDEX)
-    assert (dark.w_open, dark.w_close) == (10000, 13600)
-    polled = listener(P.BACKLIGHT_INDEX, exact=False)
-    assert (polled.w_open, polled.w_close) == (16000, 27200)
+    assert (dark.w_open, dark.w_close) == (6400, 13600)
 
 
 def test_a_rung_too_fast_for_the_settle_keeps_a_quarter_slot_to_read():
-    # A dark badge put on the lit 8 ms rung -- a misread flag -- still reads.
+    # A dark badge put on the lit 8 ms rung -- a misread flag -- still reads:
+    # its own rule leaves [5000, 6000], half WINDOW_MIN_US, and a window any
+    # shorter would take a quarter of the slot instead.
     t = listener(P.EXACT_LIT_INDEX, lit=False)
-    assert t.w_close - t.w_open == 8000 // 4
+    assert t.w_close - t.w_open >= P.WINDOW_MIN_US // 2
+    assert t.w_close - t.w_open >= min(8000 // 4, P.WINDOW_MIN_US // 2)
 
 
 def test_slots_are_decided_in_order_once_their_windows_close():
@@ -87,7 +90,7 @@ def test_a_rebase_decides_slot_zero_of_the_new_grid():
     t.follower_rx = lambda: decided.append(t.rx[-1])
     edge = 100000 + 3700            # not on this grid's boundaries
     feed(t, 0, 140000, lambda us: 112 if us >= edge else 32)
-    lag = P.EDGE_LAG_DARK_US
+    lag = P.EDGE_LAG_EXACT_DARK_US
     assert abs(t.clock.epoch - (edge - lag)) <= 200, t.clock.epoch - edge
     # The first slot of the new grid starts at the boundary, and is lit.
     assert decided[-2:] == [P.HIGH, P.HIGH], decided[-4:]
@@ -129,35 +132,17 @@ def test_no_slot_is_decided_while_this_badge_is_on_air():
     assert field == P.LOW
 
 
-def test_no_slot_is_decided_while_this_badge_breaks_in():
-    for answered in (True, False):
-        t = listener(P.EXACT_INDEX)
-        decided = []
-        t.follower_rx = lambda: decided.append(t.rx[-1])
-        feed(t, 0, 50000, 32)
-        before = list(decided)
-        t.start_break(50000)
-        stall = t.stall_slots
-        # The Leader still lit, then -- if it heard -- dark.
-        lit_until = 150000 if answered else \
-            50000 + P.BREAK_MAX_SLOTS * t.clock.duration + 2000
-        feed(t, 50000, lit_until, 112)
-        assert decided == before, "decided while breaking in"
-        assert t.stall_slots == stall
-        if answered:
-            feed(t, lit_until, lit_until + 60000, 32)
-            assert not t.breaking and "".join(t.tx) == P.SYNC_ERROR
-        else:
-            assert not t.breaking and t.want_resend
-
-
 def test_every_rung_down_to_the_start_qualifies():
     # exact_index stops at the first rung that fails, so the rung it picks
     # and every slower one have a WINDOW_MIN_US window.
+    # The dark start is held slower than its rule allows (EXACT_DARK_START_MS).
+    assert P.EXACT_INDEX <= P.exact_index(P.SETTLE_DARK_US, P.GUARD_DARK_US)
+    assert P.SLOT_LADDER[P.EXACT_INDEX] == P.EXACT_DARK_START_MS
     for settle, guard, index in ((P.SETTLE_LIT_US, P.GUARD_LIT_US,
                                   P.EXACT_LIT_INDEX),
                                  (P.SETTLE_DARK_US, P.GUARD_DARK_US,
-                                  P.EXACT_INDEX)):
+                                  P.exact_index(P.SETTLE_DARK_US,
+                                                P.GUARD_DARK_US))):
         assert P.exact_index(settle, guard) == index
         for duration in P.SLOT_LADDER[:index + 1]:
             opens, closes = P.exact_window(duration * 1000, settle, guard)

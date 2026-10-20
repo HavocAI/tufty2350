@@ -9,18 +9,47 @@ import random
 
 import simulator as sim
 from harness import load_module
+import held
 
 P = load_module("share_wifi", "protocol")
 R = load_module("share_wifi", "reader")
 
 
 def test_the_v2_and_v3_profiles_deliver():
-    for timing in (sim.LOOP_V2, sim.LOOP_V2_SLOW_PANEL, sim.LOOP_V3):
+    for timing in (sim.LOOP_V2, sim.LOOP_V3):
         link = sim.build_loop(P, sim.TYPICAL, seed=1,
                               **dict(sim.SCENARIOS["realistic"], **timing))
         link.run(300)
         assert link.leader.transfer.result == P.OK, timing
-        assert P.parse_payload(link.follower.transfer.received) == \
+        assert link.follower.transfer.received == \
+            list(sim.TYPICAL)
+        assert not link.violation, link.violation
+
+
+def test_each_badge_gets_its_own_firmwares_pwm_period_and_curve():
+    link = sim.build_loop(P, sim.TYPICAL, seed=1)
+    assert link.leader.pwm_ms == link.follower.pwm_ms == sim.PWM_PERIOD_MS
+    link = sim.build_loop(P, sim.TYPICAL, seed=1, **sim.LOOP_V3)
+    assert link.leader.pwm_ms == link.follower.pwm_ms == sim.PWM_PERIOD_MS_V3
+    assert link.leader.duty is sim.backlight_duty_v3
+    link = sim.build_loop(P, sim.TYPICAL, seed=1,
+                          **sim.mixed_firmware(sim.LOOP_V2, sim.LOOP_V3))
+    lead, follow = link.leader, link.follower
+    assert (lead.pwm_ms, follow.pwm_ms) == (sim.PWM_PERIOD_MS,
+                                            sim.PWM_PERIOD_MS_V3)
+    assert lead.duty is sim.backlight_duty_v2
+    assert follow.duty is sim.backlight_duty_v3
+
+
+def test_a_v2_and_a_v3_badge_pair():
+    for lead, follow in ((sim.LOOP_V2, sim.LOOP_V3),
+                         (sim.LOOP_V3, sim.LOOP_V2)):
+        link = sim.build_loop(P, sim.TYPICAL, seed=1,
+                              **dict(sim.SCENARIOS["realistic"],
+                                     **sim.mixed_firmware(lead, follow)))
+        link.run(300)
+        assert link.leader.transfer.result == P.OK
+        assert link.follower.transfer.received == \
             list(sim.TYPICAL)
         assert not link.violation, link.violation
 
@@ -28,13 +57,11 @@ def test_the_v2_and_v3_profiles_deliver():
 def test_the_simulator_runs_the_production_readers():
     link = sim.build_loop(P, sim.TYPICAL, seed=1)
     assert type(link.leader.reader) is R.RingReader
-    assert type(link.leader.reader.ring) is R.ListRing
+    assert type(link.leader.reader.ring) is held.ListRing
     # The ring is a power of two, its history the badge's.
     ring = link.leader.reader.ring
     assert ring.samples == sim.RING_ENTRIES == 4096
     assert link.leader.reader.usable == sim.RING_USABLE_US
-    polled = sim.build_loop(P, sim.TYPICAL, seed=1, reader="polled")
-    assert type(polled.leader.reader) is R.PolledReader
 
 
 def test_the_measured_sensor_runs_on_the_exact_rung_in_the_dark():
@@ -51,33 +78,33 @@ def test_the_measured_sensor_runs_on_the_exact_rung_in_the_dark():
             P.SLOT_LADDER[leader.clock.index]
 
 
-def test_nothing_is_presented_in_the_data_phase():
-    # Presents only change pixels, and the backlight scheme's are white for
-    # every symbol: once both badges are in the data phase, nothing is
-    # presented by either.
+def test_every_field_a_transfer_shows_is_a_backlight_level():
+    # The simulator models a backlight and nothing else: every field of
+    # every phase is a duty from the protocol's tables.
     link = sim.build_loop(P, sim.TYPICAL, seed=1,
                           **dict(sim.SCENARIOS["realistic"], **sim.LOOP_V2))
-    changes = []
+    duties = set()
+    phases = set()
     for badge in (link.leader, link.follower):
-        def schedule(when, kind, value, _badge=badge,
-                     _real=badge.panel.schedule):
-            changes.append((_badge.transfer.phase, kind))
-            _real(when, kind, value)
+        def schedule(when, duty, _badge=badge, _real=badge.panel.schedule):
+            duties.add(duty)
+            phases.add(_badge.transfer.phase)
+            _real(when, duty)
         badge.panel.schedule = schedule
     link.run(300)
     assert link.leader.transfer.result == P.OK
-    in_data = [kind for phase, kind in changes if phase == P.PHASE_DATA]
-    assert "duty" in in_data, "the data phase changed no backlight"
-    assert "share" not in in_data, "a pixel change in the data phase"
+    levels = {sim.backlight_duty_v2(v) for table in P.LEVEL_SCHEMES.values()
+              for v in table.values()}
+    assert duties <= levels and len(duties) >= 3, duties
+    assert P.PHASE_DATA in phases and P.PHASE_ANNOUNCE in phases
 
 
 def test_a_collection_the_protocol_asks_for_stalls_the_badge():
     link = sim.build_loop(P, sim.TYPICAL, seed=1)
     link.run(300)
     assert link.leader.transfer.result == P.OK
-    # The Leader on finding the closing gap; the Follower at its own and on
-    # accepting the block.
-    assert link.leader.collections >= 1 and link.follower.collections >= 2
+    # Each at its staircase's closing gap.
+    assert link.leader.collections >= 1 and link.follower.collections >= 1
 
 
 def test_the_measured_sensor_reads_in_whole_steps_around_its_swing():
@@ -90,14 +117,14 @@ def test_the_measured_sensor_reads_in_whole_steps_around_its_swing():
     assert sorted(black)[200] in (32, 48) and sorted(white)[200] in (112, 128)
 
 
-def test_the_peer_swings_follow_the_geometry():
-    import optics
-    mirror = optics.screen(5.3, lit=optics.BANDS)
-    aligned = optics.screen(4.0)
-    overlap = optics.screen(4.0, edge=3)
-    reflectance = 0.85
-    assert 0.9 < aligned / (reflectance * mirror) * sim.SWING_MIRROR \
-        / sim.SWING_PEER_ALIGNED < 1.1
-    assert 0.8 < overlap / (reflectance * mirror) * sim.SWING_MIRROR \
-        / sim.SWING_PEER_OVERLAP < 1.2
-    assert optics.screen(4.0, edge=40) < 3.1416      # never more than pi
+def test_the_peer_swings_are_the_predicted_ones():
+    # The geometry (optical-coupling.md) predicted a peer's swing from the
+    # solid angle its screen fills; data.md records the result, which the
+    # simulator's aligned and overlap rows use.
+    import os
+    from harness import REPO
+    data = open(os.path.join(REPO, ".agents", "optical_data_transfer",
+                             "data.md")).read()
+    assert "~%d aligned edge to edge, ~%d overlapping" % (
+        sim.SWING_PEER_ALIGNED, sim.SWING_PEER_OVERLAP) in data
+    assert "mirror A %d counts dark" % sim.SWING_MIRROR in data

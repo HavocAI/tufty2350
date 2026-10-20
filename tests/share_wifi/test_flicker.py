@@ -1,7 +1,8 @@
 """Dev Mode's room-flicker tool (flicker.py), against a synthetic light.
 
-The sensor is a function of a fake microsecond clock that moves on with every
-read, as the badge's does, so a capture's bins fill as they would there.
+The sensor is a function of time, read through the production RingReader
+over a ring that fills, a reading every 20 us, as a fake clock moves -- the
+DMA ring a capture reads on the badge.
 Nothing here says what a room's lights do -- only that a flicker of a known
 frequency and size comes back as that frequency and size.
 """
@@ -11,23 +12,47 @@ import math
 import os
 
 from harness import load_module
+import held
 
 F = load_module("share_wifi", "flicker")
+R = load_module("share_wifi", "reader")
 PATH = os.path.join(os.path.dirname(F.__file__), "flicker.py")
 
 
-def captured(light, read_us=27):
-    """One capture of light(t_us), reading every `read_us`."""
-    t = [0]
+class LightReader(R.RingReader):
+    """A started ring reader of `light(t_us)`, in counts kept whole (an entry
+    is 16 raw readings of one count each), its clock moved only by pump()
+    and advance()."""
 
-    def ticks():
-        return t[0]
+    def __init__(self, light, t=0):
+        self.light = light
+        self.t = t
+        ring = held.ListRing(1 << 15, 20)
+        ring.written = t // 20
+        R.RingReader.__init__(self, ring, self.ticks, per_entry=16)
+        self.start()
 
-    def read():
-        t[0] += read_us
-        return light(t[0])
+    def ticks(self):
+        ring = self.ring
+        while ring.written * 20 < self.t:
+            value = int(self.light(ring.written * 20))
+            ring.push(max(0, min(0xFFFF, value)))
+        return self.t
+
+    def advance(self, us):
+        self.t += us
+
+    def pump(self, until):
+        now = self.now_us()
+        if until > now:
+            self.t += until - now
+            self.now_us()
+
+
+def captured(light):
+    """One capture of light(t_us), through the ring."""
     capture = F.Capture()
-    capture.take(read, ticks)
+    capture.take(LightReader(light))
     return capture
 
 
@@ -40,9 +65,10 @@ def sine(hz, size, mean=400, quantum=1):
 
 def test_a_capture_fills_every_bin_for_a_quarter_second():
     capture = captured(lambda t: 100)
-    assert capture.reads > 9000
+    assert capture.reads == 12500           # 25 readings a bin
     assert all(capture.counts), "a bin with no reading"
-    assert 250000 <= capture.elapsed_us < 250000 + 100
+    assert capture.sums == [100] * F.BINS
+    assert capture.elapsed_us == 250000
 
 
 def test_mains_flicker_comes_back_at_its_frequency_and_size():
@@ -71,7 +97,7 @@ def test_flicker_smaller_than_an_adc_step_is_still_seen():
 def test_a_steady_light_has_no_peak_to_speak_of():
     result = F.analyse(captured(lambda t: 400))
     assert result["peak_counts"] < 0.01 and result["p2p"] == 0
-    assert result["read_us"] == 27.0
+    assert result["read_us"] == 20.0
 
 
 def test_a_fast_flicker_is_found_up_to_a_kilohertz():
@@ -100,13 +126,18 @@ def test_no_reading_is_an_error_not_a_crash():
 
 def test_the_summary_fits_a_line():
     line = F.summary(F.analyse(captured(sine(100, 20))))
-    assert line.startswith("100 Hz, ") and "on 400" in line, line
+    # A bin's mean is whole counts, rounded down: 399 or 400.
+    assert line.startswith("100 Hz, ") and (
+        " on 399" in line or " on 400" in line), line
 
 
 def test_every_harmonic_the_fit_uses_is_reported():
     result = F.analyse(captured(sine(120, 20)))
+    # 1-6 x 50 and 60 Hz, which the fit uses, and the 7th and 8th, which
+    # are reported only.
     assert sorted(result["hz"], key=int) == [
-        "50", "60", "100", "120", "150", "180", "200", "240"]
+        "50", "60", "100", "120", "150", "180", "200", "240", "250", "300",
+        "350", "360", "400", "420", "480"]
     assert result["hz"]["120"] > 15 and result["hz"]["240"] < 1
 
 
@@ -194,26 +225,22 @@ def test_a_capture_with_no_readings_has_no_fit():
 def drifted(mains_offset_hz, windows=24, hz=120, size=20, gaps=None,
             noise=0):
     """Drift windows of a light flickering at `hz` + 2 x `mains_offset_hz`,
-    read every 27 us of a clock that moves on once a read, with `gaps` us
-    between windows -- a frame's present and poll -- cycled."""
+    one ring run, with `gaps` us between windows -- a frame's present and
+    poll -- cycled."""
     import random
     rng = random.Random(3)
-    t = [5000000]
     gaps = gaps or (20000,)
 
-    def ticks():
-        return t[0]
-
-    def read():
-        t[0] += 27
-        x = 2 * math.pi * (hz + 2 * mains_offset_hz) * t[0] / 1e6
+    def light(t):
+        x = 2 * math.pi * (hz + 2 * mains_offset_hz) * t / 1e6
         return int(700 + size * math.sin(x) + rng.gauss(0, noise)) // 16 * 16
+    reader = LightReader(light, t=5000000)
     drift = F.Drift(hz, windows)
     capture = F.Capture()
     for w in range(windows):
-        capture.take(read, ticks)
+        capture.take(reader)
         drift.add(capture)
-        t[0] += gaps[w % len(gaps)]
+        reader.advance(gaps[w % len(gaps)])
     return drift.result()
 
 
@@ -300,14 +327,15 @@ def test_flicker_avoids_what_micropython_lacks():
 def test_the_spec_example_names_only_keys_the_tool_writes_and_all_of_them():
     import re
     from harness import REPO
-    spec = os.path.join(REPO, ".agents", "docs", "share_wifi_spec.md")
+    spec = os.path.join(REPO, ".agents", "share_wifi", "app-spec.md")
     text = open(spec).read()
-    block = text.split("### measure room flicker", 1)[1].split("### Known gaps", 1)[0]
+    block = text.split("### `room_flicker`", 1)[1].split("### Known gaps", 1)[0]
     block = block.split('"room_flicker": {', 1)[1]
     spec_keys = set(re.findall(r'"([A-Za-z0-9_.]+)":', block))
     result = F.analyse(captured(room(120, 20, harmonic=5)))
     result["drift"] = drifted(0.01, windows=3)
-    ours = keys_of(result) | {"1", "2", "temp_c", "error"}
+    # `tethered` is the subtool's, added to each measurement as it is saved.
+    ours = keys_of(result) | {"1", "2", "temp_c", "error", "tethered"}
     assert spec_keys == ours, (sorted(spec_keys - ours), sorted(ours - spec_keys))
 
 
@@ -320,10 +348,3 @@ def keys_of(obj):
     return out
 
 
-def test_display_measurements_orders_every_room_flicker_key():
-    measure = load_module("share_wifi", "measure")
-    result = F.analyse(captured(room(120, 20, harmonic=5)))
-    result["drift"] = drifted(0.01, windows=3)
-    missing = sorted(k for k in keys_of(result) - set(measure.KEY_ORDER)
-                     if not k.isdigit())
-    assert not missing, missing

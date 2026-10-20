@@ -18,9 +18,11 @@ see the comment on it in protocol.py.
 import random
 
 from harness import load_module
+from held import HeldTransfer
 import test_integration as T
 
 protocol = load_module("share_wifi", "protocol")
+FB = load_module("share_wifi", "fastblock")
 Transfer = protocol.Transfer
 
 FRAME = 16
@@ -39,36 +41,37 @@ STIMULI = {
 }
 
 STATES = [("leader", Transfer.STEP_BLOCK, False),
-          ("leader", Transfer.STEP_CRC, False),
-          ("leader", Transfer.STEP_VERDICT, False),
+          ("leader", Transfer.STEP_FAST_REPLY, False),
           ("leader", Transfer.STEP_FINISH, False),
           ("follower", Transfer.STEP_BLOCK, False),
           ("follower", Transfer.STEP_BLOCK, True),
-          ("follower", Transfer.STEP_VERDICT, False),
+          ("follower", Transfer.STEP_FAST_RX, False),
           ("follower", Transfer.STEP_FINISH, False)]
 
-NAMES = {Transfer.STEP_BLOCK: "STEP_BLOCK", Transfer.STEP_CRC: "STEP_CRC",
-         Transfer.STEP_VERDICT: "STEP_VERDICT",
+NAMES = {Transfer.STEP_BLOCK: "STEP_BLOCK",
+         Transfer.STEP_FAST_REPLY: "STEP_FAST_REPLY",
+         Transfer.STEP_FAST_RX: "STEP_FAST_RX",
          Transfer.STEP_FINISH: "STEP_FINISH"}
 
 
 def parked(side_name, sub, in_block):
     """A badge already in the data phase, parked in one sub-state."""
-    leader, follower = T.paired(7)               # the 50ms rung
+    leader, follower = T.paired(3)               # the 16 ms rung
     side = leader if side_name == "leader" else follower
     side.start_data(0)
     side.sub = sub
     if side_name == "leader":
         side.tx = []                             # stop it mid-conversation
-        if sub == Transfer.STEP_CRC:
-            side.crc_started = False
+        side.fast_pending = False
+        side.fast_burst = None
     else:
         side.in_block = in_block
         if in_block:
-            side.tokens = [65]
-            side.bits = []
-        if sub == Transfer.STEP_VERDICT:
-            side.pending_tokens = [65]
+            side.fast_bits = []
+        if sub == Transfer.STEP_FAST_RX:
+            side.deciding = 0
+            side.start_fast_rx(FB.RUNGS[0])
+            side.deciding = None
     return side
 
 
@@ -120,13 +123,12 @@ def test_the_stall_budget_leaves_room_for_an_honest_wait():
 
 
 def test_a_block_cannot_be_resent_for_ever():
-    # MAX_BLOCK_RETRIES bounds CRC failures, but the Data Sync Error path resets
-    # it on purpose, so sync-error resends were bounded by nothing. A Leader
-    # reading noise as a sync error demoted, resent, and once at the slowest
-    # rung resent for ever -- every loop looked like progress.
-    assert protocol.MAX_BLOCK_ATTEMPTS >= (protocol.MAX_BLOCK_RETRIES + 1), \
-        "the ceiling must leave room for the retries below it"
-    leader, _ = T.paired(7)
+    # NAKs step the fast rung, a Data Sync Error the slot rung, and a pair on
+    # the slowest of both would resend for ever -- every loop looks like
+    # progress. MAX_BLOCK_ATTEMPTS bounds them all.
+    assert protocol.MAX_BLOCK_ATTEMPTS > protocol.FAST_TRIES * len(FB.RUNGS), \
+        "the ceiling must leave room for every fast rung's tries"
+    leader, _ = T.paired(3)
     leader.start_data(0)
     assert leader.attempts == 1, "the first transmission counts as an attempt"
     leader.attempts = protocol.MAX_BLOCK_ATTEMPTS
@@ -148,7 +150,7 @@ def test_finishing_the_ending_still_resets_the_stall_budget():
 def test_a_block_has_an_outer_deadline():
     # The backstop for the cases nobody predicted. The other two budgets bound
     # particular ways of getting stuck; this one bounds a block.
-    leader, _ = T.paired(7)
+    leader, _ = T.paired(3)
     leader.start_data(0)
     assert leader.result is None
     leader.step(protocol.BLOCK_TIMEOUT_MS + 1, T.light_from("_", random.Random(1)))
@@ -157,19 +159,18 @@ def test_a_block_has_an_outer_deadline():
 
 def test_the_deadline_restarts_on_every_accepted_block():
     # Counted over the whole transfer it was a cap on payload length wearing a
-    # backstop's clothes -- 300s is about 750 bytes at the 50ms rung. The
-    # protocol has no opinion about how long a payload may be.
-    follower = T.Transfer(False)
+    # backstop's clothes. The protocol has no opinion about how long a
+    # payload may be.
+    follower = HeldTransfer(False)
     follower.levels = T.levels()
     follower.now = 0
     follower.start_data(0)
-    follower.pending_tokens = [65, 66]
     follower.now = protocol.BLOCK_TIMEOUT_MS - 1000
-    follower.accept_pending()
+    follower.fast_accept(0, b"\x02" + bytes(FB.CHUNK - 1))
     assert follower.block_started == protocol.BLOCK_TIMEOUT_MS - 1000, \
         "accepting a block must restart the deadline"
-    # and the badge survives well past what a whole-transfer deadline allowed
-    follower.step(protocol.BLOCK_TIMEOUT_MS + 1000, T.light_from(" ", random.Random(1)))
+    follower.step(protocol.BLOCK_TIMEOUT_MS + 1000,
+                  T.light_from(" ", random.Random(1)))
     assert follower.result is None, \
         "a transfer longer than one block's deadline must not be cut off"
 
@@ -190,7 +191,7 @@ def test_the_deadline_leaves_room_for_the_slowest_honest_block():
 def test_the_deadline_applies_even_mid_transmission():
     # A badge part way through sending a block is still stuck if the clock has
     # run out; a backstop that only applies while listening is not a backstop.
-    leader, _ = T.paired(7)
+    leader, _ = T.paired(3)
     leader.start_data(0)
     assert leader.tx, "the leader should be mid-transmission here"
     leader.step(protocol.BLOCK_TIMEOUT_MS + 1, T.light_from(" ", random.Random(1)))
@@ -198,11 +199,9 @@ def test_the_deadline_applies_even_mid_transmission():
 
 
 # --- asking for a block again ------------------------------------------------
-# The gap every failing run used to fall into: a Follower that misses a Begin
-# Block Pattern never enters the block, so nothing trips the framing check and
-# it has nothing to send. The Leader waits in STEP_CRC for a reply that was
-# never coming, and both badges stay on the rung they started on because the
-# only route to demotion is a framing failure that cannot happen.
+# A Follower that misses a block's Begin never enters it, so nothing trips
+# the framing check and it has nothing to send; the Leader waits for a reply
+# that was never coming. So it asks.
 
 
 def test_a_follower_that_missed_the_block_asks_for_it_again():
@@ -211,7 +210,7 @@ def test_a_follower_that_missed_the_block_asks_for_it_again():
     rng = random.Random(3)
     now = 0
     # A Leader mid-block: symbols streaming past that the Follower cannot frame,
-    # so it never matches Begin Block and never makes progress.
+    # so it never matches a Begin and never makes progress.
     for _ in range(protocol.STALL_SLOTS * 3):
         for _ in range(4):
             follower.step(now, T.light_from(rng.choice("-_"), rng))
@@ -222,11 +221,14 @@ def test_a_follower_that_missed_the_block_asks_for_it_again():
     # Then the Leader stops. The request goes out only now: a badge that is
     # transmitting does not listen, and two on air at once is what half duplex
     # exists to prevent.
+    sent = None
     for _ in range(protocol.RESEND_QUIET_SLOTS * 8):
         follower.step(now, T.light_from(" ", rng))
         now += FRAME
+        if follower.resend_requests and sent is None:
+            sent = "".join(follower.tx)
     assert follower.resend_requests >= 1, "the request was never sent"
-    assert "".join(follower.tx) == protocol.SYNC_ERROR, \
+    assert sent == protocol.SYNC_ERROR, \
         "it should ask with the Data Sync Error Pattern, not something new"
 
 
@@ -242,18 +244,6 @@ def test_the_request_waits_for_the_peer_to_stop_talking():
         "it must not transmit over a peer that is still sending (I6)"
 
 
-def test_a_follower_holding_an_unjudged_block_never_asks():
-    # It cannot tell an accepted block from a rejected one. Asking would either
-    # drop a block the Leader has moved past or duplicate one it has not, and
-    # both corrupt the payload while every CRC still passes.
-    follower = parked("follower", Transfer.STEP_BLOCK, False)
-    follower.pending_tokens = [65, 66]
-    assert not follower.request_resend(), \
-        "a Follower holding uncommitted tokens must not ask for a resend"
-    follower.pending_tokens = []
-    assert follower.request_resend()
-
-
 def test_asking_is_bounded():
     follower = parked("follower", Transfer.STEP_BLOCK, False)
     follower.resend_requests = protocol.MAX_BLOCK_ATTEMPTS
@@ -262,13 +252,12 @@ def test_asking_is_bounded():
 
 
 def test_the_leader_already_understands_the_request():
-    # Nothing on the Leader changed for this. The handling of a Data Sync Error
-    # in STEP_CRC was always there; nothing was ever able to trigger it.
-    leader, _ = T.paired(7, (b"HomeNet", b"hunter2!!"))
+    # A Leader waiting for a reply hears a Data Sync Error as one.
+    leader, _ = T.paired(3, (b"HomeNet", b"hunter2!!"))
     leader.start_data(0)
     leader.tx = []
-    leader.sub = Transfer.STEP_CRC
-    leader.crc_started = False
+    leader.fast_pending = False
+    leader.sub = Transfer.STEP_FAST_REPLY
     before = leader.clock.duration
     for symbol in protocol.SYNC_ERROR:
         leader.rx.append(symbol)

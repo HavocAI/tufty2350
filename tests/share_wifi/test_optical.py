@@ -2,8 +2,8 @@
 
 Calibration is driven with a synthetic sensor rather than real hardware, so
 these tests prove the maths is sound, not that the constants are right.
-Whether the separability check (MIN_GAP, GAP_SIGMAS) refuses the right links
-on a badge, and LCD_SETTLE_MS, still have to be measured there.
+Whether the separability check (MIN_GAP_EXACT, GAP_SIGMAS) refuses the right
+links on a badge still has to be measured there.
 """
 
 import itertools
@@ -11,16 +11,27 @@ import math
 import random
 
 from harness import load_module
+from held import HeldTransfer
 
 protocol = load_module("share_wifi", "protocol")
 StaircaseReader = protocol.StaircaseReader
 BeaconDetector = protocol.BeaconDetector
 SlotClock = protocol.SlotClock
 Levels = protocol.Levels
-staircase_field = protocol.staircase_field
 SLOT_LADDER = protocol.SLOT_LADDER
-STAIRCASE_MS = protocol.STAIRCASE_MS
 MIN_SWING = protocol.MIN_SWING
+
+# The staircase these read: a dark Follower's, the only one there is.
+REPS = protocol.CAL_REPS_FAST
+OPEN_MS = protocol.CAL_OPEN_FAST_MS
+PLATEAU_MS = protocol.PLATEAU_FAST_MS
+STAIRCASE_MS = protocol.staircase_ms(REPS, OPEN_MS, PLATEAU_MS,
+                                     protocol.CAL_GAP_FAST_MS)
+
+
+def staircase_field(t):
+    return protocol.staircase_field(t, protocol.STAIRCASE, REPS, OPEN_MS,
+                                    PLATEAU_MS)
 
 
 def emit(level, ambient, contrast, noise, rng, middle=0.45):
@@ -29,26 +40,33 @@ def emit(level, ambient, contrast, noise, rng, middle=0.45):
     return int(ambient + base * contrast + rng.uniform(-noise, noise))
 
 
-# A staircase is read in calibration samples of CAL_SAMPLE_MS: `frame_ms`
-# below is that, unless a test says otherwise.
-SAMPLE_MS = protocol.CAL_SAMPLE_MS
+# A staircase is read in calibration samples of FINE_MS:
+# `frame_ms` below is that, unless a test says otherwise.
+SAMPLE_MS = protocol.FINE_MS
+
+
+LEAD_MS = 300       # the Follower dark before its staircase
 
 
 def run_staircase(ambient=200, contrast=9000, noise=120, frame_ms=SAMPLE_MS,
-                  start_offset=0, seed=1, middle=0.45, settle_ms=0):
-    """A staircase read through a panel that takes `settle_ms` to settle.
+                  start_offset=-LEAD_MS, seed=1, middle=0.45, settle_ms=0):
+    """A staircase read as the Leader reads it -- over LEADER_CAL_LIMIT
+    samples, its gap found on a moving mean -- through a sensor that takes
+    `settle_ms` to settle, from `start_offset` ms (the Leader reads from
+    long before; a start inside the opening is the stress).
 
-    `middle` is the middle level's share of the swing. A settling panel
+    `middle` is the middle level's share of the swing. A settling sensor
     leaves samples part way through each transition, which is what a middle
     level near an end can be mistaken for.
     """
     rng = random.Random(seed)
-    reader = StaircaseReader()
+    reader = StaircaseReader(protocol.LEADER_CAL_LIMIT,
+                             protocol.LEADER_CAL_SMOOTH)
     tau = settle_ms / 2.3
     shown = 0.0
-    t = 0
+    t = -LEAD_MS
     while t < STAIRCASE_MS + 2000:
-        field = staircase_field(t) if t < STAIRCASE_MS else " "
+        field = staircase_field(t) if 0 <= t < STAIRCASE_MS else " "
         target = {" ": 0.0, "_": middle, "-": 1.0}[field]
         shown = target if not tau else \
             shown + (target - shown) * (1 - math.exp(-frame_ms / tau))
@@ -59,16 +77,15 @@ def run_staircase(ambient=200, contrast=9000, noise=120, frame_ms=SAMPLE_MS,
     return None
 
 
-# Late starts inside the opening gap: the Follower starts reading when the
-# Leader's beacon falls quiet, part way into it.
+# Late starts inside the opening gap, the stress: the Leader reads from
+# long before the staircase.
 CONDITIONS = {
     "ideal": {},
-    "started 150ms late": {"start_offset": 150},
-    "started 230ms late": {"start_offset": 230},
+    "started 20ms late": {"start_offset": 20},
+    "started 36ms late": {"start_offset": 36},
     "bright ambient": {"ambient": 30000},
     "noisy": {"noise": 900},
-    "8ms samples": {"frame_ms": 8},
-    "2ms samples": {"frame_ms": 2},
+    "1ms samples": {"frame_ms": 1},
 }
 
 
@@ -111,13 +128,13 @@ def test_calibration_rejects_two_level_signal():
 # The quarter rule: each level at least a quarter of the swing from the next.
 # It used to be checked against a middle level taken only from the middle half
 # of the swing, which passes it by construction -- so a middle level near an
-# end, such as color.grey at 7%, was accepted whenever the panel's transitions
-# left a few samples there. These are the cases that used to get through.
+# end, at 7%, was accepted whenever transitions left a few samples there.
+# These are the cases that used to get through.
 QUARTER_RULE_CONDITIONS = list(itertools.product(
     (0, 120, 400),          # noise
     (0, 4, 8),              # settle_ms: the sensor's, up to the dark's
-    (2, 4, 8),              # frame_ms: the calibration sample
-    (0, 150)))              # start_offset
+    (1, 2),                 # frame_ms: the calibration sample
+    (-LEAD_MS, 30)))        # start_offset
 
 
 def test_a_middle_level_near_either_end_is_rejected():
@@ -135,12 +152,13 @@ def test_a_middle_level_near_either_end_is_rejected():
 
 
 def test_a_middle_level_well_inside_the_swing_is_accepted():
-    # 30-70% covers both schemes with room either side: the fields scheme's
-    # middle measured at 40% and is modelled at 45%, the backlight's sits at
-    # about 50%.
+    # 30-70% covers the backlight's middle, about 50%, with room either
+    # side.
     conditions = [dict(kw) for kw in CONDITIONS.values()]
-    conditions += [{"settle_ms": settle, "frame_ms": frame}
-                   for settle in (4, 8) for frame in (2, 4, 8)]
+    # A sensor settling in up to 4 ms, the dark's worst fall [measured-all,
+    # M4]: a 20 ms step holds too few settled samples of a 30% middle past
+    # that.
+    conditions += [{"settle_ms": settle} for settle in (2, 4)]
     for middle in (0.30, 0.45, 0.50, 0.70):
         for kw in conditions:
             reader = run_staircase(middle=middle, **kw)
@@ -167,33 +185,53 @@ def test_hysteresis_holds_the_previous_level():
     levels = Levels()
     levels.fit(0, 5000, 10000)
     levels.classify(10000)                       # settle on high
-    on_threshold = levels.t_high
-    assert levels.classify(on_threshold) == "-", "should hold, not flip"
+    assert levels.classify(levels.t_high) == "-", "should hold, not flip"
     levels.classify(0)                           # settle on low
-    assert levels.classify(on_threshold) == " ", "should hold the other way"
+    assert levels.classify(levels.t_low) == " ", "should hold the other way"
+    levels.classify(5000)                        # settle on middle
+    assert levels.classify(levels.t_low) == "_"
+    assert levels.classify(levels.t_high) == "_"
+
+
+def test_hysteresis_holds_a_level_only_against_its_own_threshold():
+    """A value at T_high is not low, whatever came before: held low, a
+    slow sensor's first high lost a fast block's ACK [simulation, k3.0]."""
+    levels = Levels()
+    levels.fit(0, 5000, 10000)
+    levels.classify(0)                           # settle on low
+    assert levels.classify(levels.t_high) == "-"
+    levels.classify(10000)                       # settle on high
+    assert levels.classify(levels.t_low) == "_"
+
+
+ANNOUNCE = protocol.ANNOUNCE_FAST_HALF_MS
+OTHER = 40          # the Announce's half before 2026-10-11, now no beacon's
 
 
 def test_beacons_are_told_apart_by_period():
     # Not by brightness: before calibration there are no thresholds to compare
     # a brightness against.
-    for half_ms, announce, present in ((250, True, False), (400, False, True)):
+    for half_ms, announce, other in ((ANNOUNCE, True, False),
+                                     (OTHER, False, True)):
         rng = random.Random(2)
         detector = BeaconDetector()
-        for i in range(200):
-            t = i * 16
-            level = "-" if (t // half_ms) % 2 else "_"
+        for i in range(120):
+            t = i * protocol.FINE_MS
+            level = "-" if (t // half_ms) % 2 else " "
             detector.push(t, emit(level, 200, 9000, 120, rng))
-        assert abs(detector.half_period() - half_ms) < half_ms * 0.2
-        assert detector.matches(250) is announce
-        assert detector.matches(400) is present
+        window = protocol.BEACON_FAST_HALVES * half_ms
+        assert abs(detector.half_period(window, half_ms) - half_ms) \
+            < half_ms * 0.2
+        assert detector.matches(ANNOUNCE) is announce
+        assert detector.matches(OTHER) is other
 
 
 def test_steady_light_is_not_a_beacon():
     detector = BeaconDetector()
     for i in range(200):
-        detector.push(i * 16, 5000)
-    assert detector.half_period() is None
-    assert not detector.matches(250)
+        detector.push(i * protocol.FINE_MS, 5000)
+    assert detector.half_period(1000, ANNOUNCE) is None
+    assert not detector.matches(ANNOUNCE) and not detector.matches(OTHER)
 
 
 def test_dim_flicker_is_not_a_beacon():
@@ -201,51 +239,43 @@ def test_dim_flicker_is_not_a_beacon():
     rng = random.Random(4)
     detector = BeaconDetector()
     for i in range(200):
-        t = i * 16
-        level = "-" if (t // 250) % 2 else "_"
+        t = i * protocol.FINE_MS
+        level = "-" if (t // ANNOUNCE) % 2 else " "
         detector.push(t, emit(level, 200, MIN_SWING // 3, 20, rng))
-    assert detector.half_period() is None
+    assert detector.half_period(1000, ANNOUNCE) is None
 
 
 def test_slot_ladder_slows_and_floors():
     clock = SlotClock()
     clock.start(0, len(SLOT_LADDER) - 1)
-    assert clock.duration == SLOT_LADDER[-1]
+    assert clock.duration == SLOT_LADDER[-1] * 1000
     clock.slow_down()
-    assert clock.duration == SLOT_LADDER[-2], "index 0 is the slowest rung"
+    assert clock.duration == SLOT_LADDER[-2] * 1000, \
+        "index 0 is the slowest rung"
     for _ in range(20):
         clock.slow_down()
     assert clock.index == 0
-    assert clock.duration == SLOT_LADDER[0]
+    assert clock.duration == SLOT_LADDER[0] * 1000
 
 
 def test_slot_numbering_advances_with_time():
     clock = SlotClock()
     clock.start(1000, 4)
-    duration = SLOT_LADDER[4]
+    duration = SLOT_LADDER[4] * 1000
     assert clock.number(1000) == 0
     assert clock.number(1000 + duration - 1) == 0
     assert clock.number(1000 + duration) == 1
-    assert clock.offset(1000 + duration // 2) == duration // 2
 
 
-def test_the_proven_rung_is_50ms():
-    # Below it every rung is a gamble: a bad CRC there demotes.
-    transfer = protocol.Transfer(True, (b"n", b"password1"))
-    assert protocol.SLOT_LADDER[transfer.conservative_index()] == \
-        protocol.BACKLIGHT_PROVEN_MS == 50
-
-
-def test_there_is_no_optimistic_rung():
-    # A rung above the start was tried and removed: its demotion is announced
-    # by a pattern the peer must read at the rate being demoted FROM, so a
-    # failed gamble could split the two badges onto different rungs rather
-    # than stepping them down together.
-    assert protocol.OPTIMISTIC_RUNGS == 0
-    transfer = protocol.Transfer(True, (b"n", b"password1"))
-    # With no flags read yet: a POLLED, dark pair.
-    assert transfer.start_index() == protocol.BACKLIGHT_INDEX
-    assert protocol.SLOT_LADDER[transfer.start_index()] == 32
+def test_a_pair_starts_on_its_lights_rung():
+    # No rung above the start is gambled on: its demotion is announced by a
+    # pattern the peer must read at the rate being demoted FROM, so a failed
+    # gamble could split the two badges onto different rungs.
+    assert not hasattr(protocol, "OPTIMISTIC_RUNGS")
+    transfer = HeldTransfer(True, (b"n", b"password1"))
+    # With no flags read yet: a dark pair.
+    assert transfer.start_index() == protocol.EXACT_INDEX
+    assert protocol.SLOT_LADDER[transfer.start_index()] == 16
 
 
 def test_every_rung_an_exact_pair_starts_on_has_a_window():
@@ -271,16 +301,15 @@ def test_the_exact_starts_follow_the_measured_settles():
 
 
 def test_start_index_cannot_run_off_the_ladder():
-    transfer = protocol.Transfer(True, (b"n", b"password1"))
-    transfer.pair_exact = transfer.pair_lit = True
+    transfer = HeldTransfer(True, (b"n", b"password1"))
+    transfer.pair_lit = True
     assert transfer.start_index() <= len(protocol.SLOT_LADDER) - 1
 
 
 def test_demoting_from_the_starting_rung_steps_one_rung_slower():
     # Demotion is the only rate change there is, and it must move exactly
     # one rung: a badge that skipped one would land somewhere its peer is not.
-    transfer = protocol.Transfer(True, (b"n", b"password1"))
-    transfer.pair_exact = True
+    transfer = HeldTransfer(True, (b"n", b"password1"))
     transfer.clock.set_index(transfer.start_index())
     assert protocol.SLOT_LADDER[transfer.clock.index] == 16
     transfer.clock.slow_down()
@@ -294,9 +323,8 @@ def test_slow_down_stops_at_the_slowest_rung():
     for _ in range(5):
         clock.slow_down()
     assert clock.index == 0
-    assert clock.duration == protocol.SLOT_LADDER[0]
     # A transfer's clock counts microseconds.
-    assert protocol.SlotClock(1000).duration == protocol.SLOT_LADDER[0] * 1000
+    assert clock.duration == protocol.SLOT_LADDER[0] * 1000
 
 
 # --- separability: what the badge's sensor actually gives --------------------
@@ -343,10 +371,10 @@ def test_a_swing_drowned_in_noise_is_refused():
 def test_the_gap_check_is_min_gap_and_gap_sigmas_of_the_noisier_side():
     gap_separable = protocol.gap_separable
     k, floor = protocol.GAP_SIGMAS, protocol.QUANTISATION_SD
-    assert k == 4 and protocol.MIN_GAP == 32
+    assert k == 4 and protocol.MIN_GAP_EXACT == 16
     assert gap_separable(40, 2.0, 9.0) == (40 >= k * 9.0)
     assert not gap_separable(40, 2.0, 11.0)             # the noisier side
-    assert not gap_separable(24, 0.0, 0.0)              # under MIN_GAP
+    assert not gap_separable(30, 0.0, 0.0, 32)          # under a min_gap
     # Readings that all land on one code still carry quantisation error.
     assert gap_separable(32, 0.0, 0.0) == (32 >= k * floor)
     assert abs(floor - 16 / math.sqrt(12)) < 1e-9
@@ -378,14 +406,34 @@ def test_a_level_with_too_few_settled_samples_cannot_be_judged():
     assert protocol.held_spreads(values, 56, 104) is None
 
 
-def test_the_quantisation_floor_binds_once_gap_sigmas_outgrows_min_gap():
-    # At GAP_SIGMAS 4 the floor (4 x 4.62 = 18.5) sits under MIN_GAP (32),
-    # so it does not bind; raise GAP_SIGMAS and it must, or a level whose
-    # readings all land on one ADC code would count as noiseless.
-    saved = protocol.GAP_SIGMAS
-    protocol.GAP_SIGMAS = 8                 # 8 x 4.62 = 37 > 32
-    try:
-        assert not protocol.gap_separable(32, 0.0, 0.0)
-        assert protocol.gap_separable(40, 0.0, 0.0)
-    finally:
-        protocol.GAP_SIGMAS = saved
+def test_one_step_of_gap_and_the_quantisation_floor_binds():
+    # MIN_GAP_EXACT: staircase samples are means of a hundred ring readings,
+    # so HW1's gaps of 27-30 counts (an obstructed sensor) separate; the
+    # quantisation floor (4 x 4.62 = 18.5) is then what binds.
+    gap_separable = protocol.gap_separable
+    assert protocol.MIN_GAP_EXACT == protocol.SENSOR_STEP == 16
+    assert gap_separable(28, 1.0, 1.5)
+    assert not gap_separable(28, 1.0, 1.5, 2 * protocol.SENSOR_STEP)
+    assert not gap_separable(18, 0.0, 0.0)              # under 4 x 4.62
+    assert gap_separable(19, 0.0, 0.0)
+
+
+def staircase_values(gap, sd, rng, reps=3, step=10):
+    """A staircase as a ring reader's coarse samples: black, black + gap,
+    black + 2 gap, each a mean -- no 16-count steps left in it."""
+    values = []
+    for _ in range(reps):
+        for level in (0, 1, 2):
+            values += [int(round(80 + level * gap + rng.gauss(0, sd)))
+                       for _ in range(step)]
+    return values
+
+
+def test_a_staircase_of_hw1s_gaps_separates():
+    rng = random.Random(5)
+    reader = StaircaseReader()
+    t = 0
+    for v in [80] * 20 + staircase_values(28, 1.0, rng) + [80] * 70:
+        reader.feed(t, v)
+        t += 2
+    assert reader.levels() is not None
