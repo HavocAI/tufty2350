@@ -48,3 +48,6 @@ venv
 # Python bytecode cache
 __pycache__/
 *.pyc
+
+# Raw dev-link captures: kept on the user's disk, not in git (2026-10-10).
+.agents/optical_data_transfer/captures/**/*.bin
